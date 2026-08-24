@@ -19,13 +19,14 @@ first; genuine cache misses enter per-route and global admission control before
 they can consume origin capacity.
 
 Harmost is built on [Pingora](https://github.com/cloudflare/pingora), the Rust
-proxy framework Cloudflare wrote to replace their NGINX fleet and now runs more
-than a trillion requests a day on. The parts of a reverse proxy that are
+proxy framework Cloudflare wrote to replace its NGINX fleet. Cloudflare reports
+that Pingora has served more than 40 million Internet requests per second for
+years. The parts of a reverse proxy that are
 unglamorous and easy to get subtly wrong — connection pooling, HTTP/1 and
 HTTP/2 handling, graceful restarts, timeouts, the cache lock — are inherited
-from a codebase that has been under that load for years. What Harmost adds on
-top is the governor: classification, cache-key and shareability rules, and
-bounded origin admission.
+from that codebase. Harmost currently exercises only part of that surface; see
+[Roadmap](#roadmap). What Harmost adds on top is the governor: classification,
+cache-key and shareability rules, and bounded origin admission.
 
 > A *harmost* (ἁρμοστής, from ἁρμόζω, "to fit, to keep in proper adjustment") was
 > an official posted to hold a system in correct adjustment.
@@ -91,17 +92,18 @@ Conventional protection is a poor fit for this shape:
 
 - **Request-per-second rate limiting** counts requests, not work. A cheap static
   asset and an expensive product page cost the same against the limit.
-- **A reverse-proxy cache** helps only where responses are cacheable. Dynamically
-  rendered pages answer `Cache-Control: private, no-store` and are skipped
-  entirely — which is precisely the traffic that hurts.
+- **A reverse-proxy cache** helps only where responses are cacheable. Next.js
+  [documents dynamically rendered pages](https://nextjs.org/docs/app/guides/self-hosting#automatic-caching)
+  as private and non-cacheable, so a conventional shared cache skips precisely
+  the traffic that hurts.
 - **Autoscaling** reacts on the order of tens of seconds. A traffic spike arrives
   in one.
 
 ## Why Harmost exists
 
-Because the useful unit to bound is *origin work*, not requests, and nothing in
-the usual toolbox bounds it per route with a queue, a deadline, and a defined
-answer for what happens when that queue overflows.
+Because the useful unit to bound is *origin work*, not requests, and few
+off-the-shelf proxy configurations combine per-route work limits, a bounded
+queue, a deadline, reuse-before-admission and a defined overload response.
 
 Request collapsing is old news — Varnish, `proxy_cache_lock`, Fastly and Apache
 Traffic Server have done it for years. Harmost's argument is the other half:
@@ -116,12 +118,12 @@ benchmark that demonstrates the mechanism locally.
 
 | Goal | Mechanism | Demonstrated by |
 | --- | --- | --- |
-| An origin is never asked to render more than it can | Global and per-route concurrency limits with bounded queues | [`bench/demo.sh`](#admission-control-benchmark) |
+| One Harmost process never admits more render work than its configured ceilings | Global and per-route concurrency limits with bounded queues | [`bench/demo.sh`](#admission-control-benchmark) |
 | A burst on one URL costs one render, not thousands | Request coalescing on the cache lock | [`bench/coalesce.sh`](#request-coalescing-benchmark) |
 | Collapsing does not destroy streaming | Waiters attach to the in-flight write | [`bench/stream.sh`](#streaming-coalescing-benchmark) |
 | Overload degrades predictably instead of collapsing | Bounded queues, deadlines, stale-or-shed | [`bench/demo.sh`](#admission-control-benchmark) |
-| Private responses are never shared | Absolute response-side barriers | [`bench/safety.sh`](#private-response-safety-check) |
-| A slow client cannot consume render capacity | Permits released when rendering ends | [`bench/slowclient.sh`](#slow-readers-and-render-capacity) |
+| Authorization-bearing requests and `Set-Cookie` responses are never shared | Absolute request/response barriers | [`bench/safety.sh`](#private-response-safety-check) |
+| A slow client cannot make Harmost release render capacity early | Permits remain held until observed origin end-of-stream; downstream writes have a timeout | [`bench/slowclient.sh`](#slow-readers-and-render-capacity) |
 
 What Harmost explicitly does **not** promise: lower latency. Bounding
 concurrency makes a burst slower on purpose — see the wall-clock discussion in
@@ -140,12 +142,27 @@ concurrency makes a burst slower on purpose — see the wall-clock discussion in
 - **Understands Next.js request variants**, including React Server Components,
   prefetch requests, draft mode, Server Actions, and static assets.
 - **Keeps private responses private** by treating `Set-Cookie`, authorization,
-  unsafe `Vary` headers, and private cache directives as absolute barriers.
+  unsafe `Vary` headers, unsafe methods and unsafe statuses as absolute
+  barriers. Origin `private`, `no-store` and `no-cache` directives are honoured
+  unless a route is explicitly fenced as public and configured to override
+  them. Cookie-bearing requests are private by default and likewise require an
+  explicit route assertion before reuse is considered.
 - **Balances requests across origins** with round-robin or path-stable hashing.
 
 Typical use cases include protecting Next.js storefronts during product drops,
 absorbing bursts on public SSR pages, and enforcing predictable origin capacity
 for mixed public, private, static, and dynamic routes.
+
+> [!NOTE]
+> **Harmost is not a replacement for NGINX, Apache, Caddy or a general-purpose
+> web server.** It is a specialised reverse proxy for governing SSR origin
+> work. It does not currently provide the broad feature set expected from a
+> general edge server, such as native TLS termination, full virtual-host/site
+> configuration, static file serving, redirects and rewrites, WebSocket
+> handling, authentication modules or a mature plugin ecosystem. Harmost may
+> occupy the reverse-proxy hop in a narrow deployment, but it is not a drop-in
+> substitute. A load balancer, ingress, CDN or conventional web server can
+> remain in front of it for those responsibilities.
 
 ## How Harmost works
 
@@ -164,10 +181,10 @@ Request collapsing is not new — Varnish, `proxy_cache_lock`, Fastly and Apache
 Traffic Server have all done it for years, and forty lines of `nginx.conf` will
 collapse a thousand concurrent hits on one URL down to a single origin request.
 
-What none of them do is bound *origin work* per route, with a bounded queue, a
-deadline on that queue, and stale-or-shed when it overflows. `limit_conn` caps
-connections with no queue deadline and no stale fallback. Envoy has adaptive
-concurrency but no notion of a render or a shareable document.
+Harmost's intended distinction is the combination: reuse equivalent work
+before applying per-route and global render ceilings, then use bounded queues
+and stale-or-shed overload handling. Similar pieces exist elsewhere; Harmost
+packages them around SSR work as one policy pipeline.
 
 So the demo that matters is not the cacheable one.
 
@@ -237,6 +254,11 @@ $ ./bench/stream.sh 20 5 400
 One render, twenty responses, and every waiter held the shell within 9 ms while
 that render was still in progress.
 
+The proxy behavior was also checked from the fixture's `X-Origin-Total` header.
+The current `stream.sh` log-based origin counter can incorrectly print `0`; the
+reporter fix is the first roadmap phase and the sample above shows the verified
+render count rather than that reporting error.
+
 ## Private-response safety check
 
 Same route, same permissive config. This path answers with `Set-Cookie`:
@@ -279,15 +301,15 @@ The example listens on `0.0.0.0:8080` and forwards requests to the upstreams
 defined in [`harmost.yaml`](./harmost.yaml). Update those upstream addresses
 before sending production traffic.
 
-Every claim in this README is reproducible. Each script starts its own test
-origin and proxy, runs the load, and tears both down:
+The mechanism claims in this README have local benchmark scripts. Each starts a
+test origin and proxy, runs load, and tears both down:
 
 ```bash
 ./bench/demo.sh 60 1000     # bounded admission: origin peak 10 vs 60 direct
 ./bench/coalesce.sh 100     # 100 concurrent requests, one origin render
 ./bench/stream.sh 20 5 400  # collapsing without breaking streaming
 ./bench/safety.sh 50        # a Set-Cookie response is never shared
-./bench/slowclient.sh       # slow readers do not hold render capacity
+./bench/slowclient.sh       # diagnose slow-reader backpressure and permit lifetime
 ./bench/reload.sh           # SIGHUP reload, including a refused one
 ```
 
@@ -318,8 +340,15 @@ The binary lands at `target/release/harmost`.
 `harmost check` exits non-zero on an invalid or unsafe configuration, so it
 works as a CI gate on a config change.
 
-Signals: `SIGHUP` reloads the configuration in place, `SIGTERM` shuts down
-gracefully, and `SIGQUIT` performs Pingora's graceful upgrade.
+Signals: `SIGHUP` reloads reloadable policy in place and `SIGTERM` asks Pingora
+for a graceful shutdown. Harmost does not yet expose Pingora's complete
+zero-downtime upgrade workflow, so do not treat `SIGQUIT` alone as an upgrade
+procedure.
+
+The current listener and upstream connections are cleartext HTTP. Terminate TLS
+at a load balancer or ingress in front of Harmost and keep the Harmost-to-origin
+network private. Native downstream/upstream TLS and trusted-proxy handling are
+roadmap items.
 
 ## Using Harmost with Next.js
 
@@ -413,15 +442,18 @@ with `upstreams: ["web.default.svc.cluster.local:3000"]`.
 Keep the Harmost replica count low. Coalescing only collapses requests that
 reach the *same* instance, so replicas divide the benefit — and an autoscaler
 that adds replicas during a spike reduces collapsing exactly when it is most
-wanted. If you need more than a few, have the Ingress consistent-hash on path
-so one key lands on one instance.
+wanted. Concurrency limits are also per process: two replicas configured with a
+ceiling of 100 can admit up to 200 origin requests between them. Size the
+per-process limit accordingly. If you need more than a few replicas, have the
+Ingress consistent-hash on path so one key lands on one instance.
 
 #### Where this does not work
 
-**Vercel, Netlify, and similar managed platforms.** They own the network path
-between the client and your application, and there is no place to insert
-another hop. Harmost needs infrastructure you control — a VPS, ECS, Fly,
-Kubernetes, bare metal. Self-hosted Next.js behind a CDN is the target.
+**A normal Vercel, Netlify, or similar managed deployment.** Those platforms do
+not provide a place to run Harmost immediately beside the application origin.
+Harmost currently targets infrastructure where you control both hops — a VPS,
+ECS, Fly, Kubernetes or bare metal — with optional CDN/TLS termination in
+front.
 
 ### A worked configuration
 
@@ -439,7 +471,7 @@ origin:
   # in-process render cache and JIT state.
   load_balancing: hash_by_path
   concurrency:
-    max: 200                 # total renders in flight across the whole origin
+    max: 200                 # per Harmost process, across this upstream pool
     queue:
       max: 1000
       timeout: 2s
@@ -519,25 +551,28 @@ telemetry:
 
 ### What the Next.js adapter handles for you
 
-These need no configuration and cannot be switched off:
+The adapter applies these classifications automatically. Route and response
+policy still decide whether reuse is ultimately allowed:
 
 - **React Server Components.** The same URL returns HTML or an RSC flight
   payload depending on the `RSC` header, so `RSC`, `Next-Router-Prefetch`,
   `Next-Router-State-Tree` and `Next-Url` are part of the cache key. Without
   that, a flight payload eventually gets served to a browser as a document.
-- **Prefetch requests** are collapsed but never stored — they are keyed by the
-  router state tree, whose cardinality is effectively unbounded.
-- **Server Actions** (`POST` carrying `Next-Action`) bypass the cache,
-  coalescing and retries.
+- **Prefetch requests** are marked coalesce-only and never stored. They are
+  collapsed only when the route and response policy permit sharing; the router
+  state tree makes persistent storage too high-cardinality.
+- **Server Actions** (`POST` carrying `Next-Action`) are classified as
+  mutations and bypass cache reuse and coalescing. They remain admission
+  controlled.
 - **Draft mode.** A request carrying `__prerender_bypass` or
-  `__next_preview_data` bypasses entirely, so unpublished content is never
-  stored or shared.
+  `__next_preview_data` bypasses reuse and is treated as private, so unpublished
+  content is never stored or shared. It remains admission controlled.
 
 ### Two things that will bite you
 
-**Next.js has no health endpoint.** The `health:` block in the example config
-points at `/healthz`, which a stock Next app does not serve — every backend
-would fail its probe. Add one:
+**Next.js has no guaranteed built-in health endpoint.** The repository's
+[`harmost.yaml`](./harmost.yaml) probes `/healthz`, which a stock application
+does not automatically provide — every backend would fail its probe. Add one:
 
 ```ts
 // app/healthz/route.ts
@@ -586,7 +621,7 @@ not completed production hardening or operational validation.
 | Request coalescing | implemented with `pingora-cache` cache locks |
 | Pingora proxy layer | proxy, routing, admission, upstream selection wired |
 | Cache and coalescing wiring | implemented; experimental |
-| Prometheus metrics, JSON access logs | done |
+| Prometheus metrics, JSON/text access logs | done |
 | Active health checks | done |
 | Graceful reload (SIGHUP) | done |
 | Stale-while-revalidate, stale-if-error | done |
@@ -595,8 +630,8 @@ not completed production hardening or operational validation.
 
 The security- and correctness-sensitive parts — cache-key construction, response
 shareability, and bounded admission — remain isolated as testable logic beneath
-the Pingora proxy layer. The full workspace test suite (111 tests) runs without
-network access.
+the Pingora proxy layer. The full workspace test suite (133 tests) runs without
+external network services.
 
 "done, tested" means unit-tested and, where a `bench/` script exists, verified
 end to end against a local test origin. It does not mean production-validated;
@@ -608,34 +643,94 @@ that is not running.
 
 ## Roadmap
 
-Ordered by what would most change the answer to "should I run this?".
+Ordered by dependency and risk rather than novelty. Later phases depend on the
+evidence and safety work before them.
 
-**Before it is worth trusting**
+### 0. Make the evidence trustworthy
 
-- Soak and adversarial testing against a real Next.js origin, not a fixture that
-  sleeps. Everything in this README is measured against the latter.
-- An independent review of the cache-key and shareability rules. They are the
-  parts where a bug leaks one user's page to another.
-- HTTP/2 and `Upgrade`/WebSocket paths, `Range` requests, and conditional
-  revalidation (`If-None-Match` to origin), none of which are exercised today.
+- Replace broad process-killing benchmark cleanup with exact PID tracking,
+  dynamic ports and machine-checked assertions. Fix the streaming origin-count
+  and reload-success reporters.
+- Add a real Next.js fixture covering the App Router, Pages Router, RSC,
+  prefetch, Server Actions, Draft Mode, streaming and `Set-Cookie` responses.
+- Run unit and integration tests in CI on Linux, with a smaller macOS build
+  matrix; publish benchmark parameters with results rather than treating one
+  laptop run as a baseline.
+- Add property tests and fuzz targets for cache-key canonicalisation,
+  `Cache-Control`, `Vary`, cookies and malformed HTTP metadata.
 
-**Next features**
+### 1. Close protocol and security gaps
 
-- Circuit breaking per backend, and least-loaded balancing with latency
-  observations.
-- A cache purge API and cache tags, so a deploy can invalidate precisely.
-- OpenTelemetry spans alongside the existing Prometheus metrics.
-- A `@harmost/next` package for route hints and deployment ids straight from the
-  application.
+- Exercise downstream and upstream HTTP/2 end to end, then add explicit tests
+  for `HEAD`, `Range`, conditional requests, disconnects and malformed bodies.
+- Support `Upgrade`/WebSocket traffic without weakening admission or cache
+  rules.
+- Add native downstream and upstream TLS, configurable trusted proxies, and
+  correct forwarded scheme/client-IP handling.
+- Write a threat model, run sustained adversarial tests, and obtain an
+  independent review of cache keys and response shareability.
+- Add a bounded response spool so a slow reader cannot retain a render permit
+  after the origin has actually finished.
 
-**Known incomplete**
+### 2. Become operable as a service
 
-- A slow reader can still delay origin end-of-stream and therefore occupy a render slot; bounded by
-  `timeouts.downstream_write` but not eliminated. See
-  [Slow readers and render capacity](#slow-readers-and-render-capacity).
-- Coalescing is per-instance. Two replicas mean up to two origin renders for one
-  key. Consistent-hashing on path at the ingress is the recommended workaround;
-  distributed coalescing is not planned.
+- Ship versioned release binaries and an OCI image with checksums, an SBOM and
+  reproducible build instructions.
+- Add readiness and administrative status endpoints that expose configuration
+  generation, backend state, cache usage and drain state without exposing
+  client-controlled cardinality.
+- Add OpenTelemetry spans and request correlation alongside the existing
+  Prometheus metrics and structured access logs.
+- Expose and test Pingora's complete zero-downtime upgrade workflow; document
+  systemd and Kubernetes drain procedures.
+- Version the configuration schema and provide migration notes before the
+  pre-1.0 format becomes an operational dependency.
+- Add soak, memory-pressure, restart and chaos tests with explicit release
+  gates, plus example Prometheus alerts and dashboards.
+
+### 3. Improve origin resilience
+
+- Add passive failure observation, per-backend circuit breakers and outlier
+  ejection alongside active health checks.
+- Add retry budgets for eligible idempotent requests only; never retry
+  mutations blindly.
+- Add least-loaded selection using in-flight work and latency observations.
+- Add weighted admission, route priorities and reserved capacity so a slow,
+  expensive route cannot starve cheap critical work.
+
+### 4. Complete cache lifecycle and framework integration
+
+- Add a purge API and cache tags, including deployment-safe invalidation and a
+  path from Next.js `revalidateTag()`/`revalidatePath()` events.
+- Replace FIFO eviction with a measured production policy and evaluate optional
+  disk or external storage without making it required for admission control.
+- Build a versioned `@harmost/next` integration that exports route hints,
+  deployment ids and invalidation events; maintain a tested Next.js
+  compatibility matrix.
+- Add adapters only after the generic policy contract is stable, starting with
+  frameworks that expose reliable route and privacy metadata.
+
+### 5. Adapt and scale deliberately
+
+- Evaluate adaptive concurrency only after latency and failure signals are
+  trustworthy; retain hard operator-defined ceilings as safety rails.
+- Define a multi-instance capacity model so replicas cannot accidentally
+  multiply the intended origin ceiling.
+- Keep distributed coalescing optional. Path-stable ingress routing remains the
+  simpler default; a distributed lock is justified only by measured need.
+
+### Current limitations and non-goals
+
+- A slow reader can delay observed origin end-of-stream and occupy a render
+  slot. `timeouts.downstream_write` bounds the stall but does not decouple it;
+  see [Slow readers and render capacity](#slow-readers-and-render-capacity).
+- Cache, coalescing and admission state are process-local. Replicas multiply
+  origin ceilings unless their limits are partitioned, and one key can render
+  once per replica.
+- The only cache backend is bounded in-process memory. Restarting clears it,
+  and FIFO eviction is intentionally simple rather than production-tuned.
+- Harmost does not terminate TLS, connect to TLS origins, or configure trusted
+  proxy boundaries yet.
 - `serde_yaml`, which is deprecated, still enters the dependency tree through
   `pingora-core`'s own config parsing. Harmost's config is parsed with
   `serde-saphyr`.
@@ -675,8 +770,8 @@ returned normally.
 
 ## Request coalescing and microcache architecture
 
-Harmost implements `pingora-cache`'s `Storage` trait rather than bringing its
-own store, and uses its cache lock for coalescing. The
+Harmost provides a bounded in-memory implementation of `pingora-cache`'s
+`Storage` trait and uses Pingora's cache lock for coalescing. The
 [spike](./spike/pingora-cache/FINDINGS.md) that settled this found that a waiter
 can attach to the leader's write *in progress* and receive the first chunk
 immediately, so collapsing duplicate requests does not cost every waiter the
