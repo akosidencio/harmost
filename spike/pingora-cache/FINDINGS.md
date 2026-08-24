@@ -15,9 +15,9 @@ ours to fix:
 
 * it is an unbounded `HashMap` with no byte budget — a memory-exhaustion vector
   in the one component whose job is to absorb traffic spikes;
-* `lookup_streaming_write` is `.expect("must have partial write in progress")`,
-  which turns a race between the lock release and a late waiter's lookup into a
-  process crash.
+* `lookup_streaming_write` is `.expect("must have partial write in progress")`;
+  the safe contract is to return `None` when the requested write tag vanished,
+  never to substitute another body for the same key.
 
 `BoundedStore` in this spike implements the same trait with a byte budget,
 eviction, and a graceful fallback on both paths. It is ~300 lines. That is
@@ -54,9 +54,11 @@ release every reader to the origin at once. Upstream flag it themselves in
 `ReadLock::wait`: *"need to be careful not to wake everyone up at the same
 time."*
 
-So "collapse with nothing stored" is expressed instead as **an entry born
-stale** — `fresh_until == created`. The in-flight herd collapses through the
-lock onto one render; no later request is ever served from it as fresh.
+The production implementation therefore uses a short-lived **fresh in-flight
+entry** marked as transient. Followers may read it while the leader is active,
+and the storage removes it instead of admitting it when the leader finishes.
+An entry born stale does not work through Pingora's full stale-lock state
+machine, even though a storage-only prototype can read its partial body.
 
 ## What this means for the architecture
 

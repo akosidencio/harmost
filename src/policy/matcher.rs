@@ -50,9 +50,11 @@ impl CompiledMatcher {
     pub fn compile(route_id: &str, m: &Matcher) -> Result<Self, MatcherError> {
         let (host, path, methods) = match m {
             Matcher::Path(p) => (None, p.clone(), None),
-            Matcher::Detailed(DetailedMatcher { host, path, methods }) => {
-                (host.clone(), path.clone(), methods.clone())
-            }
+            Matcher::Detailed(DetailedMatcher {
+                host,
+                path,
+                methods,
+            }) => (host.clone(), path.clone(), methods.clone()),
         };
 
         let glob = Glob::new(&path).map_err(|e| MatcherError {

@@ -329,22 +329,99 @@ gracefully, and `SIGQUIT` performs Pingora's graceful upgrade.
 > treat it as a worked illustration of the intended shape, not a deployment
 > guide. See [Project maturity](#project-maturity-and-expectations).
 
-### Where it sits
+### What you install, and where
+
+Harmost is a **standalone binary that runs as its own process**, in front of
+your Next.js server. It is not an npm package, not a dependency, not Next.js
+middleware, and not something you import. **Your application code does not
+change at all** — the only optional edit is adding a health endpoint, below.
+
+What changes is the network path. Today:
 
 ```
-CDN / load balancer
-        │
-        ▼
-    Harmost            one shared deployment, not a sidecar
-        │
-   ┌────┼────┐
-   ▼    ▼    ▼
- next next next        `next start`, port 3000
+client ──▶ next start (:3000)
 ```
 
-A shared deployment matters: coalescing only collapses requests that reach the
-*same* instance, so two replicas mean up to two origin renders for one key.
-Keep the replica count low, or have the ingress consistent-hash on path.
+With Harmost:
+
+```
+client ──▶ harmost (:8080) ──▶ next start (:3000)
+```
+
+Next.js stops being publicly reachable and listens only for Harmost. Whatever
+used to point at Next — your load balancer, your CDN origin, your DNS record —
+now points at Harmost instead.
+
+#### One server
+
+Both processes on the same box. Harmost takes the public port, Next binds to
+loopback so nothing can reach it directly.
+
+```yaml
+server:
+  listen: "0.0.0.0:8080"
+origin:
+  upstreams: ["127.0.0.1:3000"]
+```
+
+```bash
+# terminal 1 — or a systemd unit / pm2 process
+next start -p 3000 -H 127.0.0.1
+
+# terminal 2
+harmost run --config /etc/harmost/harmost.yaml
+```
+
+#### Docker Compose
+
+Harmost is the only service publishing a port; `web` is reachable only on the
+internal network. No image or Dockerfile ships with the project yet, so the
+image here is one you build from source yourself.
+
+```yaml
+services:
+  harmost:
+    image: harmost:local          # built from source; nothing is published
+    ports: ["8080:8080"]
+    volumes:
+      - ./harmost.yaml:/etc/harmost/harmost.yaml:ro
+    command: ["run", "--config", "/etc/harmost/harmost.yaml"]
+    depends_on: [web]
+
+  web:
+    image: my-next-app
+    expose: ["3000"]        # not `ports` — no host publishing
+```
+
+with `upstreams: ["web:3000"]`.
+
+#### Kubernetes
+
+Harmost is its own Deployment and Service, between the Ingress and the Next
+Service. The Next Service becomes `ClusterIP` and is no longer an Ingress
+backend.
+
+```
+Ingress ──▶ Service/harmost ──▶ Deployment/harmost (2 replicas)
+                                        │
+                                        ▼
+                               Service/web ──▶ Deployment/web (N pods)
+```
+
+with `upstreams: ["web.default.svc.cluster.local:3000"]`.
+
+Keep the Harmost replica count low. Coalescing only collapses requests that
+reach the *same* instance, so replicas divide the benefit — and an autoscaler
+that adds replicas during a spike reduces collapsing exactly when it is most
+wanted. If you need more than a few, have the Ingress consistent-hash on path
+so one key lands on one instance.
+
+#### Where this does not work
+
+**Vercel, Netlify, and similar managed platforms.** They own the network path
+between the client and your application, and there is no place to insert
+another hop. Harmost needs infrastructure you control — a VPS, ECS, Fly,
+Kubernetes, bare metal. Self-hosted Next.js behind a CDN is the target.
 
 ### A worked configuration
 
@@ -553,7 +630,7 @@ Ordered by what would most change the answer to "should I run this?".
 
 **Known incomplete**
 
-- A slow reader on a *chunked* response still occupies a render slot; bounded by
+- A slow reader can still delay origin end-of-stream and therefore occupy a render slot; bounded by
   `timeouts.downstream_write` but not eliminated. See
   [Slow readers and render capacity](#slow-readers-and-render-capacity).
 - Coalescing is per-instance. Two replicas mean up to two origin renders for one
@@ -580,52 +657,21 @@ concurrency, bounded queues, load shedding, health-aware balancing and the
 metrics. If the caching half were removed entirely this would still be worth
 running.
 
-**A permit models render capacity, not transfer.** Origin capacity is returned
-as soon as the origin stops rendering, so a client slowly downloading a finished
-page is not charged against the render budget. See below.
+**A permit models observable origin work.** Origin capacity is returned only
+when Pingora observes upstream end-of-stream. A `Content-Length` is not proof
+that generation has finished, so headers alone never release capacity.
 
 ## Slow readers and render capacity
 
-An origin permit represents *render* capacity, so when it is returned depends on
-whether the origin is still rendering. The response says which:
+Pingora couples upstream reads to bounded downstream channels. A sufficiently
+slow client can therefore delay the moment upstream end-of-stream is observed,
+for both fixed-length and chunked responses. `timeouts.downstream_write` bounds
+that delay. Decoupling it completely requires a separate bounded response spool;
+until then the conservative choice is to hold the permit rather than let a
+fixed-length streaming origin bypass the concurrency ceiling.
 
-**Buffered responses** carry a `Content-Length`, meaning the origin had the whole
-body before it began writing. Rendering is finished and what remains is bytes
-moving down a socket, so the permit is returned at the response header and a
-slow reader costs nothing.
-
-**Chunked responses** carry no `Content-Length`, so the origin is still
-producing and a blocked downstream write genuinely stalls it. The permit is held
-until the body ends, because there it is still buying something.
-
-The distinction matters because Pingora pairs upstream reads with downstream
-writes through a fixed four-task channel: the origin cannot run ahead of a slow
-client, so holding a permit until end-of-stream on a buffered response charged a
-client's entire download against the render budget.
-
-```
-$ ./bench/slowclient.sh
-
-ceiling = 2, two readers at 32KB/s, then one normal request
-
-  response                     status   latency   capacity returned?
-  buffered 1MiB                200      82ms      yes
-  buffered 4MiB                200      84ms      yes
-  buffered 16MiB               200      88ms      yes
-  streaming (chunked)          503      3048ms    no
-```
-
-Every buffered row above 2 MiB previously read `503 / 3030ms`: two clients
-reading at 32 KB/s could hold a ceiling of 2 for as long as they liked while the
-origin did no work at all.
-
-The streaming row is intended behaviour rather than a leftover bug, but it is
-still a way to occupy render slots if you serve long streams to untrusted
-clients. `timeouts.downstream_write` bounds it — at `2s` that row returns
-capacity as well.
-
-Each access log line records which path the request took, as
-`"permit_released":"headers"` or `"body_end"`.
+Each access log line records `"permit_released":"body_end"` when capacity was
+returned normally.
 
 ## Request coalescing and microcache architecture
 
@@ -669,11 +715,11 @@ override — collapsing duplicate renders persists nothing and lasts one render.
 
 Harmost builds the cache key as a *structure* — scheme, host, method, path,
 canonicalised query, the headers that select a variant, and the deployment id —
-rather than folding those into a number early. Query parameters are sorted so
-`?a=1&b=2` and `?b=2&a=1` are one entry, `Accept-Encoding` is normalised to
-`br` / `gzip` / `identity` so a brotli body never reaches a gzip-only client,
-and the Next.js RSC headers are included so a flight payload can never be served
-as an HTML document.
+rather than folding those into a number early. Query parameters are sorted only
+when keys are unique; duplicate-key order and `?flag` versus `?flag=` remain
+distinct. `Accept-Encoding` retains coding order and quality values, configured
+`Vary` headers join the framework variants, and the Next.js RSC headers are
+included so a flight payload can never be served as an HTML document.
 
 That structure is then rendered to one canonical string, with a separator that
 cannot occur inside any component so `host=a.com path=/b` cannot collide with

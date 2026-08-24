@@ -2,6 +2,7 @@
 
 pub mod health;
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,6 +12,7 @@ use crate::config::schema::LoadBalancing;
 pub struct Backend {
     pub id: usize,
     pub address: String,
+    pub socket: SocketAddr,
 }
 
 pub struct UpstreamPool {
@@ -24,17 +26,33 @@ pub struct UpstreamPool {
 }
 
 impl UpstreamPool {
-    pub fn new(addresses: &[String], strategy: LoadBalancing) -> Self {
+    pub fn new(addresses: &[String], strategy: LoadBalancing) -> Result<Self, String> {
         let backends = addresses
             .iter()
             .enumerate()
-            .map(|(id, address)| Backend { id, address: address.clone() })
-            .collect::<Vec<_>>();
+            .map(|(id, address)| {
+                let socket = address
+                    .to_socket_addrs()
+                    .map_err(|error| format!("could not resolve upstream `{address}`: {error}"))?
+                    .next()
+                    .ok_or_else(|| format!("upstream `{address}` resolved to no addresses"))?;
+                Ok(Backend {
+                    id,
+                    address: address.clone(),
+                    socket,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let healthy = backends
             .iter()
             .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(true)))
             .collect();
-        UpstreamPool { backends, strategy, cursor: AtomicUsize::new(0), healthy }
+        Ok(UpstreamPool {
+            backends,
+            strategy,
+            cursor: AtomicUsize::new(0),
+            healthy,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -56,7 +74,9 @@ impl UpstreamPool {
     }
 
     fn is_healthy(&self, id: usize) -> bool {
-        self.healthy.get(id).is_some_and(|h| h.load(Ordering::Relaxed))
+        self.healthy
+            .get(id)
+            .is_some_and(|h| h.load(Ordering::Relaxed))
     }
 
     /// Pick a backend for this path.
@@ -64,11 +84,17 @@ impl UpstreamPool {
         if self.backends.is_empty() {
             return None;
         }
-        let healthy: Vec<&Backend> = self.backends.iter().filter(|b| self.is_healthy(b.id)).collect();
+        let healthy: Vec<&Backend> = self
+            .backends
+            .iter()
+            .filter(|b| self.is_healthy(b.id))
+            .collect();
         // Nothing healthy: serve anyway rather than converting a degraded
         // origin into a guaranteed outage.
         let pool: &[&Backend] = if healthy.is_empty() {
-            return self.backends.get(self.next_index(path, self.backends.len()));
+            return self
+                .backends
+                .get(self.next_index(path, self.backends.len()));
         } else {
             &healthy
         };
@@ -101,16 +127,33 @@ mod tests {
 
     fn pool(strategy: LoadBalancing) -> UpstreamPool {
         UpstreamPool::new(
-            &["a:3000".to_string(), "b:3000".to_string(), "c:3000".to_string()],
+            &[
+                "127.0.0.1:3000".to_string(),
+                "127.0.0.2:3000".to_string(),
+                "127.0.0.3:3000".to_string(),
+            ],
             strategy,
         )
+        .unwrap()
     }
 
     #[test]
     fn round_robin_cycles_through_every_backend() {
         let p = pool(LoadBalancing::RoundRobin);
-        let picks: Vec<&str> = (0..6).map(|_| p.select("/x").unwrap().address.as_str()).collect();
-        assert_eq!(picks, ["a:3000", "b:3000", "c:3000", "a:3000", "b:3000", "c:3000"]);
+        let picks: Vec<&str> = (0..6)
+            .map(|_| p.select("/x").unwrap().address.as_str())
+            .collect();
+        assert_eq!(
+            picks,
+            [
+                "127.0.0.1:3000",
+                "127.0.0.2:3000",
+                "127.0.0.3:3000",
+                "127.0.0.1:3000",
+                "127.0.0.2:3000",
+                "127.0.0.3:3000",
+            ]
+        );
     }
 
     #[test]
@@ -125,8 +168,9 @@ mod tests {
     #[test]
     fn hash_by_path_spreads_distinct_paths() {
         let p = pool(LoadBalancing::HashByPath);
-        let ids: std::collections::HashSet<usize> =
-            (0..60).map(|i| p.select(&format!("/p/{i}")).unwrap().id).collect();
+        let ids: std::collections::HashSet<usize> = (0..60)
+            .map(|i| p.select(&format!("/p/{i}")).unwrap().id)
+            .collect();
         assert!(ids.len() > 1, "every path landed on one backend");
     }
 

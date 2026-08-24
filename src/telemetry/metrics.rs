@@ -73,7 +73,9 @@ pub static ORIGIN_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
         // Bucketed for server rendering, where 50ms is fast and 5s is a
         // problem — not for the sub-millisecond world the default buckets
         // assume.
-        vec![0.005, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]
+        vec![
+            0.005, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0
+        ]
     )
     .expect("metric registration")
 });
@@ -151,7 +153,9 @@ mod tests {
     fn no_metric_is_labelled_by_anything_client_controlled() {
         // Guards the rule in this module's docs. `upstream` and `limiter` are
         // config-derived, like `route`.
-        let allowed = ["route", "class", "status", "reason", "decision", "upstream", "limiter"];
+        let allowed = [
+            "route", "class", "status", "reason", "decision", "upstream", "limiter",
+        ];
         preregister();
         for family in prometheus::gather() {
             for metric in family.get_metric() {

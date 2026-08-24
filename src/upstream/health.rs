@@ -73,20 +73,39 @@ impl HealthChecker {
     async fn probe(&self, address: &str) -> bool {
         let attempt = async {
             let mut sock = TcpStream::connect(address).await.ok()?;
-            let host = address.split(':').next().unwrap_or(address);
+            let host = address
+                .rsplit_once(':')
+                .map(|(host, _)| host.trim_matches(['[', ']']))
+                .unwrap_or(address);
             let req = format!(
                 "GET {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: harmost-health\r\nConnection: close\r\n\r\n",
                 self.path
             );
             sock.write_all(req.as_bytes()).await.ok()?;
-            let mut buf = [0u8; 64];
-            let n = sock.read(&mut buf).await.ok()?;
-            let line = String::from_utf8_lossy(&buf[..n]);
+            let mut status = Vec::with_capacity(128);
+            let mut buf = [0u8; 128];
+            loop {
+                let n = sock.read(&mut buf).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                status.extend_from_slice(&buf[..n]);
+                if status.windows(2).any(|window| window == b"\r\n") {
+                    break;
+                }
+                if status.len() >= 1024 {
+                    return None;
+                }
+            }
+            let line = String::from_utf8_lossy(&status);
             // Any 2xx counts. A backend that answers 204 to its own health
             // endpoint is healthy, and insisting on 200 would be pedantry.
             Some(line.starts_with("HTTP/1.1 2") || line.starts_with("HTTP/1.0 2"))
         };
-        matches!(tokio::time::timeout(self.timeout, attempt).await, Ok(Some(true)))
+        matches!(
+            tokio::time::timeout(self.timeout, attempt).await,
+            Ok(Some(true))
+        )
     }
 }
 
@@ -119,10 +138,13 @@ mod tests {
     use crate::config::units::Dur;
 
     fn checker(healthy_after: u32, unhealthy_after: u32) -> HealthChecker {
-        let pool = Arc::new(UpstreamPool::new(
-            &["a:1".to_string(), "b:1".to_string()],
-            LoadBalancing::RoundRobin,
-        ));
+        let pool = Arc::new(
+            UpstreamPool::new(
+                &["127.0.0.1:1".to_string(), "127.0.0.2:1".to_string()],
+                LoadBalancing::RoundRobin,
+            )
+            .unwrap(),
+        );
         HealthChecker::new(
             pool,
             &Health {
@@ -140,7 +162,11 @@ mod tests {
         let c = checker(2, 3);
         assert_eq!(c.record(0, false), None);
         assert_eq!(c.record(0, false), None);
-        assert_eq!(c.record(0, false), Some(false), "flips on the third failure");
+        assert_eq!(
+            c.record(0, false),
+            Some(false),
+            "flips on the third failure"
+        );
     }
 
     #[test]

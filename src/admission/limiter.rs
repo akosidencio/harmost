@@ -52,10 +52,14 @@ impl Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // Return the permit first, then settle any shrink still owed. Order
-        // matters: the debt can only be paid out of *available* permits.
-        drop(self.inner.take());
-        self.limiter.settle_debt();
+        if let Some(permit) = self.inner.take()
+            && self.limiter.claim_debt()
+        {
+            // Absorb this returned permit directly. Returning it to the
+            // semaphore first lets an already-queued waiter steal it before
+            // a downward resize can collect its debt.
+            permit.forget();
+        }
     }
 }
 
@@ -79,7 +83,12 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    pub fn new(name: impl Into<String>, limit: usize, queue_max: usize, queue_timeout: Duration) -> Arc<Self> {
+    pub fn new(
+        name: impl Into<String>,
+        limit: usize,
+        queue_max: usize,
+        queue_timeout: Duration,
+    ) -> Arc<Self> {
         Arc::new(Limiter {
             name: name.into(),
             sem: Arc::new(Semaphore::new(limit)),
@@ -136,19 +145,18 @@ impl Limiter {
         }
     }
 
-    fn settle_debt(&self) {
-        if self.debt.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        // Take one permit back per release until the shrink is paid off.
-        if self.sem.forget_permits(1) == 1 {
-            let _ = self.debt.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| d.checked_sub(1));
-        }
+    fn claim_debt(&self) -> bool {
+        self.debt
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |debt| {
+                debt.checked_sub(1)
+            })
+            .is_ok()
     }
 
     pub fn set_queue(&self, max: usize, timeout: Duration) {
         self.queue_max.store(max, Ordering::Relaxed);
-        self.queue_timeout_ms.store(timeout.as_millis() as usize, Ordering::Relaxed);
+        self.queue_timeout_ms
+            .store(timeout.as_millis() as usize, Ordering::Relaxed);
     }
 
     pub fn queue_timeout(&self) -> Duration {
@@ -159,10 +167,17 @@ impl Limiter {
     ///
     /// `deadline` bounds the *total* wait, so a request crossing several
     /// limiters cannot spend each one's queue timeout in turn.
-    pub async fn acquire(self: &Arc<Self>, deadline: Option<Instant>) -> Result<Permit, ShedReason> {
+    pub async fn acquire(
+        self: &Arc<Self>,
+        deadline: Option<Instant>,
+    ) -> Result<Permit, ShedReason> {
         if let Ok(p) = self.sem.clone().try_acquire_owned() {
             self.admitted.fetch_add(1, Ordering::Relaxed);
-            return Ok(Permit { inner: Some(p), limiter: self.clone(), companion: None });
+            return Ok(Permit {
+                inner: Some(p),
+                limiter: self.clone(),
+                companion: None,
+            });
         }
 
         let queue_max = self.queue_max.load(Ordering::Relaxed);
@@ -181,6 +196,9 @@ impl Limiter {
             return Err(ShedReason::QueueFull);
         }
         self.queued.fetch_add(1, Ordering::Relaxed);
+        let queue_slot = QueueSlot {
+            limiter: self.clone(),
+        };
 
         let wait = match deadline {
             Some(d) => d.saturating_duration_since(Instant::now()),
@@ -188,12 +206,16 @@ impl Limiter {
         };
 
         let result = tokio::time::timeout(wait, self.sem.clone().acquire_owned()).await;
-        self.queue_depth.fetch_sub(1, Ordering::SeqCst);
+        drop(queue_slot);
 
         match result {
             Ok(Ok(p)) => {
                 self.admitted.fetch_add(1, Ordering::Relaxed);
-                Ok(Permit { inner: Some(p), limiter: self.clone(), companion: None })
+                Ok(Permit {
+                    inner: Some(p),
+                    limiter: self.clone(),
+                    companion: None,
+                })
             }
             // The semaphore is closed only at shutdown.
             Ok(Err(_)) => {
@@ -205,6 +227,16 @@ impl Limiter {
                 Err(ShedReason::QueueTimeout)
             }
         }
+    }
+}
+
+struct QueueSlot {
+    limiter: Arc<Limiter>,
+}
+
+impl Drop for QueueSlot {
+    fn drop(&mut self) {
+        self.limiter.queue_depth.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -245,6 +277,12 @@ mod tests {
         // The next arrival is refused rather than queued.
         assert_eq!(l.acquire(None).await.unwrap_err(), ShedReason::QueueFull);
         waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(
+            l.queue_depth(),
+            0,
+            "cancelled waiters must return their queue slot"
+        );
     }
 
     #[tokio::test]
@@ -279,13 +317,25 @@ mod tests {
         assert_eq!(l.limit(), 1);
 
         drop(a);
-        assert!(l.acquire(None).await.is_err(), "still 3 in flight against a ceiling of 1");
+        assert!(
+            l.acquire(None).await.is_err(),
+            "still 3 in flight against a ceiling of 1"
+        );
         drop(b);
-        assert!(l.acquire(None).await.is_err(), "still 2 in flight against a ceiling of 1");
+        assert!(
+            l.acquire(None).await.is_err(),
+            "still 2 in flight against a ceiling of 1"
+        );
         drop(c);
-        assert!(l.acquire(None).await.is_err(), "still 1 in flight against a ceiling of 1");
+        assert!(
+            l.acquire(None).await.is_err(),
+            "still 1 in flight against a ceiling of 1"
+        );
         drop(d);
-        assert!(l.acquire(None).await.is_ok(), "now empty, one permit is correct");
+        assert!(
+            l.acquire(None).await.is_ok(),
+            "now empty, one permit is correct"
+        );
     }
 
     #[tokio::test]
@@ -298,5 +348,27 @@ mod tests {
         drop(a);
         assert!(l.acquire(None).await.is_ok());
         assert_eq!(l.limit(), 4);
+    }
+
+    #[tokio::test]
+    async fn shrinking_absorbs_a_returned_permit_before_a_waiter_can_take_it() {
+        let l = lim(2, 1, 5_000);
+        let a = l.acquire(None).await.unwrap();
+        let b = l.acquire(None).await.unwrap();
+        let waiting_limiter = l.clone();
+        let mut waiter = tokio::spawn(async move { waiting_limiter.acquire(None).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        l.resize(1);
+        drop(a);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err(),
+            "the shrink debt was handed to a queued request"
+        );
+
+        drop(b);
+        assert!(waiter.await.unwrap().is_ok());
     }
 }

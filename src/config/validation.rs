@@ -25,12 +25,27 @@ pub fn validate(cfg: &Config) -> Result<()> {
         )));
     }
     if cfg.origin.upstreams.is_empty() {
-        return Err(err("origin.upstreams is empty; there is nothing to proxy to"));
+        return Err(err(
+            "origin.upstreams is empty; there is nothing to proxy to",
+        ));
     }
     if cfg.origin.concurrency.max == 0 {
         return Err(err(
             "origin.concurrency.max is 0, which admits nothing; omit the key to take the default",
         ));
+    }
+    if cfg.cache.max_memory.get() == 0 {
+        return Err(err("cache.max_memory must be greater than zero"));
+    }
+    if cfg.cache.max_body_size.get() == 0 {
+        return Err(err("cache.max_body_size must be greater than zero"));
+    }
+    if cfg.cache.max_body_size > cfg.cache.max_memory {
+        return Err(err(format!(
+            "cache.max_body_size ({} bytes) exceeds cache.max_memory ({} bytes)",
+            cfg.cache.max_body_size.get(),
+            cfg.cache.max_memory.get()
+        )));
     }
     if !(400..=599).contains(&cfg.overload.status) {
         return Err(err(format!(
@@ -42,6 +57,35 @@ pub fn validate(cfg: &Config) -> Result<()> {
         return Err(err(
             "deployment.id and deployment.id_header are both set; pick one source of truth",
         ));
+    }
+    if cfg.deployment.id.as_ref().is_some_and(|id| {
+        id.chars()
+            .any(|c| matches!(c, '\u{1d}' | '\u{1e}' | '\u{1f}'))
+    }) {
+        return Err(err("deployment.id contains a reserved cache-key separator"));
+    }
+
+    validate_listen(&cfg.server.listen, "server.listen")?;
+    if let Some(prometheus) = &cfg.telemetry.prometheus {
+        validate_listen(&prometheus.listen, "telemetry.prometheus.listen")?;
+    }
+    for upstream in &cfg.origin.upstreams {
+        validate_upstream(upstream)?;
+    }
+    if let Some(health) = &cfg.health {
+        if !health.path.starts_with('/') {
+            return Err(err("health.path must start with `/`"));
+        }
+        if health.interval == super::units::Dur::ZERO || health.timeout == super::units::Dur::ZERO {
+            return Err(err(
+                "health.interval and health.timeout must be greater than zero",
+            ));
+        }
+        if health.healthy_after == 0 || health.unhealthy_after == 0 {
+            return Err(err(
+                "health.healthy_after and health.unhealthy_after must be greater than zero",
+            ));
+        }
     }
 
     check_unimplemented(cfg)?;
@@ -77,13 +121,33 @@ fn check_unimplemented(cfg: &Config) -> Result<()> {
              deployment.id instead",
         ));
     }
-    if cfg.coalesce.wait_timeout.is_some()
-        && cfg.coalesce.on_timeout != OnCoalesceTimeout::StaleOrShed
-    {
-        return Err(err(
-            "coalesce.on_timeout: requeue is not implemented; waiters are released by the \
-             cache lock and then re-enter admission individually",
-        ));
+    Ok(())
+}
+
+fn validate_listen(address: &str, path: &str) -> Result<()> {
+    address
+        .parse::<std::net::SocketAddr>()
+        .map(|_| ())
+        .map_err(|_| {
+            err(format!(
+                "{path} `{address}` is not a valid IP socket address"
+            ))
+        })
+}
+
+fn validate_upstream(address: &str) -> Result<()> {
+    let (host, port) = address
+        .rsplit_once(':')
+        .ok_or_else(|| err(format!("origin upstream `{address}` has no port")))?;
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        return Err(err(format!(
+            "origin upstream `{address}` is not a valid host:port"
+        )));
+    }
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err(err(format!(
+            "origin upstream `{address}` uses an IPv6 address without brackets"
+        )));
     }
     Ok(())
 }
@@ -122,7 +186,9 @@ fn check_route(route: &Route) -> Result<()> {
 
     if let Some(c) = &route.concurrency {
         if c.max == 0 {
-            return Err(err(format!("route `{id}`: concurrency.max is 0, which admits nothing")));
+            return Err(err(format!(
+                "route `{id}`: concurrency.max is 0, which admits nothing"
+            )));
         }
         check_queue(c, &format!("route `{id}`.concurrency"))?;
     }
@@ -189,6 +255,31 @@ fn check_route(route: &Route) -> Result<()> {
              per-user responses are never shared between requests"
         )));
     }
+    if route
+        .coalesce
+        .as_ref()
+        .is_some_and(|co| co.override_origin && co.enabled == Some(false))
+    {
+        return Err(err(format!(
+            "route `{id}` sets coalesce.override_origin while coalescing is disabled"
+        )));
+    }
+
+    if let Some(vary) = route.cache.as_ref().and_then(|cache| cache.vary.as_ref()) {
+        let mut seen = HashSet::new();
+        for name in &vary.headers {
+            let parsed = http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                err(format!(
+                    "route `{id}`: cache.vary header `{name}` is invalid"
+                ))
+            })?;
+            if !seen.insert(parsed) {
+                return Err(err(format!(
+                    "route `{id}`: cache.vary repeats header `{name}`"
+                )));
+            }
+        }
+    }
 
     Ok(())
 }
@@ -241,7 +332,10 @@ coalesce:
 "
         ));
         let e = validate(&cfg).unwrap_err();
-        assert!(e.to_string().contains("shorter than timeouts.origin"), "{e}");
+        assert!(
+            e.to_string().contains("shorter than timeouts.origin"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -324,7 +418,12 @@ routes:
         headers: [\"Cookie\"]
 "
         ));
-        assert!(validate(&cfg).unwrap_err().to_string().contains("credential header"));
+        assert!(
+            validate(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("credential header")
+        );
     }
 
     #[test]
@@ -341,7 +440,12 @@ routes:
         timeout: 0s
 "
         ));
-        assert!(validate(&cfg).unwrap_err().to_string().contains("no deadline"));
+        assert!(
+            validate(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("no deadline")
+        );
     }
 
     #[test]
@@ -350,7 +454,10 @@ routes:
         // ships believing a protection is enabled.
         for (yaml, want) in [
             ("cache:\n  respect_origin: false\n", "respect_origin"),
-            ("deployment:\n  id_header: \"X-Deployment-ID\"\n", "id_header"),
+            (
+                "deployment:\n  id_header: \"X-Deployment-ID\"\n",
+                "id_header",
+            ),
         ] {
             let cfg = parse(&format!("{BASE}{yaml}"));
             let e = validate(&cfg).unwrap_err().to_string();
@@ -375,6 +482,66 @@ routes:
     match: \"/b\"
 "
         ));
-        assert!(validate(&cfg).unwrap_err().to_string().contains("duplicate route id"));
+        assert!(
+            validate(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate route id")
+        );
+    }
+
+    #[test]
+    fn rejects_a_body_limit_larger_than_the_cache_budget() {
+        let cfg = parse(&format!(
+            "{BASE}cache:\n  max_memory: 1KiB\n  max_body_size: 2KiB\n"
+        ));
+        assert!(
+            validate(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds cache.max_memory")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_listeners_and_upstreams_before_pingora_can_panic() {
+        let cfg = parse(
+            "version: 1\nserver:\n  listen: nope\norigin:\n  upstreams: [\"missing-port\"]\n",
+        );
+        assert!(
+            validate(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("server.listen")
+        );
+
+        let cfg = parse("version: 1\norigin:\n  upstreams: [\"missing-port\"]\n");
+        assert!(
+            validate(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("has no port")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_vary_headers() {
+        for headers in [
+            "[\"bad header\"]",
+            "[\"Accept-Language\", \"accept-language\"]",
+        ] {
+            let cfg = parse(&format!(
+                "{BASE}routes:\n  - id: r\n    match: /x\n    cache:\n      vary:\n        headers: {headers}\n"
+            ));
+            assert!(validate(&cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_requeue_now_that_lock_timeouts_have_an_implemented_path() {
+        let cfg = parse(&format!(
+            "{BASE}coalesce:\n  wait_timeout: 30s\n  on_timeout: requeue\n"
+        ));
+        validate(&cfg).unwrap();
     }
 }

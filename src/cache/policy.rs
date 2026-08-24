@@ -62,7 +62,11 @@ pub enum Disposition {
 /// What may be done with the response that came back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shareability {
-    Shareable { ttl: Duration, swr: Duration, sie: Duration },
+    Shareable {
+        ttl: Duration,
+        swr: Duration,
+        sie: Duration,
+    },
     /// Safe to hand to the waiters already attached to this flight, but not to
     /// store. Used for `coalesce.override_origin` and for high-cardinality
     /// variants like Next prefetch payloads.
@@ -131,6 +135,8 @@ pub fn evaluate_request(
     framework_bypass: Option<&'static str>,
     route: Option<&RouteCache>,
     coalesce_override: bool,
+    cache_enabled: bool,
+    coalesce_enabled: bool,
 ) -> Disposition {
     if let Some(f) = framework_bypass {
         return Disposition::Bypass(BypassReason::Framework(f));
@@ -141,7 +147,7 @@ pub fn evaluate_request(
     if req.has_authorization() {
         return Disposition::Bypass(BypassReason::Authorization);
     }
-    if route.is_some_and(|r| r.enabled == Some(false)) {
+    if !cache_enabled && !coalesce_enabled {
         return Disposition::Bypass(BypassReason::RouteDisabled);
     }
     if !class.storable_in_principle() && !class.coalescible_in_principle() {
@@ -154,8 +160,8 @@ pub fn evaluate_request(
         return Disposition::Bypass(BypassReason::Cookie);
     }
     Disposition::Eligible {
-        may_store: class.storable_in_principle(),
-        may_coalesce: class.coalescible_in_principle(),
+        may_store: cache_enabled && class.storable_in_principle(),
+        may_coalesce: coalesce_enabled && class.coalescible_in_principle(),
     }
 }
 
@@ -167,8 +173,9 @@ pub fn evaluate_request(
 pub fn evaluate_response(
     res: &ResponseMetadata<'_>,
     route: Option<&RouteCache>,
-    key_headers: &[&str],
+    key_headers: &[String],
     coalesce_only: bool,
+    coalesce_override: bool,
 ) -> Shareability {
     // --- Absolute rules. No configuration reaches past these. ---
 
@@ -191,11 +198,17 @@ pub fn evaluate_response(
 
     // --- Origin directives, which a fenced route override may outrank. ---
 
-    let cc = res.cache_control.map(CacheControl::parse).unwrap_or_default();
+    let cc = res
+        .cache_control
+        .map(CacheControl::parse)
+        .unwrap_or_default();
     let override_origin = route.is_some_and(|r| r.override_origin);
-    let route_max = route.and_then(|r| r.ttl.as_ref()).and_then(|t| t.max).map(|d| d.as_duration());
+    let route_max = route
+        .and_then(|r| r.ttl.as_ref())
+        .and_then(|t| t.max)
+        .map(|d| d.as_duration());
 
-    if !override_origin {
+    if !override_origin && !coalesce_override {
         if cc.no_store {
             return Shareability::NotShareable(BypassReason::NoStore);
         }
@@ -250,7 +263,7 @@ pub fn evaluate_response(
 }
 
 /// Returns the first `Vary` token the cache key cannot honour.
-fn unsupported_vary(vary: &str, key_headers: &[&str]) -> Option<String> {
+fn unsupported_vary(vary: &str, key_headers: &[String]) -> Option<String> {
     for token in vary.split(',') {
         let token = token.trim().to_ascii_lowercase();
         if token.is_empty() {
@@ -275,15 +288,23 @@ mod tests {
     use super::*;
     use crate::config::schema::{RouteCache, Ttl};
     use crate::config::units::Dur;
+    use http::{HeaderMap, Method};
 
     fn res<'a>(status: u16, cc: Option<&'a str>) -> ResponseMetadata<'a> {
-        ResponseMetadata { status, cache_control: cc, set_cookie: false, vary: None }
+        ResponseMetadata {
+            status,
+            cache_control: cc,
+            set_cookie: false,
+            vary: None,
+        }
     }
 
     fn route_with_override(ttl_secs: u64) -> RouteCache {
         RouteCache {
             override_origin: true,
-            ttl: Some(Ttl { max: Some(Dur(Duration::from_secs(ttl_secs))) }),
+            ttl: Some(Ttl {
+                max: Some(Dur(Duration::from_secs(ttl_secs))),
+            }),
             ..Default::default()
         }
     }
@@ -306,7 +327,7 @@ mod tests {
     fn private_response_is_never_stored() {
         let r = res(200, Some("private, no-store"));
         assert_eq!(
-            evaluate_response(&r, None, &[], false),
+            evaluate_response(&r, None, &[], false, false),
             Shareability::NotShareable(BypassReason::NoStore)
         );
     }
@@ -323,7 +344,7 @@ mod tests {
         };
         let route = route_with_override(2);
         assert_eq!(
-            evaluate_response(&r, Some(&route), &[], false),
+            evaluate_response(&r, Some(&route), &[], false, false),
             Shareability::NotShareable(BypassReason::SetCookie)
         );
     }
@@ -337,7 +358,7 @@ mod tests {
             vary: Some("Cookie"),
         };
         assert!(matches!(
-            evaluate_response(&r, None, &["rsc"], false),
+            evaluate_response(&r, None, &["rsc".into()], false, false),
             Shareability::NotShareable(BypassReason::UnsupportedVary(_))
         ));
     }
@@ -351,7 +372,7 @@ mod tests {
             vary: Some("RSC, Accept-Encoding"),
         };
         assert!(matches!(
-            evaluate_response(&r, None, &["rsc"], false),
+            evaluate_response(&r, None, &["rsc".into()], false, false),
             Shareability::Shareable { .. }
         ));
     }
@@ -365,7 +386,7 @@ mod tests {
             vary: Some("*"),
         };
         assert!(matches!(
-            evaluate_response(&r, None, &["rsc"], false),
+            evaluate_response(&r, None, &["rsc".into()], false, false),
             Shareability::NotShareable(BypassReason::UnsupportedVary(_))
         ));
     }
@@ -373,19 +394,25 @@ mod tests {
     #[test]
     fn route_ttl_ceiling_shrinks_but_never_grows_origin_ttl() {
         let route = RouteCache {
-            ttl: Some(Ttl { max: Some(Dur(Duration::from_secs(2))) }),
+            ttl: Some(Ttl {
+                max: Some(Dur(Duration::from_secs(2))),
+            }),
             ..Default::default()
         };
         // origin 60s, route ceiling 2s -> 2s
         let r = res(200, Some("public, s-maxage=60"));
         assert_eq!(
-            evaluate_response(&r, Some(&route), &[], false),
-            Shareability::Shareable { ttl: Duration::from_secs(2), swr: Duration::ZERO, sie: Duration::ZERO }
+            evaluate_response(&r, Some(&route), &[], false, false),
+            Shareability::Shareable {
+                ttl: Duration::from_secs(2),
+                swr: Duration::ZERO,
+                sie: Duration::ZERO
+            }
         );
         // origin 1s, route ceiling 2s -> 1s, not 2s
         let r = res(200, Some("public, s-maxage=1"));
         assert!(matches!(
-            evaluate_response(&r, Some(&route), &[], false),
+            evaluate_response(&r, Some(&route), &[], false, false),
             Shareability::Shareable { ttl, .. } if ttl == Duration::from_secs(1)
         ));
     }
@@ -394,10 +421,13 @@ mod tests {
     fn override_lets_a_no_store_next_route_microcache() {
         // Without this, a dynamically rendered Next page is never cached and
         // the product's headline demo cannot run.
-        let r = res(200, Some("private, no-cache, no-store, max-age=0, must-revalidate"));
+        let r = res(
+            200,
+            Some("private, no-cache, no-store, max-age=0, must-revalidate"),
+        );
         let route = route_with_override(2);
         assert!(matches!(
-            evaluate_response(&r, Some(&route), &[], false),
+            evaluate_response(&r, Some(&route), &[], false, false),
             Shareability::Shareable { ttl, .. } if ttl == Duration::from_secs(2)
         ));
     }
@@ -405,14 +435,17 @@ mod tests {
     #[test]
     fn coalesce_only_shares_the_flight_without_storing() {
         let r = res(200, Some("public, s-maxage=60"));
-        assert_eq!(evaluate_response(&r, None, &[], true), Shareability::TransientOnly);
+        assert_eq!(
+            evaluate_response(&r, None, &[], true, false),
+            Shareability::TransientOnly
+        );
     }
 
     #[test]
     fn uncacheable_status_is_not_shared() {
         let r = res(500, Some("public, s-maxage=60"));
         assert_eq!(
-            evaluate_response(&r, None, &[], false),
+            evaluate_response(&r, None, &[], false, false),
             Shareability::NotShareable(BypassReason::Status(500))
         );
     }
@@ -422,8 +455,68 @@ mod tests {
         // No Cache-Control at all is not permission to cache.
         let r = res(200, None);
         assert!(matches!(
-            evaluate_response(&r, None, &[], false),
+            evaluate_response(&r, None, &[], false, false),
             Shareability::NotShareable(_)
         ));
+    }
+
+    #[test]
+    fn coalesce_override_can_share_no_store_for_one_flight_only() {
+        let r = res(200, Some("private, no-cache, no-store"));
+        assert_eq!(
+            evaluate_response(&r, None, &[], true, true),
+            Shareability::TransientOnly
+        );
+    }
+
+    #[test]
+    fn coalescing_can_remain_enabled_when_persistent_caching_is_off() {
+        let headers = HeaderMap::new();
+        let req = RequestMetadata {
+            method: &Method::GET,
+            host: "example.com",
+            path: "/page",
+            query: None,
+            headers: &headers,
+        };
+        assert_eq!(
+            evaluate_request(
+                &req,
+                RequestClass::PublicDocument,
+                None,
+                None,
+                false,
+                false,
+                true,
+            ),
+            Disposition::Eligible {
+                may_store: false,
+                may_coalesce: true
+            }
+        );
+    }
+
+    #[test]
+    fn disabling_cache_and_coalescing_bypasses_pingora_cache_entirely() {
+        let headers = HeaderMap::new();
+        let req = RequestMetadata {
+            method: &Method::GET,
+            host: "example.com",
+            path: "/page",
+            query: None,
+            headers: &headers,
+        };
+        assert_eq!(
+            evaluate_request(
+                &req,
+                RequestClass::PublicDocument,
+                None,
+                None,
+                false,
+                false,
+                false,
+            ),
+            Disposition::Bypass(BypassReason::RouteDisabled)
+        );
     }
 }

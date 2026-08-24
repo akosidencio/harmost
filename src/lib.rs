@@ -13,16 +13,15 @@
 //!   both before and *after* the origin responds.
 //! * [`admission`] — bounding how much origin work may be in flight.
 //!
-//! The proxy layer (Pingora) sits on top of these and is deliberately absent
-//! from this crate's dependency graph for now.
+//! The Pingora proxy layer sits on top of these pure policy components.
 
 pub mod admission;
 pub mod cache;
 pub mod classifier;
 pub mod config;
 pub mod policy;
-pub mod telemetry;
 pub mod proxy;
+pub mod telemetry;
 pub mod upstream;
 
 pub use classifier::RequestClass;

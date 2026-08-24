@@ -1,16 +1,9 @@
 #!/usr/bin/env bash
 # Can a slow reader occupy origin capacity it is not using?
 #
-# An origin permit models *render* capacity. Two response shapes behave
-# differently and both are checked here:
-#
-#   buffered  (Content-Length present) — the origin had the whole body before
-#             it started writing, so the render is done. The permit is returned
-#             at the response header and a slow reader costs nothing.
-#
-#   streaming (chunked, no Content-Length) — the origin is still producing, and
-#             a blocked downstream write really does stall it. Holding the
-#             permit is correct here; `timeouts.downstream_write` bounds it.
+# A Content-Length does not prove the origin has finished producing the body.
+# This diagnostic shows when downstream backpressure delays observed upstream
+# end-of-stream for fixed-length and chunked responses alike.
 set -uo pipefail
 set +m
 cd "$(dirname "$0")/.."
@@ -62,24 +55,13 @@ echo "timeouts.downstream_write = $DW"
 echo
 printf '  %-28s %-8s %-9s %s\n' "response" "status" "latency" "capacity returned?"
 
-FAIL=0
 for MIB in 1 4 16; do
   probe "http://127.0.0.1:8080/big/x/$MIB" "buffered ${MIB}MiB"
-  [ "$RESULT" = "yes" ] || FAIL=1
 done
 probe "http://127.0.0.1:8080/bigstream/40" "streaming (chunked)"
 STREAM_RESULT=$RESULT
 
 echo
-if [ "$FAIL" = "0" ]; then
-  echo "PASS: buffered responses return render capacity at the response header,"
-  echo "      so a slow reader no longer occupies a render slot at any size."
-else
-  echo "FAIL: a slow reader is holding a permit on a buffered response."
-  exit 1
-fi
-echo
-echo "Streaming, by contrast: capacity returned = $STREAM_RESULT."
-echo "That is expected — a chunked response means the origin is still rendering,"
-echo "so the permit is still buying something. Lower timeouts.downstream_write"
-echo "if you serve long streams to untrusted clients."
+echo "Chunked response capacity returned = $STREAM_RESULT."
+echo "Any row that reads 'no' is bounded by timeouts.downstream_write; Harmost no"
+echo "longer treats Content-Length as evidence that origin work has completed."

@@ -22,7 +22,7 @@ pub struct AccessLog<'a> {
     pub shed: bool,
     pub origin_ms: u128,
     pub total_ms: u128,
-    /// Where the origin permit was returned: "headers", "body_end", or "-"
+    /// Where the origin permit was returned: "body_end" or "-"
     /// when this request never held one.
     pub permit_released_at: &'a str,
 }
@@ -41,6 +41,33 @@ impl AccessLog<'_> {
         let _ = write!(
             s,
             "\"status\":{},\"shed\":{},\"origin_ms\":{},\"total_ms\":{}}}",
+            self.status, self.shed, self.origin_ms, self.total_ms
+        );
+        s
+    }
+
+    pub fn to_text(&self) -> String {
+        let mut s = String::with_capacity(224);
+        for (key, value) in [
+            ("method", self.method),
+            ("path", self.path),
+            ("route", self.route),
+            ("class", self.class),
+            ("cache", self.cache),
+            ("upstream", self.upstream.unwrap_or("-")),
+            ("permit_released", self.permit_released_at),
+        ] {
+            if !s.is_empty() {
+                s.push(' ');
+            }
+            s.push_str(key);
+            s.push_str("=\"");
+            escape_into(&mut s, value);
+            s.push('"');
+        }
+        let _ = write!(
+            s,
+            " status={} shed={} origin_ms={} total_ms={}",
             self.status, self.shed, self.origin_ms, self.total_ms
         );
         s
@@ -109,7 +136,11 @@ mod tests {
     fn a_quote_in_the_path_cannot_break_the_line() {
         let out = log(r#"/a"b"#);
         assert!(out.contains(r#""path":"/a\"b""#), "{out}");
-        assert_eq!(out.matches(r#"","#).count(), 7, "field count changed: {out}");
+        assert_eq!(
+            out.matches(r#"","#).count(),
+            7,
+            "field count changed: {out}"
+        );
     }
 
     #[test]
@@ -125,7 +156,10 @@ mod tests {
         let out = log("/a\nb\tc");
         assert!(out.contains("\\n"), "{out}");
         assert!(out.contains("\\t"), "{out}");
-        assert!(!out.contains('\n'), "a raw newline would split the log line");
+        assert!(
+            !out.contains('\n'),
+            "a raw newline would split the log line"
+        );
     }
 
     #[test]
@@ -151,5 +185,27 @@ mod tests {
         }
         .to_json();
         assert!(out.contains(r#""upstream":"-""#));
+    }
+
+    #[test]
+    fn text_format_escapes_attacker_controlled_values() {
+        let mut out = log("/safe");
+        assert!(out.starts_with('{'));
+        let entry = AccessLog {
+            method: "GET",
+            path: "/x\nforged=true",
+            route: "r",
+            class: "public_document",
+            cache: "hit",
+            upstream: None,
+            status: 200,
+            shed: false,
+            origin_ms: 1,
+            total_ms: 2,
+            permit_released_at: "body_end",
+        };
+        out = entry.to_text();
+        assert!(!out.contains('\n'));
+        assert!(out.contains("\\n"));
     }
 }

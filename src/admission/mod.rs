@@ -67,7 +67,13 @@ impl AdmissionController {
 
     /// Get or create the limiter for a route. Created on first use so that a
     /// newly added route does not need a restart.
-    pub fn route_limiter(&self, id: &str, max: usize, queue_max: usize, queue_timeout: Duration) -> Arc<Limiter> {
+    pub fn route_limiter(
+        &self,
+        id: &str,
+        max: usize,
+        queue_max: usize,
+        queue_timeout: Duration,
+    ) -> Arc<Limiter> {
         if let Some(l) = self.routes.read().unwrap().get(id) {
             return l.clone();
         }
@@ -82,8 +88,16 @@ impl AdmissionController {
     /// Limiters are resized rather than replaced, and one that has disappeared
     /// from the config is dropped from the registry but stays alive until its
     /// last in-flight permit returns.
-    pub fn apply_limits(&self, global_max: usize, routes: &[(String, usize, usize, Duration)]) {
+    pub fn apply_limits(
+        &self,
+        global_max: usize,
+        global_queue_max: usize,
+        global_queue_timeout: Duration,
+        routes: &[(String, usize, usize, Duration)],
+    ) {
         self.global.resize(global_max);
+        self.global
+            .set_queue(global_queue_max, global_queue_timeout);
         let mut w = self.routes.write().unwrap();
         for (id, max, q_max, q_timeout) in routes {
             match w.get(id) {
@@ -92,7 +106,10 @@ impl AdmissionController {
                     existing.set_queue(*q_max, *q_timeout);
                 }
                 None => {
-                    w.insert(id.clone(), Limiter::new(id.clone(), *max, *q_max, *q_timeout));
+                    w.insert(
+                        id.clone(),
+                        Limiter::new(id.clone(), *max, *q_max, *q_timeout),
+                    );
                 }
             }
         }
@@ -111,11 +128,11 @@ impl AdmissionController {
             return Admission::Exempt;
         }
 
-        let budget = route
-            .map(|r| r.queue_timeout())
-            .filter(|d| !d.is_zero())
-            .unwrap_or_else(|| self.global.queue_timeout());
-        let deadline = (!budget.is_zero()).then(|| Instant::now() + budget);
+        let budget = std::iter::once(self.global.queue_timeout())
+            .chain(route.map(|limiter| limiter.queue_timeout()))
+            .filter(|duration| !duration.is_zero())
+            .min();
+        let deadline = budget.map(|duration| Instant::now() + duration);
 
         let route_permit = match route {
             Some(r) => match r.acquire(deadline).await {
@@ -126,7 +143,10 @@ impl AdmissionController {
         };
 
         match self.global.acquire(deadline).await {
-            Ok(g) => Admission::Admitted(Permits { route: route_permit, global: g }),
+            Ok(g) => Admission::Admitted(Permits {
+                route: route_permit,
+                global: g,
+            }),
             // Dropping `route_permit` here hands the route slot straight back.
             Err(reason) => Admission::Shed(reason),
         }
@@ -147,8 +167,14 @@ mod tests {
         let c = controller(1);
         let _held = c.admit(RequestClass::PublicDocument, None).await;
         // The one global permit is gone, yet these still pass.
-        assert!(matches!(c.admit(RequestClass::Static, None).await, Admission::Exempt));
-        assert!(matches!(c.admit(RequestClass::Streaming, None).await, Admission::Exempt));
+        assert!(matches!(
+            c.admit(RequestClass::Static, None).await,
+            Admission::Exempt
+        ));
+        assert!(matches!(
+            c.admit(RequestClass::Streaming, None).await,
+            Admission::Exempt
+        ));
     }
 
     #[tokio::test]
@@ -169,9 +195,16 @@ mod tests {
         let route = c.route_limiter("r", 5, 0, Duration::ZERO);
         let _global_hog = c.admit(RequestClass::PublicDocument, None).await;
 
-        assert!(matches!(c.admit(RequestClass::PublicDocument, Some(&route)).await, Admission::Shed(_)));
+        assert!(matches!(
+            c.admit(RequestClass::PublicDocument, Some(&route)).await,
+            Admission::Shed(_)
+        ));
         // The route limiter must not have leaked the slot it briefly held.
-        assert_eq!(route.available(), 5, "route permit was not released after global shed");
+        assert_eq!(
+            route.available(),
+            5,
+            "route permit was not released after global shed"
+        );
     }
 
     #[tokio::test]
@@ -201,7 +234,11 @@ mod tests {
             t.await.unwrap();
         }
 
-        assert!(peak.load(Ordering::SeqCst) <= MAX, "peak {} exceeded {MAX}", peak.load(Ordering::SeqCst));
+        assert!(
+            peak.load(Ordering::SeqCst) <= MAX,
+            "peak {} exceeded {MAX}",
+            peak.load(Ordering::SeqCst)
+        );
         assert_eq!(in_flight.load(Ordering::SeqCst), 0, "a permit leaked");
     }
 
@@ -209,20 +246,48 @@ mod tests {
     async fn reload_resizes_in_place_and_keeps_the_same_limiter() {
         let c = controller(10);
         let before = c.route_limiter("products", 100, 0, Duration::ZERO);
-        c.apply_limits(20, &[("products".into(), 50, 10, Duration::from_secs(1))]);
+        c.apply_limits(
+            20,
+            25,
+            Duration::from_secs(2),
+            &[("products".into(), 50, 10, Duration::from_secs(1))],
+        );
         let after = c.route_limiter("products", 100, 0, Duration::ZERO);
 
-        assert!(Arc::ptr_eq(&before, &after), "reload replaced the limiter instead of resizing it");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "reload replaced the limiter instead of resizing it"
+        );
         assert_eq!(after.limit(), 50);
         assert_eq!(c.global().limit(), 20);
+        assert_eq!(c.global().queue_timeout(), Duration::from_secs(2));
     }
 
     #[tokio::test]
     async fn a_route_removed_from_config_leaves_the_registry() {
         let c = controller(10);
         c.route_limiter("old", 5, 0, Duration::ZERO);
-        c.apply_limits(10, &[("new".into(), 5, 0, Duration::ZERO)]);
+        c.apply_limits(
+            10,
+            0,
+            Duration::ZERO,
+            &[("new".into(), 5, 0, Duration::ZERO)],
+        );
         assert!(c.routes.read().unwrap().get("old").is_none());
         assert!(c.routes.read().unwrap().get("new").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_shorter_global_queue_deadline_wins_over_a_route_deadline() {
+        let c = AdmissionController::new(1, 10, Duration::from_millis(30));
+        let route = c.route_limiter("slow-route", 10, 10, Duration::from_secs(1));
+        let _held = c.admit(RequestClass::PublicDocument, None).await;
+        let started = Instant::now();
+
+        assert!(matches!(
+            c.admit(RequestClass::PublicDocument, Some(&route)).await,
+            Admission::Shed(ShedReason::QueueTimeout)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 }

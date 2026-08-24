@@ -12,16 +12,16 @@
 //! 3. Can we express collapse-with-nothing-retained — one render, N responses,
 //!    nothing left behind?
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
-use async_trait::async_trait;
+use pingora_cache::CacheMeta;
 use pingora_cache::key::{CacheHashKey, CacheKey, CompactCacheKey};
 use pingora_cache::storage::{
     HandleHit, HandleMiss, HitHandler, MissFinishType, MissHandler, PurgeType, Storage,
     streaming_write::U64WriteId,
 };
 use pingora_cache::trace::SpanHandle;
-use pingora_cache::CacheMeta;
 use pingora_error::{Error, ErrorType, Result};
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -65,7 +65,11 @@ struct Temp {
 impl Temp {
     fn new(meta: BinaryMeta) -> Self {
         let (tx, _rx) = watch::channel(Written::Partial(0));
-        Temp { meta, body: Arc::new(RwLock::new(Vec::new())), written: Arc::new(tx) }
+        Temp {
+            meta,
+            body: Arc::new(RwLock::new(Vec::new())),
+            written: Arc::new(tx),
+        }
     }
 }
 
@@ -117,7 +121,9 @@ impl BoundedStore {
             let mut cached = self.cached.write();
             let mut order = self.order.write();
             while self.used.load(Ordering::Relaxed) + size > self.max_bytes {
-                let Some(victim) = order.pop_front() else { break };
+                let Some(victim) = order.pop_front() else {
+                    break;
+                };
                 if let Some(v) = cached.remove(&victim) {
                     let freed = v.body.len() + v.meta.0.len() + v.meta.1.len();
                     self.used.fetch_sub(freed, Ordering::Relaxed);
@@ -136,13 +142,24 @@ impl BoundedStore {
 
 #[async_trait]
 impl Storage for BoundedStore {
-    async fn lookup(&'static self, key: &CacheKey, _t: &SpanHandle) -> Result<Option<(CacheMeta, HitHandler)>> {
+    async fn lookup(
+        &'static self,
+        key: &CacheKey,
+        _t: &SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
         let hash = key.combined();
         let Some(obj) = self.cached.read().get(&hash).cloned() else {
             return Ok(None);
         };
         let meta = CacheMeta::deserialize(&obj.meta.0, &obj.meta.1)?;
-        Ok(Some((meta, Box::new(CompleteHit { body: obj.body, read: 0, done: false }))))
+        Ok(Some((
+            meta,
+            Box::new(CompleteHit {
+                body: obj.body,
+                read: 0,
+                done: false,
+            }),
+        )))
     }
 
     async fn lookup_streaming_write(
@@ -168,17 +185,27 @@ impl Storage for BoundedStore {
         let found = {
             let guard = self.temp.read();
             guard.get(&hash).and_then(|m| m.get(&id)).map(|temp| {
-                (temp.meta.clone(), temp.body.clone(), temp.written.subscribe())
+                (
+                    temp.meta.clone(),
+                    temp.body.clone(),
+                    temp.written.subscribe(),
+                )
             })
         };
         let Some((meta, body, written)) = found else {
-            // The write finished (or failed) between the lock release and this
-            // lookup. Falling back to the completed entry is correct, and not
-            // panicking is the difference between test-only and production.
-            return self.lookup(key, t).await;
+            // A tagged lookup must never fall back to another write for this
+            // key; Pingora requires the returned body to match the tag.
+            return Ok(None);
         };
         let meta = CacheMeta::deserialize(&meta.0, &meta.1)?;
-        Ok(Some((meta, Box::new(PartialHit { body, written, read: 0 }))))
+        Ok(Some((
+            meta,
+            Box::new(PartialHit {
+                body,
+                written,
+                read: 0,
+            }),
+        )))
     }
 
     async fn get_miss_handler(
@@ -201,7 +228,12 @@ impl Storage for BoundedStore {
         Ok(Box::new(handler))
     }
 
-    async fn purge(&'static self, key: &CompactCacheKey, _p: PurgeType, _t: &SpanHandle) -> Result<bool> {
+    async fn purge(
+        &'static self,
+        key: &CompactCacheKey,
+        _p: PurgeType,
+        _t: &SpanHandle,
+    ) -> Result<bool> {
         let hash = key.combined();
         let removed = self.cached.write().remove(&hash);
         if let Some(v) = &removed {
@@ -211,10 +243,17 @@ impl Storage for BoundedStore {
         Ok(removed.is_some())
     }
 
-    async fn update_meta(&'static self, key: &CacheKey, meta: &CacheMeta, _t: &SpanHandle) -> Result<bool> {
+    async fn update_meta(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        _t: &SpanHandle,
+    ) -> Result<bool> {
         let hash = key.combined();
         let mut cached = self.cached.write();
-        let Some(obj) = cached.get_mut(&hash) else { return Ok(false) };
+        let Some(obj) = cached.get_mut(&hash) else {
+            return Ok(false);
+        };
         obj.meta = meta.serialize()?;
         Ok(true)
     }
@@ -301,7 +340,10 @@ impl HandleHit for PartialHit {
             }
             if self.written.changed().await.is_err() {
                 // The writer vanished without finishing.
-                return Err(Error::explain(ErrorType::InternalError, "cache writer dropped"));
+                return Err(Error::explain(
+                    ErrorType::InternalError,
+                    "cache writer dropped",
+                ));
             }
         }
     }
@@ -343,14 +385,22 @@ impl HandleMiss for FollowableMiss {
         let so_far = self.written.borrow().bytes();
         self.body.write().extend_from_slice(&data);
         let total = so_far + data.len();
-        self.written
-            .send_replace(if eof { Written::Complete(total) } else { Written::Partial(total) });
+        self.written.send_replace(if eof {
+            Written::Complete(total)
+        } else {
+            Written::Partial(total)
+        });
         Ok(())
     }
 
     async fn finish(self: Box<Self>) -> Result<MissFinishType> {
         let id: u64 = self.id.into();
-        let temp = self.store.temp.write().get_mut(&self.key).and_then(|m| m.remove(&id));
+        let temp = self
+            .store
+            .temp
+            .write()
+            .get_mut(&self.key)
+            .and_then(|m| m.remove(&id));
         let Some(temp) = temp else {
             return Err(Error::explain(ErrorType::InternalError, "write vanished"));
         };
@@ -360,7 +410,13 @@ impl HandleMiss for FollowableMiss {
 
         let body = Arc::new(temp.body.read().clone());
         let size = body.len();
-        self.store.admit(self.key.clone(), Stored { meta: temp.meta, body });
+        self.store.admit(
+            self.key.clone(),
+            Stored {
+                meta: temp.meta,
+                body,
+            },
+        );
         Ok(MissFinishType::Created(size))
     }
 

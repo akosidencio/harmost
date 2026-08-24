@@ -37,8 +37,14 @@ impl Dur {
         let d = match unit {
             "ms" => Duration::from_millis(num),
             "s" => Duration::from_secs(num),
-            "m" => Duration::from_secs(num * 60),
-            "h" => Duration::from_secs(num * 3600),
+            "m" => Duration::from_secs(
+                num.checked_mul(60)
+                    .ok_or_else(|| format!("duration `{s}` overflows"))?,
+            ),
+            "h" => Duration::from_secs(
+                num.checked_mul(3600)
+                    .ok_or_else(|| format!("duration `{s}` overflows"))?,
+            ),
             other => {
                 return Err(format!(
                     "duration `{s}` has unknown unit `{other}`; expected ms, s, m, or h"

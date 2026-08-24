@@ -40,7 +40,9 @@ async fn main() -> std::io::Result<()> {
         tokio::spawn(async move {
             let mut buf = [0u8; 8192];
             // One request per connection keeps the fixture honest and simple.
-            let Ok(n) = sock.read(&mut buf).await else { return };
+            let Ok(n) = sock.read(&mut buf).await else {
+                return;
+            };
             if n == 0 {
                 return;
             }
@@ -53,7 +55,9 @@ async fn main() -> std::io::Result<()> {
 
             if path == "/healthz" {
                 let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
                     .await;
                 stats.in_flight.fetch_sub(1, Ordering::SeqCst);
                 return;
@@ -64,8 +68,11 @@ async fn main() -> std::io::Result<()> {
             // in suspended regions. A buffered response cannot exercise
             // whether coalesced waiters receive chunks as they are produced.
             if path.starts_with("/stream") || path.starts_with("/bigstream") {
-                let chunks: usize =
-                    path.rsplit('/').next().and_then(|s| s.parse().ok()).unwrap_or(4);
+                let chunks: usize = path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4);
                 let head = format!(
                     "HTTP/1.1 200 OK\r\n\
                      Content-Type: text/html\r\n\
@@ -121,7 +128,11 @@ async fn main() -> std::io::Result<()> {
             // large enough to exceed the socket buffers between origin and
             // client and actually block the downstream write.
             let body = if path.starts_with("/big") {
-                let mib: usize = path.rsplit('/').next().and_then(|s| s.parse().ok()).unwrap_or(1);
+                let mib: usize = path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
                 let filler = "x".repeat(mib * 1024 * 1024);
                 format!("<html><body>rendered {path}{filler}</body></html>")
             } else {

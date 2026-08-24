@@ -54,9 +54,9 @@ fn config_path(args: &[String]) -> Option<String> {
 fn run(path: &str) -> ExitCode {
     use harmost::admission::AdmissionController;
     use harmost::policy::PolicySnapshot;
+    use harmost::policy::reload::Reloader;
     use harmost::proxy::Harmost;
     use harmost::upstream::UpstreamPool;
-    use harmost::policy::reload::Reloader;
     use harmost::upstream::health::HealthChecker;
     use std::sync::Arc;
 
@@ -78,11 +78,7 @@ fn run(path: &str) -> ExitCode {
     harmost::telemetry::metrics::preregister();
 
     let listen = cfg.server.listen.clone();
-    let prometheus_listen = cfg
-        .telemetry
-        .prometheus
-        .as_ref()
-        .map(|p| p.listen.clone());
+    let prometheus_listen = cfg.telemetry.prometheus.as_ref().map(|p| p.listen.clone());
     let concurrency = cfg.origin.concurrency.clone();
     let policy = match PolicySnapshot::build(cfg, 1) {
         Ok(p) => p,
@@ -112,10 +108,16 @@ fn run(path: &str) -> ExitCode {
     // One pool, shared by the proxy and the health checker, so a probe result
     // is visible to routing immediately.
     let snapshot = policy.load();
-    let upstreams = Arc::new(UpstreamPool::new(
+    let upstreams = match UpstreamPool::new(
         &snapshot.config.origin.upstreams,
         snapshot.config.origin.load_balancing,
-    ));
+    ) {
+        Ok(pool) => Arc::new(pool),
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let health_cfg = snapshot.config.health.clone();
     drop(snapshot);
 
@@ -159,11 +161,23 @@ fn run(path: &str) -> ExitCode {
 fn check(path: &str) -> ExitCode {
     match harmost::config::load(path) {
         Ok(cfg) => {
+            let policy = match harmost::policy::PolicySnapshot::build(cfg, 1) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    eprintln!("error: invalid configuration in {path}");
+                    eprintln!("  caused by: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let cfg = &policy.config;
             let routes = cfg.routes.len();
             let upstreams = cfg.origin.upstreams.len();
             println!("ok: {path}");
             println!("  {upstreams} upstream(s), {routes} route(s)");
-            println!("  global origin concurrency: {}", cfg.origin.concurrency.max);
+            println!(
+                "  global origin concurrency: {}",
+                cfg.origin.concurrency.max
+            );
             for r in &cfg.routes {
                 let overrides = r.cache.as_ref().is_some_and(|c| c.override_origin);
                 if overrides {
@@ -181,5 +195,27 @@ fn check(path: &str) -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_rejects_a_matcher_that_cannot_be_compiled() {
+        let path = std::env::temp_dir().join(format!(
+            "harmost-check-{}-{}.yaml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &path,
+            "version: 1\norigin:\n  upstreams: [\"127.0.0.1:3000\"]\nroutes:\n  - id: bad\n    match: \"[\"\n",
+        )
+        .unwrap();
+        let result = check(path.to_str().unwrap());
+        let _ = std::fs::remove_file(path);
+        assert_eq!(result, ExitCode::FAILURE);
     }
 }

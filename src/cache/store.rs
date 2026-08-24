@@ -13,27 +13,34 @@
 //! it rather than waiting for the whole render. That is what keeps request
 //! collapsing from destroying streaming.
 //!
-//! Response size limits are not enforced here: `HttpCache::set_max_file_size_bytes`
-//! already tracks body bytes and marks the response uncacheable past the limit.
+//! Both Pingora's per-response size limit and this store's global budget are
+//! enforced while a fill is in progress. Abandoned fills remove their temporary
+//! entry on drop.
 
-use bytes::Bytes;
-use parking_lot::RwLock;
 use async_trait::async_trait;
+use bytes::Bytes;
+use parking_lot::{Mutex, RwLock};
+use pingora_cache::CacheMeta;
 use pingora_cache::key::{CacheHashKey, CacheKey, CompactCacheKey};
 use pingora_cache::storage::{
     HandleHit, HandleMiss, HitHandler, MissFinishType, MissHandler, PurgeType, Storage,
     streaming_write::U64WriteId,
 };
 use pingora_cache::trace::SpanHandle;
-use pingora_cache::CacheMeta;
 use pingora_error::{Error, ErrorType, Result};
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 
 type BinaryMeta = (Vec<u8>, Vec<u8>);
+
+/// Pingora wakes cache-lock readers and makes them perform another ordinary
+/// lookup. A small handoff window keeps a just-completed transient response
+/// visible long enough for those already-woken tasks to attach, without
+/// turning it into a persistent cache entry.
+const TRANSIENT_HANDOFF: std::time::Duration = std::time::Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Written {
@@ -56,7 +63,13 @@ impl Written {
 #[derive(Clone)]
 struct Stored {
     meta: BinaryMeta,
-    body: Arc<Vec<u8>>,
+    body: Arc<RwLock<Vec<u8>>>,
+}
+
+impl Stored {
+    fn size(&self) -> usize {
+        self.meta.0.len() + self.meta.1.len() + self.body.read().len()
+    }
 }
 
 /// A write in progress. Readers attach to this and follow it.
@@ -64,12 +77,18 @@ struct Temp {
     meta: BinaryMeta,
     body: Arc<RwLock<Vec<u8>>>,
     written: Arc<watch::Sender<Written>>,
+    transient: bool,
 }
 
 impl Temp {
-    fn new(meta: BinaryMeta) -> Self {
+    fn new(meta: BinaryMeta, transient: bool) -> Self {
         let (tx, _rx) = watch::channel(Written::Partial(0));
-        Temp { meta, body: Arc::new(RwLock::new(Vec::new())), written: Arc::new(tx) }
+        Temp {
+            meta,
+            body: Arc::new(RwLock::new(Vec::new())),
+            written: Arc::new(tx),
+            transient,
+        }
     }
 }
 
@@ -85,7 +104,9 @@ pub struct BoundedStore {
     /// TinyUFO; FIFO is enough to prove the budget is enforceable.
     order: RwLock<VecDeque<String>>,
     temp: RwLock<HashMap<String, HashMap<u64, Temp>>>,
-    used: AtomicUsize,
+    /// Includes completed entries and every byte in an in-progress fill.
+    /// All memory-accounting mutations take this lock before cache-map locks.
+    used: Mutex<usize>,
     max_bytes: usize,
     next_id: AtomicU64,
 }
@@ -98,54 +119,84 @@ impl BoundedStore {
             cached: RwLock::new(HashMap::new()),
             order: RwLock::new(VecDeque::new()),
             temp: RwLock::new(HashMap::new()),
-            used: AtomicUsize::new(0),
+            used: Mutex::new(0),
             max_bytes,
             next_id: AtomicU64::new(0),
         }))
     }
 
     pub fn bytes_used(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+        *self.used.lock()
     }
 
     pub fn entries(&self) -> usize {
         self.cached.read().len()
     }
 
+    fn reserve(&self, additional: usize) -> bool {
+        if additional > self.max_bytes {
+            return false;
+        }
+        let mut used = self.used.lock();
+        let mut cached = self.cached.write();
+        let mut order = self.order.write();
+        while used.saturating_add(additional) > self.max_bytes {
+            let Some(victim) = order.pop_front() else {
+                return false;
+            };
+            if let Some(entry) = cached.remove(&victim) {
+                *used = used.saturating_sub(entry.size());
+            }
+        }
+        *used += additional;
+        true
+    }
+
+    fn release(&self, amount: usize) {
+        let mut used = self.used.lock();
+        *used = used.saturating_sub(amount);
+    }
+
+    /// Convert an already-accounted temporary fill into a completed entry.
     fn admit(&self, key: String, obj: Stored) {
-        let size = obj.body.len() + obj.meta.0.len() + obj.meta.1.len();
-        if size > self.max_bytes {
-            return; // oversized entries are streamed to the client, never stored
+        let mut used = self.used.lock();
+        let mut cached = self.cached.write();
+        let mut order = self.order.write();
+        if let Some(old) = cached.insert(key.clone(), obj) {
+            *used = used.saturating_sub(old.size());
+            order.retain(|existing| existing != &key);
         }
-        {
-            let mut cached = self.cached.write();
-            let mut order = self.order.write();
-            while self.used.load(Ordering::Relaxed) + size > self.max_bytes {
-                let Some(victim) = order.pop_front() else { break };
-                if let Some(v) = cached.remove(&victim) {
-                    let freed = v.body.len() + v.meta.0.len() + v.meta.1.len();
-                    self.used.fetch_sub(freed, Ordering::Relaxed);
-                }
-            }
-            if let Some(old) = cached.insert(key.clone(), obj) {
-                let freed = old.body.len() + old.meta.0.len() + old.meta.1.len();
-                self.used.fetch_sub(freed, Ordering::Relaxed);
-                order.retain(|k| k != &key);
-            }
-            order.push_back(key);
+        order.push_back(key);
+    }
+
+    fn remove_temp(&self, key: &str, id: u64) -> Option<Temp> {
+        let mut temp = self.temp.write();
+        let removed = temp.get_mut(key).and_then(|writes| writes.remove(&id));
+        if temp.get(key).is_some_and(HashMap::is_empty) {
+            temp.remove(key);
         }
-        self.used.fetch_add(size, Ordering::Relaxed);
+        removed
     }
 }
 
 #[async_trait]
 impl Storage for BoundedStore {
-    async fn lookup(&'static self, key: &CacheKey, _t: &SpanHandle) -> Result<Option<(CacheMeta, HitHandler)>> {
+    async fn lookup(
+        &'static self,
+        key: &CacheKey,
+        _t: &SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
         let hash = key.combined();
 
         if let Some(obj) = self.cached.read().get(&hash).cloned() {
             let meta = CacheMeta::deserialize(&obj.meta.0, &obj.meta.1)?;
-            return Ok(Some((meta, Box::new(CompleteHit { body: obj.body, read: 0, done: false }))));
+            return Ok(Some((
+                meta,
+                Box::new(CompleteHit {
+                    body: obj.body,
+                    read: 0,
+                }),
+            )));
         }
 
         // Nothing finished — but a write may be in progress, and this is the
@@ -163,16 +214,24 @@ impl Storage for BoundedStore {
             temp.get(&hash).and_then(|writes| {
                 // One leader per key in practice; take the newest if a
                 // revalidation overlaps.
-                writes.iter().max_by_key(|(id, _)| **id).map(|(_, t)| {
-                    (t.meta.clone(), t.body.clone(), t.written.subscribe())
-                })
+                writes
+                    .iter()
+                    .max_by_key(|(id, _)| **id)
+                    .map(|(_, t)| (t.meta.clone(), t.body.clone(), t.written.subscribe()))
             })
         };
         let Some((meta, body, written)) = partial else {
             return Ok(None);
         };
         let meta = CacheMeta::deserialize(&meta.0, &meta.1)?;
-        Ok(Some((meta, Box::new(PartialHit { body, written, read: 0 }))))
+        Ok(Some((
+            meta,
+            Box::new(PartialHit {
+                body,
+                written,
+                read: 0,
+            }),
+        )))
     }
 
     async fn lookup_streaming_write(
@@ -198,17 +257,28 @@ impl Storage for BoundedStore {
         let found = {
             let guard = self.temp.read();
             guard.get(&hash).and_then(|m| m.get(&id)).map(|temp| {
-                (temp.meta.clone(), temp.body.clone(), temp.written.subscribe())
+                (
+                    temp.meta.clone(),
+                    temp.body.clone(),
+                    temp.written.subscribe(),
+                )
             })
         };
         let Some((meta, body, written)) = found else {
-            // The write finished (or failed) between the lock release and this
-            // lookup. Falling back to the completed entry is correct, and not
-            // panicking is the difference between test-only and production.
-            return self.lookup(key, t).await;
+            // Pingora requires an exact tag match here. Falling back to another
+            // completed or in-progress write could attach the leader itself to
+            // a different response for the same key.
+            return Ok(None);
         };
         let meta = CacheMeta::deserialize(&meta.0, &meta.1)?;
-        Ok(Some((meta, Box::new(PartialHit { body, written, read: 0 }))))
+        Ok(Some((
+            meta,
+            Box::new(PartialHit {
+                body,
+                written,
+                read: 0,
+            }),
+        )))
     }
 
     async fn get_miss_handler(
@@ -218,7 +288,16 @@ impl Storage for BoundedStore {
         _t: &SpanHandle,
     ) -> Result<MissHandler> {
         let hash = key.combined();
-        let temp = Temp::new(meta.serialize()?);
+        let transient = meta
+            .response_header()
+            .headers
+            .contains_key(crate::cache::TRANSIENT_HEADER);
+        let serialized = meta.serialize()?;
+        let meta_size = serialized.0.len() + serialized.1.len();
+        if !self.reserve(meta_size) {
+            return Error::e_explain(ErrorType::InternalError, "cache memory budget exhausted");
+        }
+        let temp = Temp::new(serialized, transient);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let handler = FollowableMiss {
             store: self,
@@ -226,26 +305,53 @@ impl Storage for BoundedStore {
             id: id.into(),
             body: temp.body.clone(),
             written: temp.written.clone(),
+            accounted: meta_size,
+            finished: false,
         };
         self.temp.write().entry(hash).or_default().insert(id, temp);
         Ok(Box::new(handler))
     }
 
-    async fn purge(&'static self, key: &CompactCacheKey, _p: PurgeType, _t: &SpanHandle) -> Result<bool> {
+    async fn purge(
+        &'static self,
+        key: &CompactCacheKey,
+        _p: PurgeType,
+        _t: &SpanHandle,
+    ) -> Result<bool> {
         let hash = key.combined();
         let removed = self.cached.write().remove(&hash);
         if let Some(v) = &removed {
-            self.used.fetch_sub(v.body.len(), Ordering::Relaxed);
+            self.release(v.size());
             self.order.write().retain(|k| k != &hash);
         }
         Ok(removed.is_some())
     }
 
-    async fn update_meta(&'static self, key: &CacheKey, meta: &CacheMeta, _t: &SpanHandle) -> Result<bool> {
+    async fn update_meta(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        _t: &SpanHandle,
+    ) -> Result<bool> {
         let hash = key.combined();
+        let replacement = meta.serialize()?;
+        let replacement_size = replacement.0.len() + replacement.1.len();
+        let mut used = self.used.lock();
         let mut cached = self.cached.write();
-        let Some(obj) = cached.get_mut(&hash) else { return Ok(false) };
-        obj.meta = meta.serialize()?;
+        let Some(obj) = cached.get_mut(&hash) else {
+            return Ok(false);
+        };
+        let old_size = obj.meta.0.len() + obj.meta.1.len();
+        if replacement_size > old_size {
+            let growth = replacement_size - old_size;
+            if used.saturating_add(growth) > self.max_bytes {
+                return Ok(false);
+            }
+            *used += growth;
+        } else {
+            *used = used.saturating_sub(old_size - replacement_size);
+        }
+        obj.meta = replacement;
         Ok(true)
     }
 
@@ -260,19 +366,22 @@ impl Storage for BoundedStore {
 
 /// Reads a finished entry.
 struct CompleteHit {
-    body: Arc<Vec<u8>>,
+    body: Arc<RwLock<Vec<u8>>>,
     read: usize,
-    done: bool,
 }
 
 #[async_trait]
 impl HandleHit for CompleteHit {
     async fn read_body(&mut self) -> Result<Option<Bytes>> {
-        if self.done {
+        const CHUNK: usize = 64 * 1024;
+        let body = self.body.read();
+        if self.read >= body.len() {
             return Ok(None);
         }
-        self.done = true;
-        Ok(Some(Bytes::copy_from_slice(&self.body[self.read..])))
+        let end = (self.read + CHUNK).min(body.len());
+        let chunk = Bytes::copy_from_slice(&body[self.read..end]);
+        self.read = end;
+        Ok(Some(chunk))
     }
 
     async fn finish(
@@ -289,8 +398,7 @@ impl HandleHit for CompleteHit {
     }
 
     fn seek(&mut self, start: usize, _end: Option<usize>) -> Result<()> {
-        self.read = start.min(self.body.len());
-        self.done = false;
+        self.read = start.min(self.body.read().len());
         Ok(())
     }
 
@@ -322,8 +430,9 @@ impl HandleHit for PartialHit {
             let available = state.bytes();
             if available > self.read {
                 // Copy out under the lock, then release it before awaiting.
-                let chunk = Bytes::copy_from_slice(&self.body.read()[self.read..available]);
-                self.read = available;
+                let end = (self.read + 64 * 1024).min(available);
+                let chunk = Bytes::copy_from_slice(&self.body.read()[self.read..end]);
+                self.read = end;
                 return Ok(Some(chunk));
             }
             if state.done() {
@@ -331,7 +440,10 @@ impl HandleHit for PartialHit {
             }
             if self.written.changed().await.is_err() {
                 // The writer vanished without finishing.
-                return Err(Error::explain(ErrorType::InternalError, "cache writer dropped"));
+                return Err(Error::explain(
+                    ErrorType::InternalError,
+                    "cache writer dropped",
+                ));
             }
         }
     }
@@ -365,32 +477,77 @@ struct FollowableMiss {
     id: U64WriteId,
     body: Arc<RwLock<Vec<u8>>>,
     written: Arc<watch::Sender<Written>>,
+    accounted: usize,
+    finished: bool,
 }
 
 #[async_trait]
 impl HandleMiss for FollowableMiss {
     async fn write_body(&mut self, data: Bytes, eof: bool) -> Result<()> {
+        if !data.is_empty() && !self.store.reserve(data.len()) {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "cache memory budget exhausted during fill",
+            );
+        }
+        self.accounted += data.len();
         let so_far = self.written.borrow().bytes();
         self.body.write().extend_from_slice(&data);
         let total = so_far + data.len();
-        self.written
-            .send_replace(if eof { Written::Complete(total) } else { Written::Partial(total) });
+        self.written.send_replace(if eof {
+            Written::Complete(total)
+        } else {
+            Written::Partial(total)
+        });
         Ok(())
     }
 
-    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+    async fn finish(mut self: Box<Self>) -> Result<MissFinishType> {
         let id: u64 = self.id.into();
-        let temp = self.store.temp.write().get_mut(&self.key).and_then(|m| m.remove(&id));
-        let Some(temp) = temp else {
-            return Err(Error::explain(ErrorType::InternalError, "write vanished"));
-        };
         // Make sure any follower that has not drained yet sees the end.
         let total = self.written.borrow().bytes();
         self.written.send_replace(Written::Complete(total));
 
-        let body = Arc::new(temp.body.read().clone());
-        let size = body.len();
-        self.store.admit(self.key.clone(), Stored { meta: temp.meta, body });
+        let transient = {
+            let temp = self.store.temp.read();
+            temp.get(&self.key)
+                .and_then(|writes| writes.get(&id))
+                .map(|entry| entry.transient)
+        };
+        let Some(transient) = transient else {
+            return Err(Error::explain(ErrorType::InternalError, "write vanished"));
+        };
+        let size = self.body.read().len();
+        self.finished = true;
+        if transient {
+            // The lock is released when the miss handler is created. If the
+            // whole body arrives in the same upstream read as the headers,
+            // removing this temp immediately races the woken followers and
+            // turns each into a new origin request. Keep it only for a short
+            // scheduler handoff; attached readers retain their own Arcs.
+            let store = self.store;
+            let key = self.key.clone();
+            let accounted = self.accounted;
+            tokio::spawn(async move {
+                tokio::time::sleep(TRANSIENT_HANDOFF).await;
+                if store.remove_temp(&key, id).is_some() {
+                    store.release(accounted);
+                }
+            });
+        } else {
+            let temp = self
+                .store
+                .remove_temp(&self.key, id)
+                .ok_or_else(|| Error::explain(ErrorType::InternalError, "write vanished"))?;
+            let body = temp.body;
+            self.store.admit(
+                self.key.clone(),
+                Stored {
+                    meta: temp.meta,
+                    body,
+                },
+            );
+        }
         Ok(MissFinishType::Created(size))
     }
 
@@ -399,6 +556,17 @@ impl HandleMiss for FollowableMiss {
     }
 }
 
+impl Drop for FollowableMiss {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let id: u64 = self.id.into();
+        if self.store.remove_temp(&self.key, id).is_some() {
+            self.store.release(self.accounted);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -434,10 +602,17 @@ mod tests {
             .get_miss_handler(&key, &meta(), &Span::inactive().handle())
             .await
             .unwrap();
-        leader.write_body(Bytes::from_static(b"shell"), false).await.unwrap();
+        leader
+            .write_body(Bytes::from_static(b"shell"), false)
+            .await
+            .unwrap();
 
-        let hit = store.lookup(&key, &Span::inactive().handle()).await.unwrap();
-        let (_meta, mut reader) = hit.expect("a waiter must be able to attach to the in-flight write");
+        let hit = store
+            .lookup(&key, &Span::inactive().handle())
+            .await
+            .unwrap();
+        let (_meta, mut reader) =
+            hit.expect("a waiter must be able to attach to the in-flight write");
         assert_eq!(&reader.read_body().await.unwrap().unwrap()[..], b"shell");
     }
 
@@ -450,7 +625,10 @@ mod tests {
             .get_miss_handler(&key, &meta(), &Span::inactive().handle())
             .await
             .unwrap();
-        first.write_body(Bytes::from_static(b"old"), true).await.unwrap();
+        first
+            .write_body(Bytes::from_static(b"old"), true)
+            .await
+            .unwrap();
         first.finish().await.unwrap();
 
         // A revalidation starts while the finished entry is still servable.
@@ -458,7 +636,10 @@ mod tests {
             .get_miss_handler(&key, &meta(), &Span::inactive().handle())
             .await
             .unwrap();
-        second.write_body(Bytes::from_static(b"new"), false).await.unwrap();
+        second
+            .write_body(Bytes::from_static(b"new"), false)
+            .await
+            .unwrap();
 
         let (_m, mut reader) = store
             .lookup(&key, &Span::inactive().handle())
@@ -476,6 +657,127 @@ mod tests {
     async fn lookup_still_misses_when_there_is_nothing_at_all() {
         let store = BoundedStore::new(1 << 20);
         let key = CacheKey::new("", "/absent", "");
-        assert!(store.lookup(&key, &Span::inactive().handle()).await.unwrap().is_none());
+        assert!(
+            store
+                .lookup(&key, &Span::inactive().handle())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_an_incomplete_fill_releases_memory_and_removes_the_temp_entry() {
+        let store = BoundedStore::new(1 << 20);
+        let key = CacheKey::new("", "/abandoned", "");
+        let mut writer = store
+            .get_miss_handler(&key, &meta(), &Span::inactive().handle())
+            .await
+            .unwrap();
+        writer
+            .write_body(Bytes::from_static(b"partial"), false)
+            .await
+            .unwrap();
+        assert!(store.bytes_used() > 0);
+
+        drop(writer);
+
+        assert_eq!(store.bytes_used(), 0);
+        assert!(
+            store
+                .lookup(&key, &Span::inactive().handle())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_tag_never_falls_back_to_an_unrelated_entry() {
+        let store = BoundedStore::new(1 << 20);
+        let key = CacheKey::new("", "/tag", "");
+        let mut writer = store
+            .get_miss_handler(&key, &meta(), &Span::inactive().handle())
+            .await
+            .unwrap();
+        writer
+            .write_body(Bytes::from_static(b"done"), true)
+            .await
+            .unwrap();
+        let stale_tag = writer.streaming_write_tag().unwrap().to_vec();
+        writer.finish().await.unwrap();
+
+        assert!(
+            store
+                .lookup_streaming_write(&key, Some(&stale_tag), &Span::inactive().handle())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_fills_exist_only_for_the_follower_handoff() {
+        let store = BoundedStore::new(1 << 20);
+        let key = CacheKey::new("", "/transient", "");
+        let now = SystemTime::now();
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header
+            .insert_header(crate::cache::TRANSIENT_HEADER, "1")
+            .unwrap();
+        let transient = CacheMeta::new(now + Duration::from_secs(30), now, 0, 0, header);
+        let mut writer = store
+            .get_miss_handler(&key, &transient, &Span::inactive().handle())
+            .await
+            .unwrap();
+        writer
+            .write_body(Bytes::from_static(b"one flight"), true)
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        assert!(
+            store
+                .lookup(&key, &Span::inactive().handle())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        tokio::time::sleep(TRANSIENT_HANDOFF + Duration::from_millis(25)).await;
+        assert_eq!(store.bytes_used(), 0);
+        assert!(
+            store
+                .lookup(&key, &Span::inactive().handle())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn in_progress_fills_count_toward_the_global_budget() {
+        let store = BoundedStore::new(4096);
+        let first = CacheKey::new("", "/one", "");
+        let second = CacheKey::new("", "/two", "");
+        let mut a = store
+            .get_miss_handler(&first, &meta(), &Span::inactive().handle())
+            .await
+            .unwrap();
+        a.write_body(Bytes::from(vec![b'a'; 3000]), false)
+            .await
+            .unwrap();
+        let mut b = store
+            .get_miss_handler(&second, &meta(), &Span::inactive().handle())
+            .await
+            .unwrap();
+        assert!(
+            b.write_body(Bytes::from(vec![b'b'; 3000]), false)
+                .await
+                .is_err()
+        );
+        assert!(store.bytes_used() <= 4096);
+        drop(a);
+        drop(b);
+        assert_eq!(store.bytes_used(), 0);
     }
 }

@@ -46,7 +46,9 @@ pub struct Server {
 
 impl Default for Server {
     fn default() -> Self {
-        Server { listen: default_listen() }
+        Server {
+            listen: default_listen(),
+        }
     }
 }
 
@@ -91,7 +93,10 @@ pub struct Concurrency {
 
 impl Default for Concurrency {
     fn default() -> Self {
-        Concurrency { max: 500, queue: Queue::default() }
+        Concurrency {
+            max: 500,
+            queue: Queue::default(),
+        }
     }
 }
 
@@ -106,11 +111,14 @@ pub struct Queue {
 
 impl Default for Queue {
     fn default() -> Self {
-        Queue { max: 0, timeout: Dur::ZERO }
+        Queue {
+            max: 0,
+            timeout: Dur::ZERO,
+        }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
     pub path: String,
@@ -122,8 +130,12 @@ pub struct Health {
     pub unhealthy_after: u32,
 }
 
-fn one() -> u32 { 1 }
-fn three() -> u32 { 3 }
+fn one() -> u32 {
+    1
+}
+fn three() -> u32 {
+    3
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -154,9 +166,15 @@ impl Default for CacheDefaults {
     }
 }
 
-fn yes() -> bool { true }
-fn default_max_memory() -> Bytes { Bytes(512 * 1024 * 1024) }
-fn default_max_body() -> Bytes { Bytes(4 * 1024 * 1024) }
+fn yes() -> bool {
+    true
+}
+fn default_max_memory() -> Bytes {
+    Bytes(512 * 1024 * 1024)
+}
+fn default_max_body() -> Bytes {
+    Bytes(4 * 1024 * 1024)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -187,7 +205,11 @@ pub struct CoalesceDefaults {
 
 impl Default for CoalesceDefaults {
     fn default() -> Self {
-        CoalesceDefaults { enabled: true, wait_timeout: None, on_timeout: OnCoalesceTimeout::default() }
+        CoalesceDefaults {
+            enabled: true,
+            wait_timeout: None,
+            on_timeout: OnCoalesceTimeout::default(),
+        }
     }
 }
 
@@ -233,9 +255,15 @@ impl Default for Timeouts {
     }
 }
 
-fn d_500ms() -> Dur { Dur(std::time::Duration::from_millis(500)) }
-fn d_5s() -> Dur { Dur(std::time::Duration::from_secs(5)) }
-fn d_30s() -> Dur { Dur(std::time::Duration::from_secs(30)) }
+fn d_500ms() -> Dur {
+    Dur(std::time::Duration::from_millis(500))
+}
+fn d_5s() -> Dur {
+    Dur(std::time::Duration::from_secs(5))
+}
+fn d_30s() -> Dur {
+    Dur(std::time::Duration::from_secs(30))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -248,12 +276,19 @@ pub struct Overload {
 
 impl Default for Overload {
     fn default() -> Self {
-        Overload { status: status_503(), retry_after: d_1s() }
+        Overload {
+            status: status_503(),
+            retry_after: d_1s(),
+        }
     }
 }
 
-fn status_503() -> u16 { 503 }
-fn d_1s() -> Dur { Dur(std::time::Duration::from_secs(1)) }
+fn status_503() -> u16 {
+    503
+}
+fn d_1s() -> Dur {
+    Dur(std::time::Duration::from_secs(1))
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -392,7 +427,7 @@ pub struct Telemetry {
     pub logging: Logging,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prometheus {
     pub listen: String,

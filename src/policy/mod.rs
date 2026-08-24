@@ -11,10 +11,10 @@
 pub mod matcher;
 pub mod reload;
 
-use crate::config::schema::{ClassOverride, Config, Route};
 use crate::classifier::RequestClass;
-use matcher::{CompiledMatcher, MatcherError};
+use crate::config::schema::{ClassOverride, Config, Route};
 use http::Method;
+use matcher::{CompiledMatcher, MatcherError};
 use std::sync::Arc;
 
 pub struct ResolvedRoute {
@@ -55,7 +55,11 @@ impl PolicySnapshot {
                 })
             })
             .collect::<Result<Vec<_>, MatcherError>>()?;
-        Ok(Arc::new(PolicySnapshot { routes, config, generation }))
+        Ok(Arc::new(PolicySnapshot {
+            routes,
+            config,
+            generation,
+        }))
     }
 
     /// First match in file order wins.
@@ -65,7 +69,9 @@ impl PolicySnapshot {
     /// which is exactly the property you do not want when the thing being
     /// configured decides whether a response is shared.
     pub fn resolve(&self, host: &str, path: &str, method: &Method) -> Option<&ResolvedRoute> {
-        self.routes.iter().find(|r| r.matcher.matches(host, path, method))
+        self.routes
+            .iter()
+            .find(|r| r.matcher.matches(host, path, method))
     }
 
     /// The coalescing wait, resolved. Absent config tracks the origin timeout,
@@ -111,9 +117,20 @@ routes:
     #[test]
     fn first_matching_route_wins() {
         let s = snapshot(YAML);
-        assert_eq!(s.resolve("h", "/products/iphone", &Method::GET).unwrap().id, "products");
-        assert_eq!(s.resolve("h", "/_next/static/a.js", &Method::GET).unwrap().id, "next-static");
-        assert_eq!(s.resolve("h", "/anything-else", &Method::GET).unwrap().id, "catchall");
+        assert_eq!(
+            s.resolve("h", "/products/iphone", &Method::GET).unwrap().id,
+            "products"
+        );
+        assert_eq!(
+            s.resolve("h", "/_next/static/a.js", &Method::GET)
+                .unwrap()
+                .id,
+            "next-static"
+        );
+        assert_eq!(
+            s.resolve("h", "/anything-else", &Method::GET).unwrap().id,
+            "catchall"
+        );
     }
 
     #[test]

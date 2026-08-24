@@ -75,7 +75,7 @@ pub struct KeyBuilder<'a> {
     pub query_policy: Option<&'a QueryPolicy>,
     /// Header names from route `cache.vary` plus the framework adapter's
     /// mandatory variant headers.
-    pub variant_headers: &'a [&'a str],
+    pub variant_headers: &'a [String],
     pub deployment: Option<&'a str>,
 }
 
@@ -86,18 +86,18 @@ impl<'a> KeyBuilder<'a> {
             .iter()
             .filter_map(|name| {
                 let lower = name.to_ascii_lowercase();
-                req.header(&lower).map(|v| (lower, v.to_string()))
+                header_values(req, &lower).map(|v| (lower, v))
             })
             .collect();
 
         // Content coding is part of the identity of a stored body. Omit it and
         // a brotli entry eventually reaches a client that only reads gzip.
-        variant.push(("~encoding".into(), normalize_accept_encoding(req).into()));
+        variant.push(("~encoding".into(), normalize_accept_encoding(req)));
         variant.sort();
 
         CacheKey {
             scheme: self.scheme.to_ascii_lowercase(),
-            host: normalize_host(req.host),
+            host: normalize_host(req.host, self.scheme),
             method: req.method.as_str().to_ascii_uppercase(),
             path: req.path.to_string(),
             query: canonical_query(req.query.unwrap_or(""), self.query_policy),
@@ -107,11 +107,15 @@ impl<'a> KeyBuilder<'a> {
     }
 }
 
-fn normalize_host(host: &str) -> String {
+fn normalize_host(host: &str, scheme: &str) -> String {
     let host = host.trim().to_ascii_lowercase();
-    // Strip the default port so `example.com` and `example.com:80` are one key.
-    host.strip_suffix(":80")
-        .or_else(|| host.strip_suffix(":443"))
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" => Some(":80"),
+        "https" => Some(":443"),
+        _ => None,
+    };
+    default_port
+        .and_then(|port| host.strip_suffix(port))
         .unwrap_or(&host)
         .to_string()
 }
@@ -120,27 +124,39 @@ fn normalize_host(host: &str) -> String {
 ///
 /// Bounded to three values on purpose: keying on the raw header would mint a
 /// separate entry for every browser's exact ordering.
-fn normalize_accept_encoding(req: &RequestMetadata<'_>) -> &'static str {
-    let Some(raw) = req.header("accept-encoding") else {
-        return "identity";
-    };
-    let raw = raw.to_ascii_lowercase();
-    let accepts = |token: &str| {
-        raw.split(',').any(|part| {
-            let mut it = part.split(';');
-            let name = it.next().unwrap_or("").trim();
-            // `br;q=0` means "explicitly not br".
-            let refused = it.any(|p| p.trim().replace(' ', "") == "q=0");
-            name == token && !refused
+fn normalize_accept_encoding(req: &RequestMetadata<'_>) -> String {
+    // Preserve coding order and quality values. A compact br/gzip/identity
+    // bucket is unsafe: origins may choose a different representation based on
+    // weights, wildcard codings, or newer codings such as zstd.
+    let values = req
+        .headers
+        .get_all(http::header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|raw| raw.split(','))
+        .map(|part| {
+            part.split(';')
+                .map(|piece| piece.trim().to_ascii_lowercase().replace(' ', ""))
+                .collect::<Vec<_>>()
+                .join(";")
         })
-    };
-    if accepts("br") {
-        "br"
-    } else if accepts("gzip") {
-        "gzip"
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        "identity".into()
     } else {
-        "identity"
+        values.join(",")
     }
+}
+
+fn header_values(req: &RequestMetadata<'_>, name: &str) -> Option<String> {
+    let values = req
+        .headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join("\u{1d}"))
 }
 
 /// Filter and sort the query string.
@@ -154,12 +170,12 @@ fn canonical_query(raw: &str, policy: Option<&QueryPolicy>) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    let mut pairs: Vec<(&str, &str)> = raw
+    let mut pairs: Vec<(&str, Option<&str>)> = raw
         .split('&')
         .filter(|p| !p.is_empty())
         .map(|p| match p.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (p, ""),
+            Some((k, v)) => (k, Some(v)),
+            None => (p, None),
         })
         .filter(|(k, _)| match policy {
             None => true,
@@ -172,10 +188,18 @@ fn canonical_query(raw: &str, policy: Option<&QueryPolicy>) -> String {
             }
         })
         .collect();
-    pairs.sort_unstable();
+    // Reordering duplicate keys can change application semantics. Only sort
+    // when every key is unique; otherwise retain the request's original order.
+    let mut seen = std::collections::HashSet::new();
+    if pairs.iter().all(|(key, _)| seen.insert(*key)) {
+        pairs.sort_unstable();
+    }
     pairs
         .iter()
-        .map(|(k, v)| if v.is_empty() { (*k).to_string() } else { format!("{k}={v}") })
+        .map(|(k, v)| match v {
+            Some(v) => format!("{k}={v}"),
+            None => (*k).to_string(),
+        })
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -191,7 +215,9 @@ mod tests {
 
     impl Ctx {
         fn new() -> Self {
-            Ctx { headers: HeaderMap::new() }
+            Ctx {
+                headers: HeaderMap::new(),
+            }
         }
         fn with(mut self, k: &'static str, v: &'static str) -> Self {
             self.headers.insert(k, HeaderValue::from_static(v));
@@ -199,7 +225,13 @@ mod tests {
         }
     }
 
-    fn key(path: &str, query: Option<&str>, ctx: &Ctx, variant: &[&str], deployment: Option<&str>) -> CacheKey {
+    fn key(
+        path: &str,
+        query: Option<&str>,
+        ctx: &Ctx,
+        variant: &[&str],
+        deployment: Option<&str>,
+    ) -> CacheKey {
         let req = RequestMetadata {
             method: &Method::GET,
             host: "shop.example.com",
@@ -207,10 +239,14 @@ mod tests {
             query,
             headers: &ctx.headers,
         };
+        let variant = variant
+            .iter()
+            .map(|header| (*header).to_string())
+            .collect::<Vec<_>>();
         KeyBuilder {
             scheme: "https",
             query_policy: None,
-            variant_headers: variant,
+            variant_headers: &variant,
             deployment,
         }
         .build(&req)
@@ -228,7 +264,10 @@ mod tests {
     #[test]
     fn different_paths_are_different_keys() {
         let c = Ctx::new();
-        assert_ne!(key("/a", None, &c, &[], None), key("/b", None, &c, &[], None));
+        assert_ne!(
+            key("/a", None, &c, &[], None),
+            key("/b", None, &c, &[], None)
+        );
     }
 
     #[test]
@@ -247,21 +286,35 @@ mod tests {
     fn brotli_and_gzip_clients_get_separate_entries() {
         let br = Ctx::new().with("accept-encoding", "gzip, deflate, br");
         let gz = Ctx::new().with("accept-encoding", "gzip, deflate");
-        assert_ne!(key("/p", None, &br, &[], None), key("/p", None, &gz, &[], None));
+        assert_ne!(
+            key("/p", None, &br, &[], None),
+            key("/p", None, &gz, &[], None)
+        );
     }
 
     #[test]
-    fn equivalent_encoding_preferences_share_one_entry() {
+    fn encoding_preference_order_remains_distinct() {
         let a = Ctx::new().with("accept-encoding", "br, gzip");
         let b = Ctx::new().with("accept-encoding", "gzip, br");
-        assert_eq!(key("/p", None, &a, &[], None), key("/p", None, &b, &[], None));
+        assert_ne!(
+            key("/p", None, &a, &[], None),
+            key("/p", None, &b, &[], None)
+        );
     }
 
     #[test]
     fn explicitly_refused_encoding_is_not_selected() {
-        let refuses_br = Ctx::new().with("accept-encoding", "br;q=0, gzip");
-        let gz = Ctx::new().with("accept-encoding", "gzip");
-        assert_eq!(key("/p", None, &refuses_br, &[], None), key("/p", None, &gz, &[], None));
+        let zero = Ctx::new().with("accept-encoding", "br;q=0");
+        let zero_decimal = Ctx::new().with("accept-encoding", "br;q=0.0");
+        let accepts = Ctx::new().with("accept-encoding", "br");
+        assert_ne!(
+            key("/p", None, &zero, &[], None),
+            key("/p", None, &accepts, &[], None)
+        );
+        assert_ne!(
+            key("/p", None, &zero_decimal, &[], None),
+            key("/p", None, &accepts, &[], None)
+        );
     }
 
     #[test]
@@ -277,28 +330,71 @@ mod tests {
     fn host_case_and_default_port_normalize() {
         let c = Ctx::new();
         let mut a = key("/p", None, &c, &[], None);
-        a.host = normalize_host("SHOP.example.com:443");
+        a.host = normalize_host("SHOP.example.com:443", "https");
         assert_eq!(a, key("/p", None, &c, &[], None));
     }
 
     #[test]
+    fn non_default_ports_are_not_removed() {
+        assert_ne!(
+            normalize_host("example.com:443", "http"),
+            normalize_host("example.com", "http")
+        );
+        assert_ne!(
+            normalize_host("example.com:80", "https"),
+            normalize_host("example.com", "https")
+        );
+    }
+
+    #[test]
     fn include_policy_drops_unlisted_parameters() {
-        let p = QueryPolicy { mode: QueryMode::Include, keys: vec!["q".into(), "page".into()] };
+        let p = QueryPolicy {
+            mode: QueryMode::Include,
+            keys: vec!["q".into(), "page".into()],
+        };
         // A cache-busting parameter must not mint a new key, or every request
         // becomes a render.
-        assert_eq!(canonical_query("q=shoes&cachebust=91821", Some(&p)), "q=shoes");
-        assert_eq!(canonical_query("q=shoes&page=2", Some(&p)), "page=2&q=shoes");
+        assert_eq!(
+            canonical_query("q=shoes&cachebust=91821", Some(&p)),
+            "q=shoes"
+        );
+        assert_eq!(
+            canonical_query("q=shoes&page=2", Some(&p)),
+            "page=2&q=shoes"
+        );
     }
 
     #[test]
     fn exclude_policy_drops_only_listed_parameters() {
-        let p = QueryPolicy { mode: QueryMode::Exclude, keys: vec!["utm_source".into()] };
-        assert_eq!(canonical_query("utm_source=fb&q=shoes", Some(&p)), "q=shoes");
+        let p = QueryPolicy {
+            mode: QueryMode::Exclude,
+            keys: vec!["utm_source".into()],
+        };
+        assert_eq!(
+            canonical_query("utm_source=fb&q=shoes", Some(&p)),
+            "q=shoes"
+        );
     }
 
     #[test]
     fn no_policy_keeps_every_parameter() {
         assert_eq!(canonical_query("a=1&zz=2", None), "a=1&zz=2");
+    }
+
+    #[test]
+    fn duplicate_query_parameter_order_is_preserved() {
+        assert_ne!(
+            canonical_query("step=a&step=b", None),
+            canonical_query("step=b&step=a", None)
+        );
+    }
+
+    #[test]
+    fn valueless_and_empty_query_parameters_are_distinct() {
+        assert_ne!(
+            canonical_query("flag", None),
+            canonical_query("flag=", None)
+        );
     }
 
     #[test]

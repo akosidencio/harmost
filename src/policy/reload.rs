@@ -76,25 +76,56 @@ impl Reloader {
                     .to_string(),
             );
         }
-
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if cfg.origin.load_balancing != current.config.origin.load_balancing {
+            return Err("origin.load_balancing changed; that needs a restart".to_string());
+        }
+        if cfg.health != current.config.health {
+            return Err("health-check settings changed; that needs a restart".to_string());
+        }
+        if cfg.telemetry.prometheus != current.config.telemetry.prometheus {
+            return Err("telemetry.prometheus changed; that needs a restart".to_string());
+        }
+        if cfg.cache.max_memory != current.config.cache.max_memory
+            || cfg.cache.store != current.config.cache.store
+        {
+            return Err("cache store or memory budget changed; that needs a restart".to_string());
+        }
+        if cfg.timeouts.origin != current.config.timeouts.origin {
+            return Err(
+                "timeouts.origin changed; Pingora's cache-lock writer age is startup-bound and needs a restart"
+                    .to_string(),
+            );
+        }
+        drop(current);
 
         let route_limits: Vec<(String, usize, usize, std::time::Duration)> = cfg
             .routes
             .iter()
             .filter_map(|r| {
                 r.concurrency.as_ref().map(|c| {
-                    (r.id.clone(), c.max, c.queue.max, c.queue.timeout.as_duration())
+                    (
+                        r.id.clone(),
+                        c.max,
+                        c.queue.max,
+                        c.queue.timeout.as_duration(),
+                    )
                 })
             })
             .collect();
 
-        let snapshot = PolicySnapshot::build(cfg, generation).map_err(|e| e.to_string())?;
+        let next_generation = self.generation.load(Ordering::SeqCst) + 1;
+        let snapshot = PolicySnapshot::build(cfg, next_generation).map_err(|e| e.to_string())?;
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
         // Resize before swapping: a request arriving on the new policy should
         // never find the old ceiling still in force.
-        self.admission
-            .apply_limits(snapshot.config.origin.concurrency.max, &route_limits);
+        let global = &snapshot.config.origin.concurrency;
+        self.admission.apply_limits(
+            global.max,
+            global.queue.max,
+            global.queue.timeout.as_duration(),
+            &route_limits,
+        );
         self.policy.store(snapshot);
 
         Ok(generation)
@@ -152,7 +183,13 @@ routes:
       max: 10
 "#;
 
-    fn setup(body: &str) -> (tempfile_lite::TempPath, Reloader, Arc<ArcSwap<PolicySnapshot>>) {
+    fn setup(
+        body: &str,
+    ) -> (
+        tempfile_lite::TempPath,
+        Reloader,
+        Arc<ArcSwap<PolicySnapshot>>,
+    ) {
         let path = write_config(body);
         let cfg = crate::config::load(&path.0).unwrap();
         let snapshot = PolicySnapshot::build(cfg, 1).unwrap();
@@ -185,9 +222,18 @@ routes:
         .unwrap();
 
         assert!(reloader.reload().is_err());
-        assert_eq!(policy.load().generation, 1, "a refused reload must not advance");
         assert_eq!(
-            policy.load().routes[0].config.concurrency.as_ref().unwrap().max,
+            policy.load().generation,
+            1,
+            "a refused reload must not advance"
+        );
+        assert_eq!(
+            policy.load().routes[0]
+                .config
+                .concurrency
+                .as_ref()
+                .unwrap()
+                .max,
             10,
             "the running config must be untouched"
         );
@@ -213,9 +259,31 @@ routes:
     #[test]
     fn changing_upstreams_is_refused_with_an_explanation() {
         let (path, reloader, _policy) = setup(BASE);
-        std::fs::write(&path.0, BASE.replace(r#"["a:3000"]"#, r#"["a:3000", "b:3000"]"#)).unwrap();
+        std::fs::write(
+            &path.0,
+            BASE.replace(r#"["a:3000"]"#, r#"["a:3000", "b:3000"]"#),
+        )
+        .unwrap();
         let err = reloader.reload().unwrap_err();
         assert!(err.contains("needs a restart"), "{err}");
+    }
+
+    #[test]
+    fn changing_startup_bound_runtime_components_is_refused() {
+        for changed in [
+            BASE.replace(
+                "upstreams: [\"a:3000\"]",
+                "upstreams: [\"a:3000\"]\n  load_balancing: hash_by_path",
+            ),
+            format!("{BASE}health:\n  path: /healthz\n  interval: 5s\n  timeout: 1s\n"),
+            format!("{BASE}cache:\n  max_memory: 64MiB\n"),
+            format!("{BASE}telemetry:\n  prometheus:\n    listen: \"127.0.0.1:9090\"\n"),
+        ] {
+            let (path, reloader, policy) = setup(BASE);
+            std::fs::write(&path.0, changed).unwrap();
+            assert!(reloader.reload().unwrap_err().contains("restart"));
+            assert_eq!(policy.load().generation, 1);
+        }
     }
 
     #[test]
@@ -241,7 +309,10 @@ mod tempfile_lite {
         pub fn new(prefix: &str) -> TempPath {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
-            TempPath(format!("{}/{prefix}-{pid}-{n}.yaml", std::env::temp_dir().display()))
+            TempPath(format!(
+                "{}/{prefix}-{pid}-{n}.yaml",
+                std::env::temp_dir().display()
+            ))
         }
     }
 

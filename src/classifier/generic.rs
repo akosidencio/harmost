@@ -19,11 +19,6 @@ pub fn classify(req: &RequestMetadata<'_>) -> RequestClass {
         return RequestClass::PrivateDynamic;
     }
 
-    // Server-sent events hold their body open; they must not occupy a render slot.
-    if req.header("accept").is_some_and(|a| a.contains("text/event-stream")) {
-        return RequestClass::Streaming;
-    }
-
     // Cookies are the conservative default: assume personalised unless a route
     // says otherwise. Most of the internet's cache bugs live here.
     if req.has_cookies() {
@@ -55,14 +50,28 @@ mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue, Method, header};
 
-    fn req<'a>(m: &'a Method, path: &'a str, q: Option<&'a str>, h: &'a HeaderMap) -> RequestMetadata<'a> {
-        RequestMetadata { method: m, host: "example.com", path, query: q, headers: h }
+    fn req<'a>(
+        m: &'a Method,
+        path: &'a str,
+        q: Option<&'a str>,
+        h: &'a HeaderMap,
+    ) -> RequestMetadata<'a> {
+        RequestMetadata {
+            method: m,
+            host: "example.com",
+            path,
+            query: q,
+            headers: h,
+        }
     }
 
     #[test]
     fn plain_get_is_a_public_document() {
         let h = HeaderMap::new();
-        assert_eq!(classify(&req(&Method::GET, "/blog/post", None, &h)), RequestClass::PublicDocument);
+        assert_eq!(
+            classify(&req(&Method::GET, "/blog/post", None, &h)),
+            RequestClass::PublicDocument
+        );
     }
 
     #[test]
@@ -78,21 +87,33 @@ mod tests {
     fn authorization_is_always_private() {
         let mut h = HeaderMap::new();
         h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer x"));
-        assert_eq!(classify(&req(&Method::GET, "/blog/post", None, &h)), RequestClass::PrivateDynamic);
+        assert_eq!(
+            classify(&req(&Method::GET, "/blog/post", None, &h)),
+            RequestClass::PrivateDynamic
+        );
     }
 
     #[test]
     fn cookies_are_private_by_default() {
         let mut h = HeaderMap::new();
         h.insert(header::COOKIE, HeaderValue::from_static("session=abc"));
-        assert_eq!(classify(&req(&Method::GET, "/", None, &h)), RequestClass::PrivateDynamic);
+        assert_eq!(
+            classify(&req(&Method::GET, "/", None, &h)),
+            RequestClass::PrivateDynamic
+        );
     }
 
     #[test]
-    fn event_stream_is_streaming_not_a_document() {
+    fn accept_header_cannot_bypass_admission() {
         let mut h = HeaderMap::new();
-        h.insert(header::ACCEPT, HeaderValue::from_static("text/event-stream"));
-        assert_eq!(classify(&req(&Method::GET, "/feed", None, &h)), RequestClass::Streaming);
+        h.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        assert_eq!(
+            classify(&req(&Method::GET, "/feed", None, &h)),
+            RequestClass::PublicDocument
+        );
     }
 
     #[test]
@@ -105,7 +126,10 @@ mod tests {
     fn writes_are_mutations() {
         let h = HeaderMap::new();
         for m in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
-            assert_eq!(classify(&req(&m, "/api/x", None, &h)), RequestClass::Mutation);
+            assert_eq!(
+                classify(&req(&m, "/api/x", None, &h)),
+                RequestClass::Mutation
+            );
         }
     }
 }

@@ -11,3 +11,7 @@ pub mod store;
 pub use key::{CacheKey, KeyBuilder};
 pub use policy::{BypassReason, Disposition, Shareability};
 pub use store::BoundedStore;
+
+/// Private marker carried only in cache metadata while an in-flight response
+/// is being followed. It is stripped before every downstream response.
+pub(crate) const TRANSIENT_HEADER: &str = "x-harmost-transient-internal";

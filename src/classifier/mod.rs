@@ -33,12 +33,18 @@ pub enum RequestClass {
 impl RequestClass {
     /// May a response in this class ever be stored, before any header is read?
     pub fn storable_in_principle(self) -> bool {
-        matches!(self, RequestClass::Static | RequestClass::PublicDocument | RequestClass::PublicDynamic)
+        matches!(
+            self,
+            RequestClass::Static | RequestClass::PublicDocument | RequestClass::PublicDynamic
+        )
     }
 
     /// May concurrent equivalent requests in this class be collapsed?
     pub fn coalescible_in_principle(self) -> bool {
-        matches!(self, RequestClass::PublicDocument | RequestClass::PublicDynamic)
+        matches!(
+            self,
+            RequestClass::PublicDocument | RequestClass::PublicDynamic
+        )
     }
 
     /// Does a request in this class consume an origin work permit?
@@ -89,7 +95,10 @@ impl<'a> RequestMetadata<'a> {
         self.headers.get_all(header::COOKIE).iter().any(|v| {
             v.to_str().is_ok_and(|raw| {
                 raw.split(';').any(|pair| {
-                    pair.split('=').next().map(str::trim).is_some_and(|k| k == name)
+                    pair.split('=')
+                        .next()
+                        .map(str::trim)
+                        .is_some_and(|k| k == name)
                 })
             })
         })
