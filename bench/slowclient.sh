@@ -21,7 +21,8 @@ cargo build --workspace -q || exit 1
 cleanup() { pkill -9 -f 'target/debug/slow-origin' 2>/dev/null; pkill -9 -f 'target/debug/harmost run' 2>/dev/null; }
 trap cleanup EXIT
 
-cat > /tmp/slowclient.yaml <<'EOF'
+write_config() { # $1 = downstream_write
+cat > /tmp/slowclient.yaml <<EOF
 version: 1
 server:
   listen: "127.0.0.1:8080"
@@ -32,6 +33,8 @@ origin:
     queue:
       max: 10
       timeout: 3s
+timeouts:
+  downstream_write: $1
 cache:
   enabled: false
 routes:
@@ -39,11 +42,16 @@ routes:
     match: "/**"
     class: public_ssr
 EOF
+}
+
+DW=${1:-30s}
+write_config "$DW"
 
 echo "ceiling = 2, two slow readers at 32KB/s, then one normal request"
+echo "timeouts.downstream_write = $DW"
 echo
 printf '  %-10s %-8s %-10s %s\n' "body" "status" "latency" "capacity returned?"
-for MIB in 1 2 4 8 16; do
+for MIB in 1 2 4 16; do
   cleanup; sleep 1
   ./target/debug/slow-origin 3000 50 >/dev/null 2>&1 & disown
   sleep 1
@@ -59,4 +67,4 @@ for MIB in 1 2 4 8 16; do
   printf '  %-10s %-8s %-10s %s\n' "${MIB}MiB" "$CODE" "${MS}ms" "$VERDICT"
 done
 echo
-echo "Known gap: past the buffer threshold, a slow reader occupies a render slot."
+echo "Run with a tighter bound to see the mitigation:  ./bench/slowclient.sh 2s"

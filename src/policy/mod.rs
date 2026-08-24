@@ -9,6 +9,7 @@
 //! generation — see [`crate::admission::AdmissionController`].
 
 pub mod matcher;
+pub mod reload;
 
 use crate::config::schema::{ClassOverride, Config, Route};
 use crate::classifier::RequestClass;
@@ -84,7 +85,7 @@ mod tests {
     use super::*;
 
     fn snapshot(yaml: &str) -> Arc<PolicySnapshot> {
-        let cfg: Config = serde_norway::from_str(yaml).unwrap();
+        let cfg: Config = serde_saphyr::from_str(yaml).unwrap();
         crate::config::validation::validate(&cfg).unwrap();
         PolicySnapshot::build(cfg, 1).unwrap()
     }

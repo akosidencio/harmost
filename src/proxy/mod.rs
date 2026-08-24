@@ -19,6 +19,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use pingora_core::prelude::*;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -40,6 +41,9 @@ use crate::upstream::UpstreamPool;
 
 /// Per-request state.
 pub struct Ctx {
+    /// The policy generation this request started on. Pinned here so a reload
+    /// mid-request cannot apply half of itself to one request.
+    pub policy: Arc<PolicySnapshot>,
     pub started: Instant,
     pub class: RequestClass,
     pub route_id: Option<String>,
@@ -61,11 +65,14 @@ pub struct Ctx {
     pub key_headers: Vec<&'static str>,
     pub coalesce_only: bool,
     pub may_store: bool,
+    /// Where the origin permit was given back, for the access log.
+    pub permit_released_at: Option<&'static str>,
 }
 
 impl Ctx {
-    fn new() -> Self {
+    fn new(policy: Arc<PolicySnapshot>) -> Self {
         Ctx {
+            policy,
             started: Instant::now(),
             class: RequestClass::Unknown,
             route_id: None,
@@ -77,45 +84,40 @@ impl Ctx {
             key_headers: Vec::new(),
             coalesce_only: false,
             may_store: false,
+            permit_released_at: None,
         }
     }
 }
 
 pub struct Harmost {
-    policy: Arc<PolicySnapshot>,
+    policy: Arc<ArcSwap<PolicySnapshot>>,
     admission: Arc<AdmissionController>,
     upstreams: Arc<UpstreamPool>,
     adapter: Arc<dyn FrameworkAdapter>,
     store: &'static BoundedStore,
+    /// Built once at startup: the lock's age timeout comes from
+    /// `coalesce.wait_timeout`, so changing that needs a restart.
     cache_lock: &'static pingora_cache::lock::CacheKeyLockImpl,
-    max_body_size: usize,
-    cache_enabled: bool,
-    debug_headers: bool,
-    overload_status: u16,
-    retry_after: u64,
 }
 
 impl Harmost {
     pub fn new(
-        policy: Arc<PolicySnapshot>,
+        policy: Arc<ArcSwap<PolicySnapshot>>,
         admission: Arc<AdmissionController>,
         upstreams: Arc<UpstreamPool>,
     ) -> Self {
+        let initial = policy.load();
         // `Storage` takes `&'static self` throughout, so the store and the
         // lock are created once and leaked deliberately at startup.
-        let store = BoundedStore::new(policy.config.cache.max_memory.get() as usize);
+        let store = BoundedStore::new(initial.config.cache.max_memory.get() as usize);
         let cache_lock: &'static pingora_cache::lock::CacheKeyLockImpl = Box::leak(
-            pingora_cache::lock::CacheLock::new_boxed(policy.coalesce_wait()),
+            pingora_cache::lock::CacheLock::new_boxed(initial.coalesce_wait()),
         );
+        drop(initial);
 
         Harmost {
             store,
             cache_lock,
-            max_body_size: policy.config.cache.max_body_size.get() as usize,
-            cache_enabled: policy.config.cache.enabled,
-            debug_headers: policy.config.debug_headers,
-            overload_status: policy.config.overload.status,
-            retry_after: policy.config.overload.retry_after.as_duration().as_secs().max(1),
             adapter: Arc::new(NextJs),
             upstreams,
             admission,
@@ -124,8 +126,8 @@ impl Harmost {
     }
 
     /// Route limiter for this request, created on first use.
-    fn limiter_for(&self, route_id: &str) -> Option<Arc<Limiter>> {
-        let route = self.policy.routes.iter().find(|r| r.id == route_id)?;
+    fn limiter_for(&self, policy: &PolicySnapshot, route_id: &str) -> Option<Arc<Limiter>> {
+        let route = policy.routes.iter().find(|r| r.id == route_id)?;
         let c = route.config.concurrency.as_ref()?;
         Some(self.admission.route_limiter(
             route_id,
@@ -135,12 +137,14 @@ impl Harmost {
         ))
     }
 
-    async fn refuse(&self, session: &mut Session) -> Result<()> {
-        let mut resp = ResponseHeader::build(self.overload_status, Some(3))?;
-        resp.insert_header("Retry-After", self.retry_after.to_string())?;
+    async fn refuse(&self, session: &mut Session, policy: &PolicySnapshot) -> Result<()> {
+        let overload = &policy.config.overload;
+        let mut resp = ResponseHeader::build(overload.status, Some(3))?;
+        let retry_after = overload.retry_after.as_duration().as_secs().max(1);
+        resp.insert_header("Retry-After", retry_after.to_string())?;
         // A CDN that caches this turns a brief origin blip into a long outage.
         resp.insert_header("Cache-Control", "no-store")?;
-        if self.debug_headers {
+        if policy.config.debug_headers {
             resp.insert_header("X-Harmost", "SHED")?;
         }
         session.write_response_header(Box::new(resp), true).await?;
@@ -153,7 +157,23 @@ impl ProxyHttp for Harmost {
     type CTX = Ctx;
 
     fn new_ctx(&self) -> Ctx {
-        Ctx::new()
+        // Pin the generation for the whole request.
+        Ctx::new(self.policy.load_full())
+    }
+
+    async fn early_request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<()> {
+        // Bound how long a single downstream write may block.
+        //
+        // This is what keeps a deliberately slow reader from occupying an
+        // origin permit indefinitely on a response too large to fit in the
+        // buffers between origin and client. It does not eliminate the
+        // coupling — see the slow-reader note in the README — but it turns an
+        // unbounded hold into a bounded one.
+        let timeout = ctx.policy.config.timeouts.downstream_write.as_duration();
+        if !timeout.is_zero() {
+            session.as_downstream_mut().set_write_timeout(Some(timeout));
+        }
+        Ok(())
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
@@ -177,7 +197,8 @@ impl ProxyHttp for Harmost {
         };
 
         let hints = self.adapter.classify_request(&meta);
-        let route = self.policy.resolve(&host, &path, &method);
+        let policy = ctx.policy.clone();
+        let route = policy.resolve(&host, &path, &method);
 
         // A route's declared class outranks what the classifier inferred —
         // the operator knows things about their own routes that headers do not
@@ -200,7 +221,7 @@ impl ProxyHttp for Harmost {
         let route_label = ctx.route_id.as_deref().unwrap_or("-");
         metrics::REQUESTS.with_label_values(&[route_label, ctx.class.as_str()]).inc();
 
-        ctx.may_store = self.cache_enabled
+        ctx.may_store = ctx.policy.config.cache.enabled
             && matches!(
                 evaluate_request(
                     &meta,
@@ -231,7 +252,7 @@ impl ProxyHttp for Harmost {
         // Upstream tracks body bytes and marks the response uncacheable past
         // this limit, so an oversized body streams to the client without
         // being retained.
-        session.cache.set_max_file_size_bytes(self.max_body_size);
+        session.cache.set_max_file_size_bytes(ctx.policy.config.cache.max_body_size.get() as usize);
         Ok(())
     }
 
@@ -259,7 +280,7 @@ impl ProxyHttp for Harmost {
             scheme: "http",
             query_policy: ctx.route_cache.as_ref().and_then(|c| c.query.as_ref()),
             variant_headers: &variant,
-            deployment: self.policy.config.deployment.id.as_deref(),
+            deployment: ctx.policy.config.deployment.id.as_deref(),
         }
         .build(&meta);
 
@@ -269,7 +290,10 @@ impl ProxyHttp for Harmost {
     /// Admission. Reached only on a genuine cache miss, so hits and coalesced
     /// followers never consume origin capacity.
     async fn proxy_upstream_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
-        let route_limiter = ctx.route_id.as_deref().and_then(|id| self.limiter_for(id));
+        let route_limiter = ctx
+            .route_id
+            .as_deref()
+            .and_then(|id| self.limiter_for(&ctx.policy, id));
         let route_label = ctx.route_id.as_deref().unwrap_or("-").to_string();
         let outcome = self.admission.admit(ctx.class, route_limiter.as_ref()).await;
 
@@ -305,7 +329,7 @@ impl ProxyHttp for Harmost {
                 metrics::ADMISSION
                     .with_label_values(&[&route_label, &format!("shed_{}", reason.as_str())])
                     .inc();
-                self.refuse(session).await?;
+                self.refuse(session, &ctx.policy).await?;
                 Ok(false)
             }
         }
@@ -378,6 +402,34 @@ impl ProxyHttp for Harmost {
         Ok(())
     }
 
+    async fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        upstream: &mut ResponseHeader,
+        ctx: &mut Ctx,
+    ) -> Result<()> {
+        // A permit models *render* capacity, not transfer.
+        //
+        // If the origin sent a Content-Length it had the whole body in hand
+        // before it started writing, so the render is finished and everything
+        // left is bytes moving down a socket. Holding the permit through that
+        // charges a slow reader's download against the render budget — and
+        // Pingora's proxy loop pairs upstream reads with downstream writes
+        // through a fixed four-task channel, so the origin cannot run ahead
+        // and end-of-stream never arrives until the client has drained. That
+        // is how two clients reading at 32KB/s used to occupy a ceiling of 2
+        // for minutes without the origin doing any work at all.
+        //
+        // A chunked response is the opposite case: no Content-Length means
+        // the origin is still producing, so the permit is still buying
+        // something and is held until the body ends.
+        if upstream.headers.contains_key(http::header::CONTENT_LENGTH) {
+            ctx.permit = None;
+            ctx.permit_released_at = Some("headers");
+        }
+        Ok(())
+    }
+
     fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
@@ -386,16 +438,18 @@ impl ProxyHttp for Harmost {
         ctx: &mut Ctx,
     ) -> Result<Option<std::time::Duration>> {
         if end_of_stream {
+            if ctx.permit.is_some() {
+                ctx.permit_released_at = Some("body_end");
+            }
             // The permit represents *render* capacity, so it is returned the
             // moment the origin stops rendering. Holding it until the client
             // finished reading would let a deliberately slow reader occupy a
             // slot sized for a 200ms render, which is a cheap way to defeat
             // the limiter.
             //
-            // Residual coupling remains: Pingora paces upstream reads against
-            // downstream writes, so a slow client can still stretch how long
-            // the origin takes to drain. `timeouts.downstream_write` is what
-            // bounds that.
+            // Reached only for responses with no Content-Length, where the
+            // origin is genuinely still rendering. A slow client can still
+            // stretch that out, and `timeouts.downstream_write` bounds it.
             ctx.permit = None;
         }
         Ok(None)
@@ -407,7 +461,7 @@ impl ProxyHttp for Harmost {
         resp: &mut ResponseHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
-        if self.debug_headers {
+        if ctx.policy.config.debug_headers {
             resp.insert_header("X-Harmost", cache_status(session, ctx).to_ascii_uppercase())?;
         }
         Ok(())
@@ -459,7 +513,7 @@ impl ProxyHttp for Harmost {
             .with_label_values(&["global"])
             .set((global.limit().saturating_sub(global.available())) as i64);
         metrics::QUEUE_DEPTH.with_label_values(&["global"]).set(global.queue_depth() as i64);
-        if let Some(l) = ctx.route_id.as_deref().and_then(|id| self.limiter_for(id)) {
+        if let Some(l) = ctx.route_id.as_deref().and_then(|id| self.limiter_for(&ctx.policy, id)) {
             metrics::IN_FLIGHT
                 .with_label_values(&[l.name()])
                 .set((l.limit().saturating_sub(l.available())) as i64);

@@ -180,7 +180,7 @@ and request-coalescing integration.
 | Cache and coalescing wiring | implemented; experimental |
 | Prometheus metrics, JSON access logs | done |
 | Active health checks | done |
-| Graceful reload | not started |
+| Graceful reload (SIGHUP) | done |
 
 The security- and correctness-sensitive parts—cache-key construction, response
 shareability, and bounded admission—remain isolated as testable logic beneath

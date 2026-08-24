@@ -142,11 +142,37 @@ impl BoundedStore {
 impl Storage for BoundedStore {
     async fn lookup(&'static self, key: &CacheKey, _t: &SpanHandle) -> Result<Option<(CacheMeta, HitHandler)>> {
         let hash = key.combined();
-        let Some(obj) = self.cached.read().get(&hash).cloned() else {
+
+        if let Some(obj) = self.cached.read().get(&hash).cloned() {
+            let meta = CacheMeta::deserialize(&obj.meta.0, &obj.meta.1)?;
+            return Ok(Some((meta, Box::new(CompleteHit { body: obj.body, read: 0, done: false }))));
+        }
+
+        // Nothing finished — but a write may be in progress, and this is the
+        // path a coalesced waiter arrives on.
+        //
+        // When a storage supports streaming partial writes, Pingora releases
+        // the cache lock as soon as the leader's miss handler exists, so
+        // waiters wake with `LockStatus::Done` and come straight back here
+        // with no write tag. If `lookup` only ever answered from finished
+        // entries, every one of them would miss and go to the origin — which
+        // is request collapsing failing silently, in the one shape where the
+        // collapsing matters most.
+        let partial = {
+            let temp = self.temp.read();
+            temp.get(&hash).and_then(|writes| {
+                // One leader per key in practice; take the newest if a
+                // revalidation overlaps.
+                writes.iter().max_by_key(|(id, _)| **id).map(|(_, t)| {
+                    (t.meta.clone(), t.body.clone(), t.written.subscribe())
+                })
+            })
+        };
+        let Some((meta, body, written)) = partial else {
             return Ok(None);
         };
-        let meta = CacheMeta::deserialize(&obj.meta.0, &obj.meta.1)?;
-        Ok(Some((meta, Box::new(CompleteHit { body: obj.body, read: 0, done: false }))))
+        let meta = CacheMeta::deserialize(&meta.0, &meta.1)?;
+        Ok(Some((meta, Box::new(PartialHit { body, written, read: 0 }))))
     }
 
     async fn lookup_streaming_write(
@@ -373,3 +399,83 @@ impl HandleMiss for FollowableMiss {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_cache::CacheMeta;
+    use pingora_cache::trace::Span;
+    use pingora_http::ResponseHeader;
+    use std::time::{Duration, SystemTime};
+
+    fn meta() -> CacheMeta {
+        let now = SystemTime::now();
+        CacheMeta::new(
+            now + Duration::from_secs(60),
+            now,
+            0,
+            0,
+            ResponseHeader::build(200, None).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn lookup_serves_a_write_that_is_still_in_progress() {
+        // The regression this guards: Pingora releases the cache lock as soon
+        // as the leader's miss handler exists, so coalesced waiters arrive at
+        // `lookup` with no write tag while the body is still being written.
+        // A `lookup` that only answers from finished entries makes every
+        // waiter miss and go to the origin — request collapsing failing
+        // silently on exactly the streaming responses it matters most for.
+        let store = BoundedStore::new(1 << 20);
+        let key = CacheKey::new("", "/streaming", "");
+
+        let mut leader = store
+            .get_miss_handler(&key, &meta(), &Span::inactive().handle())
+            .await
+            .unwrap();
+        leader.write_body(Bytes::from_static(b"shell"), false).await.unwrap();
+
+        let hit = store.lookup(&key, &Span::inactive().handle()).await.unwrap();
+        let (_meta, mut reader) = hit.expect("a waiter must be able to attach to the in-flight write");
+        assert_eq!(&reader.read_body().await.unwrap().unwrap()[..], b"shell");
+    }
+
+    #[tokio::test]
+    async fn lookup_prefers_a_finished_entry_over_a_new_write() {
+        let store = BoundedStore::new(1 << 20);
+        let key = CacheKey::new("", "/revalidating", "");
+
+        let mut first = store
+            .get_miss_handler(&key, &meta(), &Span::inactive().handle())
+            .await
+            .unwrap();
+        first.write_body(Bytes::from_static(b"old"), true).await.unwrap();
+        first.finish().await.unwrap();
+
+        // A revalidation starts while the finished entry is still servable.
+        let mut second = store
+            .get_miss_handler(&key, &meta(), &Span::inactive().handle())
+            .await
+            .unwrap();
+        second.write_body(Bytes::from_static(b"new"), false).await.unwrap();
+
+        let (_m, mut reader) = store
+            .lookup(&key, &Span::inactive().handle())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &reader.read_body().await.unwrap().unwrap()[..],
+            b"old",
+            "a complete entry should win over a half-written one"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_still_misses_when_there_is_nothing_at_all() {
+        let store = BoundedStore::new(1 << 20);
+        let key = CacheKey::new("", "/absent", "");
+        assert!(store.lookup(&key, &Span::inactive().handle()).await.unwrap().is_none());
+    }
+}

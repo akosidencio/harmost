@@ -19,8 +19,10 @@ pub enum LoadError {
     #[error("parsing {path}")]
     Parse {
         path: String,
+        // Boxed: serde_saphyr's error carries position and context and is
+        // large enough to bloat every Ok value on this Result.
         #[source]
-        source: serde_norway::Error,
+        source: Box<serde_saphyr::Error>,
     },
     #[error("invalid configuration in {path}")]
     Invalid {
@@ -36,9 +38,9 @@ pub fn load(path: &str) -> Result<Config, LoadError> {
         path: path.to_string(),
         source,
     })?;
-    let cfg: Config = serde_norway::from_str(&text).map_err(|source| LoadError::Parse {
+    let cfg: Config = serde_saphyr::from_str(&text).map_err(|source| LoadError::Parse {
         path: path.to_string(),
-        source,
+        source: Box::new(source),
     })?;
     validation::validate(&cfg).map_err(|source| LoadError::Invalid {
         path: path.to_string(),

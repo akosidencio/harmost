@@ -56,6 +56,7 @@ fn run(path: &str) -> ExitCode {
     use harmost::policy::PolicySnapshot;
     use harmost::proxy::Harmost;
     use harmost::upstream::UpstreamPool;
+    use harmost::policy::reload::Reloader;
     use harmost::upstream::health::HealthChecker;
     use std::sync::Arc;
 
@@ -91,6 +92,8 @@ fn run(path: &str) -> ExitCode {
         }
     };
 
+    let policy = Arc::new(arc_swap::ArcSwap::from(policy));
+
     let admission = Arc::new(AdmissionController::new(
         concurrency.max,
         concurrency.queue.max,
@@ -108,12 +111,21 @@ fn run(path: &str) -> ExitCode {
 
     // One pool, shared by the proxy and the health checker, so a probe result
     // is visible to routing immediately.
+    let snapshot = policy.load();
     let upstreams = Arc::new(UpstreamPool::new(
-        &policy.config.origin.upstreams,
-        policy.config.origin.load_balancing,
+        &snapshot.config.origin.upstreams,
+        snapshot.config.origin.load_balancing,
     ));
+    let health_cfg = snapshot.config.health.clone();
+    drop(snapshot);
 
-    if let Some(health) = policy.config.health.clone() {
+    server.add_service(pingora_core::services::background::background_service(
+        "reload",
+        Reloader::new(path.to_string(), policy.clone(), admission.clone()),
+    ));
+    eprintln!("  reload config with: kill -HUP <pid>");
+
+    if let Some(health) = health_cfg {
         eprintln!(
             "  health checks: {} every {:?}",
             health.path,

@@ -168,7 +168,7 @@ mod tests {
     use crate::config::Config as _Config;
 
     fn parse(yaml: &str) -> _Config {
-        serde_norway::from_str(yaml).expect("yaml should parse")
+        serde_saphyr::from_str(yaml).expect("yaml should parse")
     }
 
     const BASE: &str = r#"
@@ -185,7 +185,7 @@ origin:
     #[test]
     fn rejects_unknown_keys() {
         // A typo'd key is a silent policy change; serde must refuse it.
-        let e = serde_norway::from_str::<_Config>(
+        let e = serde_saphyr::from_str::<_Config>(
             r#"
 version: 1
 origin:

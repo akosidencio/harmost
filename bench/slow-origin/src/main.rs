@@ -59,6 +59,45 @@ async fn main() -> std::io::Result<()> {
                 return;
             }
 
+            // /stream/<n> emits n chunks with a render delay between each,
+            // the way a server-rendered page streams a shell and then fills
+            // in suspended regions. A buffered response cannot exercise
+            // whether coalesced waiters receive chunks as they are produced.
+            if path.starts_with("/stream") {
+                let chunks: usize =
+                    path.rsplit('/').next().and_then(|s| s.parse().ok()).unwrap_or(4);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/html\r\n\
+                     Transfer-Encoding: chunked\r\n\
+                     Cache-Control: private, no-cache, no-store, max-age=0, must-revalidate\r\n\
+                     X-Origin-Total: {seq}\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                if sock.write_all(head.as_bytes()).await.is_err() {
+                    stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                }
+                let _ = sock.flush().await;
+                for i in 0..chunks {
+                    // The shell goes out immediately; everything after it
+                    // costs a render delay.
+                    if i > 0 {
+                        tokio::time::sleep(Duration::from_millis(render_ms)).await;
+                    }
+                    let piece = format!("<div>chunk {i}</div>");
+                    let framed = format!("{:x}\r\n{piece}\r\n", piece.len());
+                    if sock.write_all(framed.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    let _ = sock.flush().await;
+                }
+                let _ = sock.write_all(b"0\r\n\r\n").await;
+                let _ = sock.flush().await;
+                stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+
             tokio::time::sleep(Duration::from_millis(render_ms)).await;
 
             // /private/* sets a session cookie. Nothing that does this may
