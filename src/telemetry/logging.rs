@@ -22,6 +22,9 @@ pub struct AccessLog<'a> {
     pub shed: bool,
     pub origin_ms: u128,
     pub total_ms: u128,
+    /// Where the origin permit was returned: "headers", "body_end", or "-"
+    /// when this request never held one.
+    pub permit_released_at: &'a str,
 }
 
 impl AccessLog<'_> {
@@ -34,6 +37,7 @@ impl AccessLog<'_> {
         write_str(&mut s, "class", self.class);
         write_str(&mut s, "cache", self.cache);
         write_str(&mut s, "upstream", self.upstream.unwrap_or("-"));
+        write_str(&mut s, "permit_released", self.permit_released_at);
         let _ = write!(
             s,
             "\"status\":{},\"shed\":{},\"origin_ms\":{},\"total_ms\":{}}}",
@@ -88,6 +92,7 @@ mod tests {
             shed: false,
             origin_ms: 0,
             total_ms: 3,
+            permit_released_at: "headers",
         }
         .to_json()
     }
@@ -104,7 +109,7 @@ mod tests {
     fn a_quote_in_the_path_cannot_break_the_line() {
         let out = log(r#"/a"b"#);
         assert!(out.contains(r#""path":"/a\"b""#), "{out}");
-        assert_eq!(out.matches(r#"","#).count(), 6, "field count changed: {out}");
+        assert_eq!(out.matches(r#"","#).count(), 7, "field count changed: {out}");
     }
 
     #[test]
@@ -142,6 +147,7 @@ mod tests {
             shed: false,
             origin_ms: 0,
             total_ms: 1,
+            permit_released_at: "-",
         }
         .to_json();
         assert!(out.contains(r#""upstream":"-""#));

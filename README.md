@@ -2,6 +2,12 @@
 
 **Stop traffic spikes from becoming render spikes.**
 
+> [!WARNING]
+> **Harmost is under active development and is not ready for production.** It
+> is in an early validation, verification, and testing phase. APIs,
+> configuration, behavior, and operational guarantees may change without
+> notice. Use it only in development or controlled test environments.
+
 Harmost is an open-source Rust reverse proxy and origin workload governor for
 server-rendered applications. It protects Next.js and other SSR origins with
 bounded concurrency, request coalescing, safe microcaching, bounded queues, and
@@ -44,15 +50,28 @@ Typical use cases include protecting Next.js storefronts during product drops,
 absorbing bursts on public SSR pages, and enforcing predictable origin capacity
 for mixed public, private, static, and dynamic routes.
 
+## How Harmost works
+
+![Animated diagram showing how Harmost classifies requests, reuses cached or in-flight responses, bounds cache misses, and protects the SSR origin](./assets/harmost-flow.svg)
+
+Harmost resolves the route and request class before checking for a safe cached
+or in-flight response. Only a genuine cache miss enters the bounded per-route
+and global admission queues. Accepted work reaches the SSR origin; excess work
+receives an eligible stale response or is shed when the queue is full or its
+deadline expires. Every origin response is checked again before it can be
+shared or stored.
+
 ## Contents
 
 - [What Harmost does](#what-harmost-does)
+- [How Harmost works](#how-harmost-works)
 - [Why use Harmost instead of a standard reverse-proxy cache?](#why-use-harmost-instead-of-a-standard-reverse-proxy-cache)
 - [Request coalescing benchmark](#request-coalescing-benchmark)
 - [Private-response safety check](#private-response-safety-check)
 - [Quick start](#quick-start)
 - [Project status](#project-status)
 - [Design principles](#design-principles)
+- [Slow readers and render capacity](#slow-readers-and-render-capacity)
 - [Request coalescing and microcache architecture](#request-coalescing-and-microcache-architecture)
 - [Next.js caching and cache-key design](#nextjs-caching-and-cache-key-design)
 - [Configuration](#configuration)
@@ -163,8 +182,10 @@ To reproduce the bounded-concurrency demonstration, run:
 
 ## Project status
 
-Early-stage. Harmost runs as a Pingora reverse proxy with experimental cache
-and request-coalescing integration.
+**Not production ready.** Harmost is under active development and remains in an
+early validation, verification, and testing phase. It runs as a Pingora reverse
+proxy with experimental cache and request-coalescing integration, but it has
+not completed production hardening or operational validation.
 
 | Area | State |
 | --- | --- |
@@ -203,6 +224,53 @@ configuration reaches past it.
 concurrency, bounded queues, load shedding, health-aware balancing and the
 metrics. If the caching half were removed entirely this would still be worth
 running.
+
+**A permit models render capacity, not transfer.** Origin capacity is returned
+as soon as the origin stops rendering, so a client slowly downloading a finished
+page is not charged against the render budget. See below.
+
+## Slow readers and render capacity
+
+An origin permit represents *render* capacity, so when it is returned depends on
+whether the origin is still rendering. The response says which:
+
+**Buffered responses** carry a `Content-Length`, meaning the origin had the whole
+body before it began writing. Rendering is finished and what remains is bytes
+moving down a socket, so the permit is returned at the response header and a
+slow reader costs nothing.
+
+**Chunked responses** carry no `Content-Length`, so the origin is still
+producing and a blocked downstream write genuinely stalls it. The permit is held
+until the body ends, because there it is still buying something.
+
+The distinction matters because Pingora pairs upstream reads with downstream
+writes through a fixed four-task channel: the origin cannot run ahead of a slow
+client, so holding a permit until end-of-stream on a buffered response charged a
+client's entire download against the render budget.
+
+```
+$ ./bench/slowclient.sh
+
+ceiling = 2, two readers at 32KB/s, then one normal request
+
+  response                     status   latency   capacity returned?
+  buffered 1MiB                200      82ms      yes
+  buffered 4MiB                200      84ms      yes
+  buffered 16MiB               200      88ms      yes
+  streaming (chunked)          503      3048ms    no
+```
+
+Every buffered row above 2 MiB previously read `503 / 3030ms`: two clients
+reading at 32 KB/s could hold a ceiling of 2 for as long as they liked while the
+origin did no work at all.
+
+The streaming row is intended behaviour rather than a leftover bug, but it is
+still a way to occupy render slots if you serve long streams to untrusted
+clients. `timeouts.downstream_write` bounds it — at `2s` that row returns
+capacity as well.
+
+Each access log line records which path the request took, as
+`"permit_released":"headers"` or `"body_end"`.
 
 ## Request coalescing and microcache architecture
 

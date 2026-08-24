@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
-# Characterises a KNOWN GAP, and does not gate anything.
+# Can a slow reader occupy origin capacity it is not using?
 #
-# An origin permit represents render capacity, so it should be returned when
-# the origin stops rendering. Harmost releases it at upstream end-of-stream —
-# but Pingora paces upstream reads against downstream writes, so once a slow
-# client blocks the downstream write, end-of-stream never arrives and the
-# permit is held for the client's download instead.
+# An origin permit models *render* capacity. Two response shapes behave
+# differently and both are checked here:
 #
-# This sweep finds the response size at which that starts to bite. Small
-# responses land in socket buffers, the origin finishes independently, and
-# capacity comes back promptly. Past that, slow readers occupy render slots.
+#   buffered  (Content-Length present) — the origin had the whole body before
+#             it started writing, so the render is done. The permit is returned
+#             at the response header and a slow reader costs nothing.
 #
-# The real fix is a bounded decoupling buffer, which Pingora's streaming proxy
-# model does not offer directly. Until then `timeouts.downstream_write` is the
-# bound.
+#   streaming (chunked, no Content-Length) — the origin is still producing, and
+#             a blocked downstream write really does stall it. Holding the
+#             permit is correct here; `timeouts.downstream_write` bounds it.
 set -uo pipefail
 set +m
 cd "$(dirname "$0")/.."
+DW=${1:-30s}
 cargo build --workspace -q || exit 1
 cleanup() { pkill -9 -f 'target/debug/slow-origin' 2>/dev/null; pkill -9 -f 'target/debug/harmost run' 2>/dev/null; }
 trap cleanup EXIT
 
-write_config() { # $1 = downstream_write
 cat > /tmp/slowclient.yaml <<EOF
 version: 1
 server:
@@ -34,7 +31,7 @@ origin:
       max: 10
       timeout: 3s
 timeouts:
-  downstream_write: $1
+  downstream_write: $DW
 cache:
   enabled: false
 routes:
@@ -42,29 +39,47 @@ routes:
     match: "/**"
     class: public_ssr
 EOF
-}
 
-DW=${1:-30s}
-write_config "$DW"
-
-echo "ceiling = 2, two slow readers at 32KB/s, then one normal request"
-echo "timeouts.downstream_write = $DW"
-echo
-printf '  %-10s %-8s %-10s %s\n' "body" "status" "latency" "capacity returned?"
-for MIB in 1 2 4 16; do
+probe() { # $1 = url for the two slow readers, $2 = label
   cleanup; sleep 1
   ./target/debug/slow-origin 3000 50 >/dev/null 2>&1 & disown
   sleep 1
   ./target/debug/harmost run --config /tmp/slowclient.yaml >/tmp/h.log 2>&1 & disown
   sleep 2
-  curl -s -o /dev/null --limit-rate 32k "http://127.0.0.1:8080/big/1/$MIB" & disown
-  curl -s -o /dev/null --limit-rate 32k "http://127.0.0.1:8080/big/2/$MIB" & disown
+  curl -s -o /dev/null --limit-rate 32k "$1" & disown
+  curl -s -o /dev/null --limit-rate 32k "$1" & disown
   sleep 3
-  START=$(date +%s%N)
-  CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:8080/quick")
-  MS=$(( ($(date +%s%N) - START) / 1000000 ))
-  if [ "$CODE" = "200" ] && [ "$MS" -lt 1000 ]; then VERDICT="yes"; else VERDICT="NO — permits held"; fi
-  printf '  %-10s %-8s %-10s %s\n' "${MIB}MiB" "$CODE" "${MS}ms" "$VERDICT"
-done
+  local start code ms
+  start=$(date +%s%N)
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:8080/quick")
+  ms=$(( ($(date +%s%N) - start) / 1000000 ))
+  if [ "$code" = "200" ] && [ "$ms" -lt 1000 ]; then RESULT=yes; else RESULT=no; fi
+  printf '  %-28s %-8s %-9s %s\n' "$2" "$code" "${ms}ms" "$RESULT"
+}
+
+echo "ceiling = 2, two readers at 32KB/s, then one normal request"
+echo "timeouts.downstream_write = $DW"
 echo
-echo "Run with a tighter bound to see the mitigation:  ./bench/slowclient.sh 2s"
+printf '  %-28s %-8s %-9s %s\n' "response" "status" "latency" "capacity returned?"
+
+FAIL=0
+for MIB in 1 4 16; do
+  probe "http://127.0.0.1:8080/big/x/$MIB" "buffered ${MIB}MiB"
+  [ "$RESULT" = "yes" ] || FAIL=1
+done
+probe "http://127.0.0.1:8080/bigstream/40" "streaming (chunked)"
+STREAM_RESULT=$RESULT
+
+echo
+if [ "$FAIL" = "0" ]; then
+  echo "PASS: buffered responses return render capacity at the response header,"
+  echo "      so a slow reader no longer occupies a render slot at any size."
+else
+  echo "FAIL: a slow reader is holding a permit on a buffered response."
+  exit 1
+fi
+echo
+echo "Streaming, by contrast: capacity returned = $STREAM_RESULT."
+echo "That is expected — a chunked response means the origin is still rendering,"
+echo "so the permit is still buying something. Lower timeouts.downstream_write"
+echo "if you serve long streams to untrusted clients."

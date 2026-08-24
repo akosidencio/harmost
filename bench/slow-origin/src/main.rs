@@ -63,7 +63,7 @@ async fn main() -> std::io::Result<()> {
             // the way a server-rendered page streams a shell and then fills
             // in suspended regions. A buffered response cannot exercise
             // whether coalesced waiters receive chunks as they are produced.
-            if path.starts_with("/stream") {
+            if path.starts_with("/stream") || path.starts_with("/bigstream") {
                 let chunks: usize =
                     path.rsplit('/').next().and_then(|s| s.parse().ok()).unwrap_or(4);
                 let head = format!(
@@ -85,7 +85,14 @@ async fn main() -> std::io::Result<()> {
                     if i > 0 {
                         tokio::time::sleep(Duration::from_millis(render_ms)).await;
                     }
-                    let piece = format!("<div>chunk {i}</div>");
+                    // /bigstream emits chunks large enough that a rate-limited
+                    // reader actually stalls the write; /stream keeps them tiny
+                    // so the coalescing test stays fast.
+                    let piece = if path.starts_with("/bigstream") {
+                        format!("<div>{}</div>", "x".repeat(256 * 1024))
+                    } else {
+                        format!("<div>chunk {i}</div>")
+                    };
                     let framed = format!("{:x}\r\n{piece}\r\n", piece.len());
                     if sock.write_all(framed.as_bytes()).await.is_err() {
                         break;

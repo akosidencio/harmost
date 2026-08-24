@@ -498,6 +498,7 @@ impl ProxyHttp for Harmost {
                 shed: ctx.shed,
                 origin_ms,
                 total_ms: ctx.started.elapsed().as_millis(),
+                permit_released_at: ctx.permit_released_at.unwrap_or("-"),
             }
             .to_json()
         );
