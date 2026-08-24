@@ -1,0 +1,32 @@
+[workspace]
+members = [".", "spike/pingora-cache", "bench/slow-origin"]
+
+[package]
+name = "harmost"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Origin workload governor for server-rendered applications"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
+globset = "0.4"
+http = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "signal"] }
+pingora-core = "0.8"
+pingora-proxy = "0.8"
+pingora-http = "0.8"
+pingora-error = "0.8"
+async-trait = "0.1"
+bytes = "1"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

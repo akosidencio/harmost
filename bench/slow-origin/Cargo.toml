@@ -1,0 +1,12 @@
+[package]
+name = "slow-origin"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# A deliberately slow origin, so the governor has something to govern.
+# Hand-rolled HTTP/1.1 — a benchmark fixture should not drag a web framework
+# into the workspace.
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }

@@ -1,0 +1,107 @@
+# Example configuration. `harmost check --config harmost.yaml` validates it.
+version: 1
+
+server:
+  listen: "0.0.0.0:8080"
+
+origin:
+  upstreams:
+    - "next-1:3000"
+    - "next-2:3000"
+  # Hashing by path also warms the origin's own render cache and JIT state.
+  load_balancing: hash_by_path
+  concurrency:
+    max: 500
+    queue:
+      max: 1000
+      timeout: 2s
+
+health:
+  path: "/healthz"
+  interval: 5s
+  timeout: 1s
+
+cache:
+  enabled: true
+  store: memory
+  max_memory: 512MiB
+  max_body_size: 4MiB
+  respect_origin: true
+
+coalesce:
+  enabled: true
+  # wait_timeout is omitted on purpose: it then tracks timeouts.origin, so a
+  # waiter never gives up before the render it is waiting on can finish.
+  on_timeout: stale_or_shed
+
+timeouts:
+  connect: 500ms
+  first_byte: 5s
+  idle: 30s
+  origin: 30s
+  downstream_write: 30s
+
+deployment:
+  id_header: "X-Deployment-ID"
+
+routes:
+  - id: next-static
+    match: "/_next/static/**"
+    class: static
+    cache:
+      mode: origin
+
+  - id: product-pages
+    match: "/products/**"
+    class: public_ssr
+    cache:
+      # A dynamically rendered Next route answers `no-store`. Without this
+      # override the microcache never engages on the pages worth protecting.
+      override_origin: true
+      ttl:
+        max: 2s
+      stale_while_revalidate: 30s
+      stale_if_error: 5m
+    coalesce:
+      enabled: true
+    concurrency:
+      max: 100
+      queue:
+        max: 300
+        timeout: 1500ms
+
+  - id: search
+    match: "/search"
+    class: public_dynamic
+    cache:
+      ttl:
+        max: 500ms
+      query:
+        # An allowlist is what stops `?cachebust=<random>` from minting a
+        # fresh key, and therefore a fresh render, on every request.
+        mode: include
+        keys: ["q", "page"]
+    concurrency:
+      max: 50
+      queue:
+        max: 100
+        timeout: 1s
+
+  - id: account
+    match: "/account/**"
+    class: private_dynamic
+    cache:
+      enabled: false
+    coalesce:
+      enabled: false
+    concurrency:
+      max: 40
+      queue:
+        max: 100
+        timeout: 1s
+
+telemetry:
+  prometheus:
+    listen: "127.0.0.1:9090"
+  logging:
+    format: json

@@ -1,0 +1,19 @@
+# Benchmark config: a hard ceiling of 10 concurrent renders.
+version: 1
+server:
+  listen: "127.0.0.1:8080"
+origin:
+  upstreams: ["127.0.0.1:3000"]
+  load_balancing: round_robin
+  concurrency:
+    max: 10
+    queue:
+      max: 500
+      timeout: 20s
+cache:
+  enabled: false
+debug_headers: true
+routes:
+  - id: pages
+    match: "/**"
+    class: public_ssr
