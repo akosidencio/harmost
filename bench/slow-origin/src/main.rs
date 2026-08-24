@@ -69,7 +69,18 @@ async fn main() -> std::io::Result<()> {
             } else {
                 String::new()
             };
-            let body = format!("<html><body>rendered {path}</body></html>");
+            // /big/* returns a realistically sized SSR document so a slow
+            // client has something to be slow about.
+            // /big/<MiB> returns a body of that size, so a test can pick one
+            // large enough to exceed the socket buffers between origin and
+            // client and actually block the downstream write.
+            let body = if path.starts_with("/big") {
+                let mib: usize = path.rsplit('/').next().and_then(|s| s.parse().ok()).unwrap_or(1);
+                let filler = "x".repeat(mib * 1024 * 1024);
+                format!("<html><body>rendered {path}{filler}</body></html>")
+            } else {
+                format!("<html><body>rendered {path}</body></html>")
+            };
             let peak = stats.peak.load(Ordering::SeqCst);
             let resp = format!(
                 "HTTP/1.1 200 OK\r\n\

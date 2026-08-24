@@ -28,3 +28,7 @@ routes:
         max: 1s
     coalesce:
       enabled: true
+
+telemetry:
+  prometheus:
+    listen: "127.0.0.1:9090"

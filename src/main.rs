@@ -55,6 +55,8 @@ fn run(path: &str) -> ExitCode {
     use harmost::admission::AdmissionController;
     use harmost::policy::PolicySnapshot;
     use harmost::proxy::Harmost;
+    use harmost::upstream::UpstreamPool;
+    use harmost::upstream::health::HealthChecker;
     use std::sync::Arc;
 
     let cfg = match harmost::config::load(path) {
@@ -68,7 +70,18 @@ fn run(path: &str) -> ExitCode {
         }
     };
 
+    // Logs go to stderr at info by default; RUST_LOG overrides as usual.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+    harmost::telemetry::metrics::preregister();
+
     let listen = cfg.server.listen.clone();
+    let prometheus_listen = cfg
+        .telemetry
+        .prometheus
+        .as_ref()
+        .map(|p| p.listen.clone());
     let concurrency = cfg.origin.concurrency.clone();
     let policy = match PolicySnapshot::build(cfg, 1) {
         Ok(p) => p,
@@ -93,12 +106,38 @@ fn run(path: &str) -> ExitCode {
     };
     server.bootstrap();
 
+    // One pool, shared by the proxy and the health checker, so a probe result
+    // is visible to routing immediately.
+    let upstreams = Arc::new(UpstreamPool::new(
+        &policy.config.origin.upstreams,
+        policy.config.origin.load_balancing,
+    ));
+
+    if let Some(health) = policy.config.health.clone() {
+        eprintln!(
+            "  health checks: {} every {:?}",
+            health.path,
+            health.interval.as_duration()
+        );
+        server.add_service(pingora_core::services::background::background_service(
+            "health",
+            HealthChecker::new(upstreams.clone(), &health),
+        ));
+    }
+
     let mut service = pingora_proxy::http_proxy_service(
         &server.configuration,
-        Harmost::new(policy, admission),
+        Harmost::new(policy, admission, upstreams),
     );
     service.add_tcp(&listen);
     server.add_service(service);
+
+    if let Some(addr) = &prometheus_listen {
+        let mut metrics = pingora_core::services::listening::Service::prometheus_http_service();
+        metrics.add_tcp(addr);
+        server.add_service(metrics);
+        eprintln!("harmost metrics on {addr}/metrics");
+    }
 
     eprintln!("harmost listening on {listen}");
     eprintln!("  origin concurrency ceiling: {}", concurrency.max);

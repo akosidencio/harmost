@@ -1,5 +1,7 @@
 //! Where a request goes, and whether that backend is worth sending it to.
 
+pub mod health;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -37,6 +39,10 @@ impl UpstreamPool {
 
     pub fn len(&self) -> usize {
         self.backends.len()
+    }
+
+    pub fn backends(&self) -> &[Backend] {
+        &self.backends
     }
 
     pub fn is_empty(&self) -> bool {

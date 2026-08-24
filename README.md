@@ -178,7 +178,9 @@ and request-coalescing integration.
 | Request coalescing | implemented with `pingora-cache` cache locks |
 | Pingora proxy layer | proxy, routing, admission, upstream selection wired |
 | Cache and coalescing wiring | implemented; experimental |
-| Prometheus metrics | not started |
+| Prometheus metrics, JSON access logs | done |
+| Active health checks | done |
+| Graceful reload | not started |
 
 The security- and correctness-sensitive parts—cache-key construction, response
 shareability, and bounded admission—remain isolated as testable logic beneath

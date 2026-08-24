@@ -34,6 +34,8 @@ use crate::cache::{BoundedStore, KeyBuilder};
 use crate::classifier::{FrameworkAdapter, RequestClass, RequestMetadata, nextjs::NextJs};
 use crate::config::schema::RouteCache;
 use crate::policy::PolicySnapshot;
+use crate::telemetry::logging::AccessLog;
+use crate::telemetry::metrics;
 use crate::upstream::UpstreamPool;
 
 /// Per-request state.
@@ -94,11 +96,11 @@ pub struct Harmost {
 }
 
 impl Harmost {
-    pub fn new(policy: Arc<PolicySnapshot>, admission: Arc<AdmissionController>) -> Self {
-        let upstreams = Arc::new(UpstreamPool::new(
-            &policy.config.origin.upstreams,
-            policy.config.origin.load_balancing,
-        ));
+    pub fn new(
+        policy: Arc<PolicySnapshot>,
+        admission: Arc<AdmissionController>,
+        upstreams: Arc<UpstreamPool>,
+    ) -> Self {
         // `Storage` takes `&'static self` throughout, so the store and the
         // lock are created once and leaked deliberately at startup.
         let store = BoundedStore::new(policy.config.cache.max_memory.get() as usize);
@@ -195,6 +197,9 @@ impl ProxyHttp for Harmost {
             .and_then(|r| r.config.coalesce.as_ref())
             .is_some_and(|c| c.override_origin);
 
+        let route_label = ctx.route_id.as_deref().unwrap_or("-");
+        metrics::REQUESTS.with_label_values(&[route_label, ctx.class.as_str()]).inc();
+
         ctx.may_store = self.cache_enabled
             && matches!(
                 evaluate_request(
@@ -206,6 +211,12 @@ impl ProxyHttp for Harmost {
                 ),
                 Disposition::Eligible { .. }
             );
+
+        // The denominator of the origin-work-avoidance ratio, counted only
+        // where reuse was genuinely possible.
+        if ctx.may_store {
+            metrics::REUSE_ELIGIBLE.with_label_values(&[route_label]).inc();
+        }
 
         Ok(false)
     }
@@ -259,14 +270,41 @@ impl ProxyHttp for Harmost {
     /// followers never consume origin capacity.
     async fn proxy_upstream_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
         let route_limiter = ctx.route_id.as_deref().and_then(|id| self.limiter_for(id));
-        match self.admission.admit(ctx.class, route_limiter.as_ref()).await {
+        let route_label = ctx.route_id.as_deref().unwrap_or("-").to_string();
+        let outcome = self.admission.admit(ctx.class, route_limiter.as_ref()).await;
+
+        // Publish limiter state on the way through rather than from a timer:
+        // these are the numbers an operator wants during an incident, and a
+        // sampled gauge would miss the spike that caused it.
+        let global = self.admission.global();
+        metrics::LIMIT.with_label_values(&["global"]).set(global.limit() as i64);
+        metrics::QUEUE_DEPTH.with_label_values(&["global"]).set(global.queue_depth() as i64);
+        metrics::IN_FLIGHT
+            .with_label_values(&["global"])
+            .set((global.limit().saturating_sub(global.available())) as i64);
+        if let Some(l) = &route_limiter {
+            metrics::LIMIT.with_label_values(&[l.name()]).set(l.limit() as i64);
+            metrics::QUEUE_DEPTH.with_label_values(&[l.name()]).set(l.queue_depth() as i64);
+            metrics::IN_FLIGHT
+                .with_label_values(&[l.name()])
+                .set((l.limit().saturating_sub(l.available())) as i64);
+        }
+
+        match outcome {
             Admission::Admitted(permits) => {
                 ctx.permit = Some(permits.into_inner());
+                metrics::ADMISSION.with_label_values(&[&route_label, "admitted"]).inc();
                 Ok(true)
             }
-            Admission::Exempt => Ok(true),
-            Admission::Shed(_reason) => {
+            Admission::Exempt => {
+                metrics::ADMISSION.with_label_values(&[&route_label, "exempt"]).inc();
+                Ok(true)
+            }
+            Admission::Shed(reason) => {
                 ctx.shed = true;
+                metrics::ADMISSION
+                    .with_label_values(&[&route_label, &format!("shed_{}", reason.as_str())])
+                    .inc();
                 self.refuse(session).await?;
                 Ok(false)
             }
@@ -304,7 +342,10 @@ impl ProxyHttp for Harmost {
                 let now = std::time::SystemTime::now();
                 Ok(RespCacheable::Cacheable(CacheMeta::new(now, now, 0, 0, resp.clone())))
             }
-            Shareability::NotShareable(_) => {
+            Shareability::NotShareable(reason) => {
+                metrics::BYPASS_REASON
+                    .with_label_values(&[ctx.route_id.as_deref().unwrap_or("-"), reason.as_str()])
+                    .inc();
                 Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache))
             }
         }
@@ -318,6 +359,9 @@ impl ProxyHttp for Harmost {
             .ok_or_else(|| Error::explain(ErrorType::InternalError, "no upstream configured"))?;
         ctx.upstream = Some(backend.address.clone());
         ctx.origin_started = Some(Instant::now());
+        metrics::ORIGIN_REQUESTS
+            .with_label_values(&[ctx.route_id.as_deref().unwrap_or("-"), &backend.address])
+            .inc();
         Ok(Box::new(HttpPeer::new(backend.address.as_str(), false, String::new())))
     }
 
@@ -334,6 +378,29 @@ impl ProxyHttp for Harmost {
         Ok(())
     }
 
+    fn upstream_response_body_filter(
+        &self,
+        _session: &mut Session,
+        _body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Ctx,
+    ) -> Result<Option<std::time::Duration>> {
+        if end_of_stream {
+            // The permit represents *render* capacity, so it is returned the
+            // moment the origin stops rendering. Holding it until the client
+            // finished reading would let a deliberately slow reader occupy a
+            // slot sized for a 200ms render, which is a cheap way to defeat
+            // the limiter.
+            //
+            // Residual coupling remains: Pingora paces upstream reads against
+            // downstream writes, so a slow client can still stretch how long
+            // the origin takes to drain. `timeouts.downstream_write` is what
+            // bounds that.
+            ctx.permit = None;
+        }
+        Ok(None)
+    }
+
     async fn response_filter(
         &self,
         session: &mut Session,
@@ -341,33 +408,77 @@ impl ProxyHttp for Harmost {
         ctx: &mut Ctx,
     ) -> Result<()> {
         if self.debug_headers {
-            let status = match session.cache.phase() {
-                pingora_cache::CachePhase::Hit => "HIT",
-                pingora_cache::CachePhase::Stale | pingora_cache::CachePhase::StaleUpdating => "STALE",
-                pingora_cache::CachePhase::Miss | pingora_cache::CachePhase::Expired => "MISS",
-                pingora_cache::CachePhase::Bypass => "BYPASS",
-                _ if ctx.permit.is_some() => "MISS",
-                _ => "PASS",
-            };
-            resp.insert_header("X-Harmost", status)?;
+            resp.insert_header("X-Harmost", cache_status(session, ctx).to_ascii_uppercase())?;
         }
         Ok(())
     }
 
     async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Ctx) {
         let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
-        let origin_ms = ctx.origin_started.map(|t| t.elapsed().as_millis()).unwrap_or(0);
+        let route = ctx.route_id.as_deref().unwrap_or("-");
+        let cache = cache_status(session, ctx);
+        metrics::CACHE.with_label_values(&[route, cache]).inc();
+
+        let origin_ms = match ctx.origin_started {
+            Some(started) => {
+                let elapsed = started.elapsed();
+                metrics::ORIGIN_LATENCY
+                    .with_label_values(&[route])
+                    .observe(elapsed.as_secs_f64());
+                elapsed.as_millis()
+            }
+            None => 0,
+        };
+
         log::info!(
-            r#"{{"path":"{}","route":"{}","class":"{}","shed":{},"upstream":"{}","origin_ms":{},"total_ms":{},"status":{}}}"#,
-            session.req_header().uri.path(),
-            ctx.route_id.as_deref().unwrap_or("-"),
-            ctx.class.as_str(),
-            ctx.shed,
-            ctx.upstream.as_deref().unwrap_or("-"),
-            origin_ms,
-            ctx.started.elapsed().as_millis(),
-            status,
+            "{}",
+            AccessLog {
+                method: session.req_header().method.as_str(),
+                // Path only — the query string routinely carries tokens.
+                path: session.req_header().uri.path(),
+                route,
+                class: ctx.class.as_str(),
+                cache,
+                upstream: ctx.upstream.as_deref(),
+                status,
+                shed: ctx.shed,
+                origin_ms,
+                total_ms: ctx.started.elapsed().as_millis(),
+            }
+            .to_json()
         );
-        // The permit drops with ctx, releasing origin capacity.
+
+        // Normally already released at upstream end-of-stream; this covers
+        // the paths that never got there (shed, cache hit, upstream error).
+        // Then republish the gauges: updating them only on the way in leaves
+        // `in_flight` reading stale while the proxy is idle, which is the
+        // moment an operator is most likely to be looking at it.
+        ctx.permit = None;
+        let global = self.admission.global();
+        metrics::IN_FLIGHT
+            .with_label_values(&["global"])
+            .set((global.limit().saturating_sub(global.available())) as i64);
+        metrics::QUEUE_DEPTH.with_label_values(&["global"]).set(global.queue_depth() as i64);
+        if let Some(l) = ctx.route_id.as_deref().and_then(|id| self.limiter_for(id)) {
+            metrics::IN_FLIGHT
+                .with_label_values(&[l.name()])
+                .set((l.limit().saturating_sub(l.available())) as i64);
+            metrics::QUEUE_DEPTH.with_label_values(&[l.name()]).set(l.queue_depth() as i64);
+        }
+    }
+}
+
+
+/// One vocabulary for the cache outcome, shared by the debug header, the
+/// access log and the metrics, so the three can never disagree.
+fn cache_status(session: &Session, ctx: &Ctx) -> &'static str {
+    match session.cache.phase() {
+        pingora_cache::CachePhase::Hit => "hit",
+        pingora_cache::CachePhase::Stale | pingora_cache::CachePhase::StaleUpdating => "stale",
+        pingora_cache::CachePhase::Miss | pingora_cache::CachePhase::Expired => "miss",
+        pingora_cache::CachePhase::Bypass => "bypass",
+        _ if ctx.shed => "shed",
+        _ if ctx.may_store => "miss",
+        _ => "disabled",
     }
 }

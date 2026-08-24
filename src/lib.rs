@@ -21,6 +21,7 @@ pub mod cache;
 pub mod classifier;
 pub mod config;
 pub mod policy;
+pub mod telemetry;
 pub mod proxy;
 pub mod upstream;
 
