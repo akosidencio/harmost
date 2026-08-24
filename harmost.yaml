@@ -42,14 +42,12 @@ timeouts:
   downstream_write: 30s
 
 deployment:
-  id_header: "X-Deployment-ID"
+  id: "build-local"
 
 routes:
   - id: next-static
     match: "/_next/static/**"
     class: static
-    cache:
-      mode: origin
 
   - id: product-pages
     match: "/products/**"

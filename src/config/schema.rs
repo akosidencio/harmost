@@ -316,8 +316,6 @@ pub struct RouteCache {
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
-    pub mode: Option<CacheMode>,
-    #[serde(default)]
     pub ttl: Option<Ttl>,
     #[serde(default)]
     pub stale_while_revalidate: Option<Dur>,
@@ -336,13 +334,6 @@ pub struct RouteCache {
     /// refuses to combine it with a private class or a cookie-bearing route.
     #[serde(default)]
     pub override_origin: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheMode {
-    /// Follow origin headers exactly, with no route ceiling.
-    Origin,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

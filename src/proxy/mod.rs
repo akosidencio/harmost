@@ -335,6 +335,34 @@ impl ProxyHttp for Harmost {
         }
     }
 
+    /// Whether a stale entry may be served.
+    ///
+    /// Pingora only calls this once it has already confirmed the entry is
+    /// inside its stale window, so the window itself comes from `CacheMeta` —
+    /// which is to say from the route's `stale_while_revalidate` /
+    /// `stale_if_error`, falling back to whatever the origin asked for. This
+    /// is purely the policy question of whether to use it.
+    ///
+    /// The default implementation answers `false` when `error` is `None`,
+    /// which is precisely the stale-while-revalidate path — so without this
+    /// override, configuring `stale_while_revalidate` would quietly do
+    /// nothing.
+    fn should_serve_stale(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Ctx,
+        error: Option<&Error>,
+    ) -> bool {
+        match error {
+            // Background revalidation in flight: serve the stale copy now.
+            None => true,
+            // Only an origin failure justifies stale. An error raised by
+            // Harmost itself (a shed, a bad config) is not a reason to hand
+            // out old content.
+            Some(e) => e.esource() == &pingora_core::ErrorSource::Upstream,
+        }
+    }
+
     fn response_cache_filter(
         &self,
         _session: &Session,

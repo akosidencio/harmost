@@ -44,6 +44,7 @@ pub fn validate(cfg: &Config) -> Result<()> {
         ));
     }
 
+    check_unimplemented(cfg)?;
     check_coalesce_wait(cfg)?;
     check_queue(&cfg.origin.concurrency, "origin.concurrency")?;
 
@@ -53,6 +54,36 @@ pub fn validate(cfg: &Config) -> Result<()> {
             return Err(err(format!("duplicate route id `{}`", route.id)));
         }
         check_route(route)?;
+    }
+    Ok(())
+}
+
+/// Reject options that parse but do nothing.
+///
+/// A config key that is accepted and then silently ignored is worse than one
+/// that does not exist: it lets someone ship believing a protection is on. If
+/// these get implemented, delete the corresponding check.
+fn check_unimplemented(cfg: &Config) -> Result<()> {
+    if !cfg.cache.respect_origin {
+        return Err(err(
+            "cache.respect_origin: false is not implemented; origin cache directives are \
+             always honoured except where a route sets cache.override_origin",
+        ));
+    }
+    if cfg.deployment.id_header.is_some() {
+        return Err(err(
+            "deployment.id_header is not implemented — a cache key is built before the \
+             response exists, so the id cannot come from a response header; use \
+             deployment.id instead",
+        ));
+    }
+    if cfg.coalesce.wait_timeout.is_some()
+        && cfg.coalesce.on_timeout != OnCoalesceTimeout::StaleOrShed
+    {
+        return Err(err(
+            "coalesce.on_timeout: requeue is not implemented; waiters are released by the \
+             cache lock and then re-enter admission individually",
+        ));
     }
     Ok(())
 }
@@ -311,6 +342,26 @@ routes:
 "
         ));
         assert!(validate(&cfg).unwrap_err().to_string().contains("no deadline"));
+    }
+
+    #[test]
+    fn rejects_config_that_would_silently_do_nothing() {
+        // Each of these parses happily and has no effect, which is how someone
+        // ships believing a protection is enabled.
+        for (yaml, want) in [
+            ("cache:\n  respect_origin: false\n", "respect_origin"),
+            ("deployment:\n  id_header: \"X-Deployment-ID\"\n", "id_header"),
+        ] {
+            let cfg = parse(&format!("{BASE}{yaml}"));
+            let e = validate(&cfg).unwrap_err().to_string();
+            assert!(e.contains(want), "expected {want} to be rejected, got: {e}");
+            assert!(e.contains("not implemented"), "{e}");
+        }
+    }
+
+    #[test]
+    fn accepts_respect_origin_true_because_that_is_the_behaviour() {
+        validate(&parse(&format!("{BASE}cache:\n  respect_origin: true\n"))).unwrap();
     }
 
     #[test]
