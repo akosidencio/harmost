@@ -1,11 +1,16 @@
-# Harmost
+# Harmost: Rust Reverse Proxy for SSR Origin Protection
 
 **Stop traffic spikes from becoming render spikes.**
 
-A reverse proxy that bounds how much work a server-rendered origin is allowed to
-do. It collapses duplicate concurrent renders, microcaches what is genuinely
-shareable, and — the part that matters most — refuses to let more origin work be
-in flight than the origin can survive.
+Harmost is an open-source Rust reverse proxy and origin workload governor for
+server-rendered applications. It protects Next.js and other SSR origins with
+bounded concurrency, request coalescing, safe microcaching, bounded queues, and
+load shedding.
+
+Unlike a conventional reverse-proxy cache, Harmost limits how much rendering
+work may reach an origin at once. Cache hits and duplicate requests are reused
+first; genuine cache misses enter per-route and global admission control before
+they can consume origin capacity.
 
 Harmost is built on [Pingora](https://github.com/cloudflare/pingora), the Rust
 proxy framework Cloudflare wrote to replace their NGINX fleet and now runs more
@@ -19,7 +24,41 @@ bounded origin admission.
 > A *harmost* (ἁρμοστής, from ἁρμόζω, "to fit, to keep in proper adjustment") was
 > an official posted to hold a system in correct adjustment.
 
-## Why not just put a cache in front of it
+## What Harmost does
+
+- **Protects SSR origins from traffic spikes** with global and per-route
+  concurrency limits.
+- **Collapses duplicate concurrent renders** so identical requests share one
+  in-flight origin response when it is safe to do so.
+- **Microcaches public server-rendered pages** with strict response
+  shareability checks and route-level TTL ceilings.
+- **Bounds overload queues** with explicit queue sizes and deadlines, then
+  serves stale content or sheds load instead of overwhelming the origin.
+- **Understands Next.js request variants**, including React Server Components,
+  prefetch requests, draft mode, Server Actions, and static assets.
+- **Keeps private responses private** by treating `Set-Cookie`, authorization,
+  unsafe `Vary` headers, and private cache directives as absolute barriers.
+- **Balances requests across origins** with round-robin or path-stable hashing.
+
+Typical use cases include protecting Next.js storefronts during product drops,
+absorbing bursts on public SSR pages, and enforcing predictable origin capacity
+for mixed public, private, static, and dynamic routes.
+
+## Contents
+
+- [What Harmost does](#what-harmost-does)
+- [Why use Harmost instead of a standard reverse-proxy cache?](#why-use-harmost-instead-of-a-standard-reverse-proxy-cache)
+- [Request coalescing benchmark](#request-coalescing-benchmark)
+- [Private-response safety check](#private-response-safety-check)
+- [Quick start](#quick-start)
+- [Project status](#project-status)
+- [Design principles](#design-principles)
+- [Request coalescing and microcache architecture](#request-coalescing-and-microcache-architecture)
+- [Next.js caching and cache-key design](#nextjs-caching-and-cache-key-design)
+- [Configuration](#configuration)
+- [License](#license)
+
+## Why use Harmost instead of a standard reverse-proxy cache?
 
 Request collapsing is not new — Varnish, `proxy_cache_lock`, Fastly and Apache
 Traffic Server have all done it for years, and forty lines of `nginx.conf` will
@@ -59,9 +98,73 @@ concurrency does not degrade linearly.
 
 Caching and coalescing are the bonus. Governing is the product.
 
-## Status
+## Request coalescing benchmark
 
-Early. This is the correctness core, not yet a running proxy.
+```
+$ ./bench/coalesce.sh 100 1000
+
+100 concurrent requests for ONE url, 1000ms render
+
+  requests served        100 / 100
+  origin renders         1
+
+  X-Harmost breakdown:
+      99 HIT
+       1 MISS
+```
+
+## Private-response safety check
+
+Same route, same permissive config. This path answers with `Set-Cookie`:
+
+```
+$ ./bench/safety.sh 50
+
+  requests served        50 / 50
+  distinct session ids   50
+
+  X-Harmost breakdown:
+      50 MISS
+
+PASS: every request got its own session; nothing was shared
+```
+
+Fifty renders where a moment ago there was one. That is the design working, not
+failing: shareability is a property of the *response*, and no route
+configuration can override a response that addresses one person.
+
+## Quick start
+
+Harmost requires Rust 1.88 or newer.
+
+```bash
+git clone https://github.com/akosidencio/harmost.git
+cd harmost
+
+# Run the test suite.
+cargo test --workspace
+
+# Validate the example configuration.
+cargo run -- check --config harmost.yaml
+
+# Start the reverse proxy.
+cargo run -- run --config harmost.yaml
+```
+
+The example listens on `0.0.0.0:8080` and forwards requests to the upstreams
+defined in [`harmost.yaml`](./harmost.yaml). Update those upstream addresses
+before sending production traffic.
+
+To reproduce the bounded-concurrency demonstration, run:
+
+```bash
+./bench/demo.sh 60 1000
+```
+
+## Project status
+
+Early-stage. Harmost runs as a Pingora reverse proxy with experimental cache
+and request-coalescing integration.
 
 | Area | State |
 | --- | --- |
@@ -71,26 +174,18 @@ Early. This is the correctness core, not yet a running proxy.
 | Cache key construction | done, tested |
 | Response shareability rules | done, tested |
 | Admission control, queueing, load shedding | done, tested |
-| Cache store | decided: implement Pingora's `Storage` ([spike](./spike/pingora-cache/FINDINGS.md)) |
-| Request coalescing | decided: `pingora-cache`'s cache lock |
+| Cache store | implemented with Pingora `Storage` ([spike](./spike/pingora-cache/FINDINGS.md)) |
+| Request coalescing | implemented with `pingora-cache` cache locks |
 | Pingora proxy layer | proxy, routing, admission, upstream selection wired |
-| Cache and coalescing wiring | not started |
+| Cache and coalescing wiring | implemented; experimental |
 | Prometheus metrics | not started |
 
-```
-cargo test --workspace                  # 85 tests, no network required
-cargo run -- check --config harmost.yaml
-cargo run -- run   --config harmost.yaml
+The security- and correctness-sensitive parts—cache-key construction, response
+shareability, and bounded admission—remain isolated as testable logic beneath
+the Pingora proxy layer. The full workspace test suite runs without network
+access.
 
-./bench/demo.sh                         # the demonstration above
-```
-
-The proxy layer is deliberately absent from the dependency graph for now. The
-three things worth getting right — key construction, shareability, and bounded
-admission — are pure logic, and keeping them free of a proxy runtime keeps the
-test loop instant and leaves the runtime decisions open.
-
-## Design commitments
+## Design principles
 
 **Uncertain means pass through.** If Harmost cannot prove a response is safe to
 share, it does not share it. A higher hit ratio is never worth a wrong response.
@@ -107,7 +202,7 @@ concurrency, bounded queues, load shedding, health-aware balancing and the
 metrics. If the caching half were removed entirely this would still be worth
 running.
 
-### Where the cache and the lock come from
+## Request coalescing and microcache architecture
 
 Harmost implements `pingora-cache`'s `Storage` trait rather than bringing its
 own store, and uses its cache lock for coalescing. The
@@ -122,10 +217,11 @@ origin at once. That is safe — an uncacheable response is never fanned out —
 but it is an unbounded herd, and admission control is what bounds it. The
 governor protects the cache, not the other way around.
 
-### Two decisions that need explaining
+## Next.js caching and cache-key design
 
-**Next.js needs an explicit override to be cacheable at all.** A dynamically
-rendered Next route answers `Cache-Control: private, no-cache, no-store,
+### Explicit caching for dynamic Next.js routes
+
+A dynamically rendered Next.js route answers `Cache-Control: private, no-cache, no-store,
 max-age=0, must-revalidate`. Honouring that unconditionally — which is the
 correct default — means the microcache never engages on precisely the pages
 worth protecting. So a route may declare:
@@ -144,16 +240,22 @@ It is per-route, never global, refuses to combine with a private class, and
 still cannot override the absolute rules. Coalescing has a separate, weaker
 override — collapsing duplicate renders persists nothing and lasts one render.
 
-**The cache key is structural, not hashed.** For an in-process store, hashing
+### Structural, collision-safe cache keys
+
+The cache key is structural rather than hashed. For an in-process store, hashing
 only buys a shorter map key and costs collision safety: two pages that collide
 under a 64-bit hash are one user's document served to another. A short
 fingerprint is derived separately, for logs.
 
 ## Configuration
 
-See [`harmost.yaml`](./harmost.yaml). Unknown keys are a startup error rather
-than a silent no-op, and `harmost check` refuses configurations that are
-syntactically valid but unsafe.
+Harmost uses YAML configuration for upstream servers, route matching, cache
+policy, request coalescing, concurrency limits, queue deadlines, timeouts,
+health checks, and telemetry. See the documented example in
+[`harmost.yaml`](./harmost.yaml).
+
+Unknown keys are a startup error rather than a silent no-op, and `harmost
+check` refuses configurations that are syntactically valid but unsafe.
 
 ## License
 

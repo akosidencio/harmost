@@ -731,6 +731,8 @@ dependencies = [
  "globset",
  "http",
  "log",
+ "parking_lot",
+ "pingora-cache",
  "pingora-core",
  "pingora-error",
  "pingora-http",

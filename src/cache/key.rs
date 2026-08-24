@@ -38,6 +38,34 @@ impl CacheKey {
     pub fn path(&self) -> &str {
         &self.path
     }
+
+    /// Render the key as one canonical string.
+    ///
+    /// Pingora's `CacheKey` takes a string primary and hashes it itself, so
+    /// this is the bridge between our structural key and its storage key.
+    /// Components are separated by a byte that cannot appear in any of them,
+    /// so `host=a.com path=/b` and `host=a.com/b path=` cannot collide.
+    pub fn canonical_string(&self) -> String {
+        let mut out = String::with_capacity(128);
+        for part in [
+            self.scheme.as_str(),
+            self.host.as_str(),
+            self.method.as_str(),
+            self.path.as_str(),
+            self.query.as_str(),
+            self.deployment.as_deref().unwrap_or(""),
+        ] {
+            out.push_str(part);
+            out.push('\u{1f}');
+        }
+        for (name, value) in &self.variant {
+            out.push_str(name);
+            out.push('\u{1e}');
+            out.push_str(value);
+            out.push('\u{1f}');
+        }
+        out
+    }
 }
 
 /// Everything that goes into a key, assembled by the caller from route policy
@@ -271,6 +299,26 @@ mod tests {
     #[test]
     fn no_policy_keeps_every_parameter() {
         assert_eq!(canonical_query("a=1&zz=2", None), "a=1&zz=2");
+    }
+
+    #[test]
+    fn canonical_string_cannot_confuse_component_boundaries() {
+        let c = Ctx::new();
+        // Without a separator that cannot appear in a component, these two
+        // would render to the same string.
+        let a = key("/b", None, &c, &[], None);
+        let mut b = key("", None, &c, &[], None);
+        b.host = "shop.example.com/b".into();
+        assert_ne!(a.canonical_string(), b.canonical_string());
+    }
+
+    #[test]
+    fn canonical_string_matches_key_equality() {
+        let c = Ctx::new();
+        let a = key("/p", Some("a=1&b=2"), &c, &[], None);
+        let b = key("/p", Some("b=2&a=1"), &c, &[], None);
+        assert_eq!(a, b);
+        assert_eq!(a.canonical_string(), b.canonical_string());
     }
 
     #[test]

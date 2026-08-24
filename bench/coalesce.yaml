@@ -1,0 +1,30 @@
+# Coalescing demo. The origin answers `no-store` (as a dynamically rendered
+# Next.js route does), so the route has to say out loud that these responses
+# are shareable before anything can be collapsed or cached.
+version: 1
+server:
+  listen: "127.0.0.1:8080"
+origin:
+  upstreams: ["127.0.0.1:3000"]
+  concurrency:
+    max: 50
+    queue:
+      max: 500
+      timeout: 20s
+cache:
+  enabled: true
+  max_memory: 64MiB
+  max_body_size: 4MiB
+timeouts:
+  origin: 20s
+debug_headers: true
+routes:
+  - id: pages
+    match: "/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 1s
+    coalesce:
+      enabled: true

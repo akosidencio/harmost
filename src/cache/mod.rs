@@ -1,13 +1,13 @@
 //! Cache key construction and response shareability.
 //!
-//! The store itself is deliberately absent. Whether Harmost brings its own
-//! `CacheStore` or implements Pingora's `Storage` trait on top of
-//! `pingora-cache` is an open decision — `pingora-cache` already has a working
-//! cache lock and `Vary` machinery, but its only `Storage` implementation is
-//! documented "for testing only". The two modules here are needed either way.
+//! Harmost implements Pingora's `Storage` trait rather than bringing its own
+//! store, and uses `pingora-cache`'s cache lock for request coalescing. See
+//! `spike/pingora-cache/FINDINGS.md` for how that was decided.
 
 pub mod key;
 pub mod policy;
+pub mod store;
 
 pub use key::{CacheKey, KeyBuilder};
 pub use policy::{BypassReason, Disposition, Shareability};
+pub use store::BoundedStore;

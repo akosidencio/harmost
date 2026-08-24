@@ -49,7 +49,7 @@ async fn main() -> std::io::Result<()> {
 
             let now = stats.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             stats.peak.fetch_max(now, Ordering::SeqCst);
-            stats.total.fetch_add(1, Ordering::SeqCst);
+            let seq = stats.total.fetch_add(1, Ordering::SeqCst) + 1;
 
             if path == "/healthz" {
                 let _ = sock
@@ -61,6 +61,14 @@ async fn main() -> std::io::Result<()> {
 
             tokio::time::sleep(Duration::from_millis(render_ms)).await;
 
+            // /private/* sets a session cookie. Nothing that does this may
+            // ever be shared between requests, no matter what the route
+            // configuration claims.
+            let set_cookie = if path.starts_with("/private") {
+                format!("Set-Cookie: session=user-{seq}; Path=/\r\n")
+            } else {
+                String::new()
+            };
             let body = format!("<html><body>rendered {path}</body></html>");
             let peak = stats.peak.load(Ordering::SeqCst);
             let resp = format!(
@@ -71,6 +79,7 @@ async fn main() -> std::io::Result<()> {
                  X-Origin-Concurrency: {now}\r\n\
                  X-Origin-Peak: {peak}\r\n\
                  X-Origin-Total: {}\r\n\
+                 {set_cookie}\
                  Connection: close\r\n\r\n{body}",
                 body.len(),
                 stats.total.load(Ordering::SeqCst),
