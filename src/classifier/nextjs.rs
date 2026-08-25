@@ -5,8 +5,10 @@
 //!
 //! 1. **RSC is a variant of the same URL.** With `RSC: 1` a route returns a
 //!    flight payload; without it, an HTML document. Same method, same path,
-//!    same query. If those headers are not in the cache key, Harmost will
-//!    eventually hand a flight payload to a browser as a document.
+//!    same query. Next also advertises these selectors in `Vary` on an ordinary
+//!    HTML response, so their present *and absent* values belong in every
+//!    non-static document key. Otherwise the response is either unsafe or
+//!    rejected as carrying an unsupported `Vary`.
 //! 2. **Draft mode must bypass.** `__prerender_bypass` and `__next_preview_data`
 //!    put Next into draft mode, where the response contains unpublished
 //!    content. Storing one and serving it publicly is a content leak.
@@ -19,6 +21,7 @@ pub const RSC_KEY_HEADERS: &[&str] = &[
     "rsc",
     "next-router-prefetch",
     "next-router-state-tree",
+    "next-router-segment-prefetch",
     "next-url",
 ];
 
@@ -38,6 +41,7 @@ impl NextJs {
 
     fn is_prefetch(req: &RequestMetadata<'_>) -> bool {
         req.header("next-router-prefetch").is_some()
+            || req.header("next-router-segment-prefetch").is_some()
     }
 
     fn is_server_action(req: &RequestMetadata<'_>) -> bool {
@@ -99,6 +103,10 @@ impl FrameworkAdapter for NextJs {
 
         RequestHints {
             class: Some(generic::classify(req)),
+            // Next emits `Vary` for these selectors on normal HTML too. Keying
+            // their absence is what keeps an HTML document separate from a
+            // later RSC or prefetch request for the same URL.
+            key_headers: RSC_KEY_HEADERS.to_vec(),
             ..Default::default()
         }
     }
@@ -137,10 +145,10 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_document_request_adds_no_variant_headers() {
+    fn a_plain_document_keys_absent_rsc_variant_headers() {
         let h = HeaderMap::new();
         let hints = NextJs.classify_request(&get("/products/iphone", &h));
-        assert!(hints.key_headers.is_empty());
+        assert_eq!(hints.key_headers, RSC_KEY_HEADERS);
         assert_eq!(hints.class, Some(RequestClass::PublicDocument));
     }
 
@@ -154,6 +162,19 @@ mod tests {
             hints.coalesce_only,
             "state-tree cardinality makes storing these pointless"
         );
+    }
+
+    #[test]
+    fn segment_prefetch_is_also_coalesced_but_never_stored() {
+        let mut h = HeaderMap::new();
+        h.insert("rsc", HeaderValue::from_static("1"));
+        h.insert(
+            "next-router-segment-prefetch",
+            HeaderValue::from_static("/products/[slug]/page"),
+        );
+        let hints = NextJs.classify_request(&get("/products/iphone", &h));
+        assert!(hints.coalesce_only);
+        assert!(hints.key_headers.contains(&"next-router-segment-prefetch"));
     }
 
     #[test]

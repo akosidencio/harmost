@@ -1,0 +1,5 @@
+.git
+target
+fixtures/next-storefront/.next
+fixtures/next-storefront/node_modules
+*.local.yaml

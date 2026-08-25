@@ -38,11 +38,11 @@ production users, no soak testing, no adversarial traffic history, and no
 third-party security review.
 
 Everything described below as a benefit is a **design goal supported by local
-benchmarks**, not an outcome observed under real traffic. The numbers in this
-README are reproducible on a laptop against a test origin that `sleep`s instead
-of rendering — they demonstrate that the mechanisms work, and they say nothing
-about how the system behaves against a real Next.js process, real network
-conditions, or a real attacker.
+tests**, not an outcome observed under real traffic. The focused benchmarks use
+a deterministic origin that `sleep`s instead of rendering; a separate Docker
+scenario runs one Harmost process against three real Next.js standalone
+origins. Together they demonstrate the mechanisms and framework protocol
+handling, but they do not predict production traffic, networks or attackers.
 
 Treat it as a working prototype with a serious test suite. If you deploy it, do
 so behind something you can fail back to, and read
@@ -323,17 +323,23 @@ test origin and proxy, runs load, and tears both down:
 ./bench/safety.sh 50        # a Set-Cookie response is never shared
 ./bench/slowclient.sh       # diagnose slow-reader backpressure and permit lifetime
 ./bench/reload.sh           # SIGHUP reload, including a refused one
+./bench/nextjs.sh           # one Harmost process, three real Next.js origins
 ```
 
-They measure against [`bench/slow-origin`](./bench/slow-origin), a fixture that
-`sleep`s instead of rendering. That is enough to show the mechanisms work and
-not enough to predict behaviour under real traffic — see
-[Project maturity](#project-maturity-and-expectations).
+The focused scripts measure against [`bench/slow-origin`](./bench/slow-origin),
+a fixture that `sleep`s instead of rendering. `nextjs.sh` instead builds the
+standalone App Router application in
+[`fixtures/next-storefront`](./fixtures/next-storefront), starts three
+independently identified origins, and makes machine-checked assertions across
+their combined traffic. Neither setup predicts behaviour under real traffic —
+see [Project maturity](#project-maturity-and-expectations).
 
 ## Installation
 
 Building from source is the only supported route today. Harmost is not on
-crates.io, there are no release binaries, and there is no container image.
+crates.io and there are no release binaries or published container images. The
+repository [`Dockerfile`](./Dockerfile) builds a local Linux image for testing
+and as a base for deployment work.
 
 ```bash
 git clone https://github.com/akosidencio/harmost.git
@@ -364,11 +370,38 @@ roadmap items.
 
 ## Using Harmost with Next.js
 
-> **This example is theoretical.** Harmost has not been run in front of a real
-> Next.js application, and the configuration schema is pre-1.0 and expected to
-> change. Nothing below has been validated against a production deployment —
-> treat it as a worked illustration of the intended shape, not a deployment
-> guide. See [Project maturity](#project-maturity-and-expectations).
+> **This is locally validated, not production validated.** The repository runs
+> one Harmost process against three real Next.js 16 standalone origins and
+> verifies coalescing, origin distribution, HTML/RSC separation, `Set-Cookie`
+> isolation, mutation bypass, Draft Mode isolation and Suspense streaming. The
+> configuration schema remains pre-1.0, and no managed-platform or production
+> deployment has been validated. See
+> [Project maturity](#project-maturity-and-expectations).
+
+### Reproduce the real Next.js proof
+
+Docker Desktop or another Docker Engine with Compose is required:
+
+```bash
+./bench/nextjs.sh
+```
+
+The script builds the repository's Harmost image and one standalone Next.js
+image, then starts this private origin pool:
+
+```text
+localhost:18080 -> Harmost -> next-1:3000
+                            -> next-2:3000
+                            -> next-3:3000
+```
+
+It proves that 24 simultaneous requests for one public SSR URL produce one
+origin render, distinct paths reach all three origins, HTML and canonical RSC
+payloads stay in separate cache entries, 16 private requests receive 16 unique
+sessions, `Next-Action` mutations bypass reuse, Draft Mode cannot contaminate a
+cached public preview, and coalesced clients receive a real Suspense shell
+before the slow region completes. All assertions use Harmost's combined origin
+counters and response contents; the stack is removed on exit.
 
 ### What you install, and where
 
@@ -416,8 +449,8 @@ harmost run --config /etc/harmost/harmost.yaml
 #### Docker Compose
 
 Harmost is the only service publishing a port; `web` is reachable only on the
-internal network. No image or Dockerfile ships with the project yet, so the
-image here is one you build from source yourself.
+internal network. A Dockerfile ships with the project, but no image is
+published, so build and tag it yourself.
 
 ```yaml
 services:
@@ -435,6 +468,29 @@ services:
 ```
 
 with `upstreams: ["web:3000"]`.
+
+The complete local example is [`compose.nextjs.yaml`](./compose.nextjs.yaml).
+
+#### DigitalOcean App Platform
+
+Kubernetes is not required. Put Harmost and Next.js in the same App Platform
+app as two container services:
+
+```text
+App Platform public ingress -> harmost:8080 -> nextjs:3000 (internal only)
+```
+
+Push images built from this repository's [`Dockerfile`](./Dockerfile) and the
+fixture's [standalone Dockerfile](./fixtures/next-storefront/Dockerfile) to
+DOCR, GHCR or Docker Hub. Give only Harmost a public HTTP port and route; give
+Next.js only internal port `3000`, make both bind `0.0.0.0`, and set Harmost's
+upstream to `nextjs:3000`. Bake or securely generate `harmost.yaml` in the
+Harmost image because App Platform does not provide Kubernetes ConfigMaps.
+
+Start with one fixed Harmost instance so cache, coalescing and admission state
+have one owner. This topology is the intended first managed-platform staging
+test after the local release gates pass; it has not been run on DigitalOcean
+yet.
 
 #### Kubernetes
 
@@ -568,8 +624,10 @@ policy still decide whether reuse is ultimately allowed:
 
 - **React Server Components.** The same URL returns HTML or an RSC flight
   payload depending on the `RSC` header, so `RSC`, `Next-Router-Prefetch`,
-  `Next-Router-State-Tree` and `Next-Url` are part of the cache key. Without
-  that, a flight payload eventually gets served to a browser as a document.
+  `Next-Router-State-Tree`, `Next-Router-Segment-Prefetch` and `Next-Url` are
+  part of every non-static document key, including when absent. Without that,
+  a flight payload can eventually be served to a browser as a document; Next
+  also names these selectors in `Vary` on ordinary HTML responses.
 - **Prefetch requests** are marked coalesce-only and never stored. They are
   collapsed only when the route and response policy permit sharing; the router
   state tree makes persistent storage too high-cardinality.
@@ -637,12 +695,13 @@ not completed production hardening or operational validation.
 | Active health checks | done |
 | Graceful reload (SIGHUP) | done |
 | Stale-while-revalidate, stale-if-error | done |
+| Real Next.js standalone fixture | done; local Docker integration tested |
 | Circuit breaking, least-loaded balancing | not started ([roadmap](#roadmap)) |
 | Cache purge API, OpenTelemetry | not started ([roadmap](#roadmap)) |
 
 The security- and correctness-sensitive parts — cache-key construction, response
 shareability, and bounded admission — remain isolated as testable logic beneath
-the Pingora proxy layer. The full workspace test suite (133 tests) runs without
+the Pingora proxy layer. The full workspace test suite (134 tests) runs without
 external network services.
 
 "done, tested" means unit-tested and, where a `bench/` script exists, verified
@@ -663,8 +722,11 @@ evidence and safety work before them.
 - Replace broad process-killing benchmark cleanup with exact PID tracking,
   dynamic ports and machine-checked assertions. Fix the streaming origin-count
   and reload-success reporters.
-- Add a real Next.js fixture covering the App Router, Pages Router, RSC,
-  prefetch, Server Actions, Draft Mode, streaming and `Set-Cookie` responses.
+- Extend the real App Router fixture and its HTTP assertions with Pages Router
+  coverage and browser-driven checks for prefetch and real Server Action form
+  submissions. Public SSR, RSC separation, mutation classification, Draft
+  Mode, Suspense streaming and `Set-Cookie` isolation are already exercised
+  locally.
 - Run unit and integration tests in CI on Linux, with a smaller macOS build
   matrix; publish benchmark parameters with results rather than treating one
   laptop run as a baseline.

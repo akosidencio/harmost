@@ -1,0 +1,22 @@
+{
+  "name": "harmost-next-storefront-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "node .next/standalone/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "16.3.3",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.5",
+    "@types/react": "19.2.4",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.9.2"
+  }
+}

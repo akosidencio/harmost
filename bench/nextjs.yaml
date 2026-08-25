@@ -1,0 +1,171 @@
+# Real Next.js integration fixture: one Harmost process governing three
+# independently identifiable standalone origins.
+version: 1
+
+server:
+  listen: "0.0.0.0:8080"
+
+origin:
+  upstreams:
+    - "next-1:3000"
+    - "next-2:3000"
+    - "next-3:3000"
+  load_balancing: hash_by_path
+  concurrency:
+    max: 8
+    queue:
+      max: 100
+      timeout: 5s
+
+health:
+  path: "/healthz"
+  interval: 2s
+  timeout: 1s
+  healthy_after: 1
+  unhealthy_after: 1
+
+cache:
+  enabled: true
+  store: memory
+  max_memory: 64MiB
+  max_body_size: 4MiB
+
+coalesce:
+  enabled: true
+  on_timeout: stale_or_shed
+
+timeouts:
+  connect: 1s
+  first_byte: 5s
+  idle: 30s
+  origin: 15s
+  downstream_write: 15s
+
+deployment:
+  id: "next-fixture-v1"
+
+debug_headers: true
+
+routes:
+  - id: next-static
+    match: "/_next/static/**"
+    class: static
+
+  - id: health
+    match: "/healthz"
+    class: private_dynamic
+    cache:
+      enabled: false
+
+  - id: products
+    match: "/products/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 2s
+    coalesce:
+      enabled: true
+    concurrency:
+      max: 4
+      queue:
+        max: 50
+        timeout: 5s
+
+  - id: search
+    match: "/search"
+    class: public_dynamic
+    cache:
+      override_origin: true
+      ttl:
+        max: 1s
+      query:
+        mode: include
+        keys: ["q", "page"]
+    coalesce:
+      enabled: true
+    concurrency:
+      max: 3
+      queue:
+        max: 30
+        timeout: 5s
+
+  - id: flash-sale
+    match: "/flash-sale"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 1s
+      query:
+        mode: include
+        keys: ["run"]
+    coalesce:
+      enabled: true
+    concurrency:
+      max: 2
+      queue:
+        max: 30
+        timeout: 5s
+
+  # Deliberately permissive: Next.js Draft Mode cookies must still force a
+  # bypass before this route policy can share unpublished content.
+  - id: preview
+    match: "/preview"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 2s
+    coalesce:
+      enabled: true
+
+  - id: private-session
+    match: "/api/private-session"
+    class: private_dynamic
+    cache:
+      enabled: false
+    coalesce:
+      enabled: false
+
+  # Deliberately permissive: a Next-Action header must force a mutation bypass
+  # before this policy can cache or collapse the response.
+  - id: action-probe
+    match:
+      path: "/api/action-probe"
+      methods: ["POST"]
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 2s
+    coalesce:
+      enabled: true
+
+  - id: private-routes
+    match:
+      path: "/{account,cart,api/**}"
+    class: private_dynamic
+    cache:
+      enabled: false
+    coalesce:
+      enabled: false
+    concurrency:
+      max: 4
+      queue:
+        max: 30
+        timeout: 5s
+
+  - id: private-default
+    match: "/**"
+    class: private_dynamic
+    cache:
+      enabled: false
+    coalesce:
+      enabled: false
+
+telemetry:
+  prometheus:
+    listen: "0.0.0.0:9090"
+  logging:
+    format: json

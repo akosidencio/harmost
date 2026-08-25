@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480" role="img" aria-labelledby="title description">
+  <title id="title">Abstract running shoe</title>
+  <desc id="description">Orange and green geometric shapes suggesting a running shoe.</desc>
+  <rect width="640" height="480" rx="40" fill="#dce9df"/>
+  <path d="M91 291c77-9 130-45 158-109l63 82 132 42c54 17 88 52 104 104H112c-37 0-61-20-61-51 0-33 14-58 40-68Z" fill="#e86338"/>
+  <path d="m249 182 63 82 65 21-25 39-132-17-63-72c35-15 65-33 92-53Z" fill="#173c31"/>
+  <path d="M75 370h466" stroke="#173c31" stroke-width="25" stroke-linecap="round"/>
+  <path d="m223 252 77 11m-49-43 79 18" stroke="#f8f4e8" stroke-width="12" stroke-linecap="round"/>
+</svg>
