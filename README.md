@@ -1,3 +1,5 @@
+![Harmost — Stop traffic spikes from becoming render spikes.](./assets/harmost-banner.png)
+
 # Harmost: Rust reverse proxy that protects Next.js and SSR origins with bounded concurrency, request coalescing, and safe microcaching. Built on Pingora
 
 **Stop traffic spikes from becoming render spikes.**
