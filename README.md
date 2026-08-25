@@ -164,6 +164,18 @@ for mixed public, private, static, and dynamic routes.
 > substitute. A load balancer, ingress, CDN or conventional web server can
 > remain in front of it for those responsibilities.
 
+For production today, plan to run an edge component in front of Harmost:
+
+```text
+Client -> NGINX / CDN / load balancer / ingress -> Harmost -> Next.js
+```
+
+If you already use NGINX, keep it for TLS termination and general edge duties;
+Harmost adds SSR caching, request coalescing and bounded origin admission behind
+it. NGINX is not mandatory specifically—a CDN, cloud load balancer or Kubernetes
+ingress can fill that role. For local development or a trusted private network
+using cleartext HTTP, clients can connect directly to Harmost.
+
 ## How Harmost works
 
 ![Animated diagram showing how Harmost classifies requests, reuses cached or in-flight responses, bounds cache misses, and protects the SSR origin](./assets/harmost-flow.svg)
