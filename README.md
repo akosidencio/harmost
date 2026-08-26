@@ -338,10 +338,18 @@ see [Project maturity](#project-maturity-and-expectations).
 
 ## Installation
 
-Building from source is the only supported route today. Harmost is not on
-crates.io and there are no release binaries or published container images. The
-repository [`Dockerfile`](./Dockerfile) builds a local Linux image for testing
-and as a base for deployment work.
+Harmost is not on crates.io and there are no standalone release binaries.
+
+Tagged releases publish a `linux/amd64` container image to GitHub Packages at
+`ghcr.io/akosidencio/harmost`, built from the repository
+[`Dockerfile`](./Dockerfile). The same Dockerfile builds a local image for
+testing and as a base for deployment work.
+
+```bash
+docker pull ghcr.io/akosidencio/harmost:<version>
+```
+
+To build from source:
 
 ```bash
 git clone https://github.com/akosidencio/harmost.git
@@ -451,13 +459,14 @@ harmost run --config /etc/harmost/harmost.yaml
 #### Docker Compose
 
 Harmost is the only service publishing a port; `web` is reachable only on the
-internal network. A Dockerfile ships with the project, but no image is
-published, so build and tag it yourself.
+internal network. Released images live at `ghcr.io/akosidencio/harmost`; the
+shipped [`Dockerfile`](./Dockerfile) builds the same image locally if you would
+rather tag it yourself.
 
 ```yaml
 services:
   harmost:
-    image: harmost:local          # built from source; nothing is published
+    image: ghcr.io/akosidencio/harmost:0.1.0   # or a locally built harmost:local
     ports: ["8080:8080"]
     volumes:
       - ./harmost.yaml:/etc/harmost/harmost.yaml:ro
@@ -482,11 +491,12 @@ app as two container services:
 App Platform public ingress -> harmost:8080 -> nextjs:3000 (internal only)
 ```
 
-Push images built from this repository's [`Dockerfile`](./Dockerfile) and the
-fixture's [standalone Dockerfile](./fixtures/next-storefront/Dockerfile) to
-DOCR, GHCR or Docker Hub. Give only Harmost a public HTTP port and route; give
-Next.js only internal port `3000`, make both bind `0.0.0.0`, and set Harmost's
-upstream to `nextjs:3000`. Bake or securely generate `harmost.yaml` in the
+Pull Harmost from `ghcr.io/akosidencio/harmost` (or build this repository's
+[`Dockerfile`](./Dockerfile) yourself) and push your own application image —
+the fixture's [standalone Dockerfile](./fixtures/next-storefront/Dockerfile) is
+a worked example — to DOCR, GHCR or Docker Hub. Give only Harmost a public
+HTTP port and route; give Next.js only internal port `3000`, make both bind
+`0.0.0.0`, and set Harmost's upstream to `nextjs:3000`. Bake or securely generate `harmost.yaml` in the
 Harmost image because App Platform does not provide Kubernetes ConfigMaps.
 
 Start with one fixed Harmost instance so cache, coalescing and admission state
