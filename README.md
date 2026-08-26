@@ -1,8 +1,12 @@
 ![Harmost — Stop traffic spikes from becoming render spikes.](./assets/harmost-banner.png)
 
-# Harmost: Rust reverse proxy that protects Next.js and SSR origins with bounded concurrency, request coalescing, and safe microcaching. Built on Pingora
+# Harmost
 
 **Stop traffic spikes from becoming render spikes.**
+
+Rust reverse proxy and origin workload governor for Next.js and other SSR
+origins: bounded render concurrency, request coalescing, safe microcaching,
+bounded queues and load shedding. Built on Pingora.
 
 > [!WARNING]
 > **Harmost is under active development and is not ready for production.** It
@@ -10,15 +14,20 @@
 > configuration, behavior, and operational guarantees may change without
 > notice. Use it only in development or controlled test environments.
 
-Harmost is an open-source Rust reverse proxy and origin workload governor for
-server-rendered applications. It protects Next.js and other SSR origins with
-bounded concurrency, request coalescing, safe microcaching, bounded queues, and
-load shedding.
+**Every conventional defense counts requests. Server rendering made requests
+stop being a unit of work.** One route is a cached shell; the next fans out
+into a React render, a database round trip, a CMS call and a pricing service.
+Rate limiting, connection limits and autoscaling triggers all count requests,
+so none of them can tell those two apart.
 
-Unlike a conventional reverse-proxy cache, Harmost limits how much rendering
-work may reach an origin at once. Cache hits and duplicate requests are reused
-first; genuine cache misses enter per-route and global admission control before
-they can consume origin capacity.
+Harmost counts the work instead. It is an open-source Rust reverse proxy that
+bounds how much *rendering* may reach an origin at once, rather than how many
+requests arrive. The ordering is the point: cache hits and duplicate requests
+are reused **first**, and only genuine cache misses enter per-route and global
+admission control, so reuse never spends origin capacity. Whatever the origin
+still cannot absorb meets a bounded queue, a deadline, and a defined answer —
+stale content or a shed request — instead of an unbounded pile of concurrent
+renders.
 
 Harmost is built on [Pingora](https://github.com/cloudflare/pingora), the Rust
 proxy framework Cloudflare wrote to replace its NGINX fleet. Cloudflare reports
@@ -83,6 +92,12 @@ fan out into React rendering, a database round trip, a CMS call, a pricing
 service and a recommendations service. Ten thousand requests can become ten
 thousand of each.
 
+React Server Components sharpen this. The same URL returns a full HTML render
+or an RSC flight payload depending on a request header, and a prefetch costs
+something different again — so the cost of a request is not merely high, it is
+invisible from the URL. Anything counting requests is counting a unit that no
+longer means anything.
+
 That matters because SSR origins fail non-linearly. A Node process serving a
 200 ms render comfortably at 50 concurrent requests does not serve 500 concurrent
 requests ten times slower — it starts queueing inside the event loop, latency
@@ -111,6 +126,21 @@ Request collapsing is old news — Varnish, `proxy_cache_lock`, Fastly and Apach
 Traffic Server have done it for years. Harmost's argument is the other half:
 duplicate work is reused *first*, and whatever genuinely has to reach the origin
 then passes through admission control that can say no.
+
+### Scope: Next.js today, framework-agnostic by design
+
+Harmost's policy contract — routes, work classes, cache keys, shareability
+rules — does not assume a framework. Next.js is the first and only supported
+adapter because that is where the traffic is, not because the design depends on
+it. The Next-specific surface is request classification: the `RSC`,
+`Next-Router-Prefetch` and `Next-Action` headers, draft mode, and `/_next/*`
+assets. Nothing beneath that layer knows which framework produced the response.
+
+Any origin whose responses are expensive to produce has the same shape, so
+other React Server Components frameworks — and non-JavaScript SSR origins — are
+plausible targets. **None are supported today.** Additional adapters land only
+once the generic contract is stable enough that adding one cannot bend it; see
+[Roadmap](#roadmap) phase 4.
 
 ## Intended benefits
 
