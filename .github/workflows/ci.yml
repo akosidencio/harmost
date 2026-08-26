@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, staging]
+    branches: [main, dev]
   pull_request:
-    branches: [main, staging]
+    branches: [main, dev]
   # Reused as the release gate so a tag cannot publish untested code.
   workflow_call:
 
