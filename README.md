@@ -65,6 +65,7 @@ so behind something you can fail back to, and read
 - [Project maturity and expectations](#project-maturity-and-expectations)
 - [The problem](#the-problem)
 - [Why Harmost exists](#why-harmost-exists)
+- [Is Harmost for you?](#is-harmost-for-you)
 - [Intended benefits](#intended-benefits)
 - [What Harmost does](#what-harmost-does)
 - [How Harmost works](#how-harmost-works)
@@ -141,6 +142,73 @@ other React Server Components frameworks — and non-JavaScript SSR origins — 
 plausible targets. **None are supported today.** Additional adapters land only
 once the generic contract is stable enough that adding one cannot bend it; see
 [Roadmap](#roadmap) phase 4.
+
+## Is Harmost for you?
+
+The question is not whether you have high traffic. It is whether your peak
+concurrency can exceed your origin's render capacity, and what happens when it
+does. Small origins have very little capacity, so the answer is often yes at
+traffic volumes that sound unremarkable.
+
+Concurrency is arrival rate multiplied by render time. A Node process handles
+roughly 50 concurrent renders before its event loop begins queueing, so two
+pods give you on the order of 100. With a 500 ms render you reach that at about
+200 requests per second — and the requests that get you there are frequently
+not the ones you planned for:
+
+- **A visitor is not a request.** The App Router prefetches on hover and on
+  viewport entry, so one person browsing produces several origin requests.
+  What each costs depends on the route, but none of them appear in a page-view
+  count.
+- **Crawlers and scrapers do not care how popular you are.** An automated
+  client walking thousands of distinct URLs produces sustained concurrency
+  against your origin regardless of your organic traffic. Every URL is unique,
+  so every one is a cache miss and none of them can be collapsed. This is the
+  case where caching and coalescing offer nothing at all and bounded admission
+  is the only mechanism that applies.
+- **Small sites have spikier traffic than large ones.** A large site's load is
+  comparatively smooth. A small site's load is a launch, a drop, a newsletter
+  or a link from somewhere busy — a step change, not a curve.
+
+There is a second reason unrelated to outages. Without admission control, the
+only way to survive a peak is to provision for it: run enough pods for the
+worst thirty seconds and pay for them the rest of the day. Bounding origin work
+is what makes running fewer pods a considered decision rather than a gamble.
+
+### Harmost is likely to help if
+
+- You self-host a server-rendered application on infrastructure you own or
+  operate, and a slow or failing origin is your problem to fix.
+- A meaningful share of your traffic is dynamic, personalized or otherwise
+  uncacheable, so a conventional cache skips it.
+- Your traffic is bursty, automated, or both, and your headroom is a small
+  multiple of your steady-state load rather than a large one.
+- An origin overload costs you something — revenue, a launch, an on-call night.
+
+### Harmost is unlikely to help if
+
+- **Your site is static or fully pre-rendered.** There is no render cost to
+  govern; a CDN is the entire answer.
+- **You run on Vercel, Netlify or Cloudflare.** You do not own the origin, the
+  platform already collapses duplicate requests and scales the render tier for
+  you, and Harmost has nowhere useful to sit.
+- **Your origin is already mostly cacheable.** If ISR or a plain CDN absorbs
+  your traffic, a governor is protecting capacity that was never under threat.
+- **A spike-induced outage costs you nothing.** A personal site does not need
+  an additional hop, an additional configuration and an additional failure
+  mode.
+
+The cost side deserves the same scrutiny. Harmost is another process in your
+request path, another configuration to maintain and another failure mode to
+understand, and today it is
+[unproven software](#project-maturity-and-expectations). For a small
+deployment, adding a pod or putting a CDN in front is sometimes simply the
+better trade.
+
+If you want to know where you stand before installing anything, the useful
+measurements are your origin's **peak concurrent in-flight requests** and your
+**render latency** — not requests per day. Their product against your pod count
+is the number Harmost exists to bound.
 
 ## Intended benefits
 

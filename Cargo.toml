@@ -29,8 +29,14 @@ async-trait = "0.1"
 bytes = "1"
 log = "0.4"
 
+[features]
+# Exposes the internal parsers the fuzz targets drive. Not part of the public
+# API: enabling it outside `fuzz/` has no purpose.
+fuzzing = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "test-util"] }
+proptest = "1"
 
 [profile.release]
 lto = "thin"

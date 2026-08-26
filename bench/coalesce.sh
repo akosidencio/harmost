@@ -1,37 +1,56 @@
 #!/usr/bin/env bash
 # N concurrent requests for the SAME url. The origin counts how many renders it
 # was actually asked to perform.
-set -uo pipefail
-set +m
-cd "$(dirname "$0")/.."
+BENCH_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$BENCH_ROOT/bench/lib.sh"
+
 CONCURRENCY=${1:-100}
 RENDER_MS=${2:-1000}
 
-cargo build --workspace -q || exit 1
-cleanup() { pkill -9 -f 'target/debug/slow-origin' 2>/dev/null; pkill -9 -f 'target/debug/harmost run' 2>/dev/null; }
-trap cleanup EXIT
-cleanup; sleep 1
+bench_init coalescing
+bench_param concurrency "$CONCURRENCY"
+bench_param render_ms "$RENDER_MS"
+bench_build
 
-./target/debug/slow-origin 3000 "$RENDER_MS" >/dev/null 2>&1 & disown
-sleep 1
-./target/debug/harmost run --config bench/coalesce.yaml >/tmp/harmost.log 2>&1 & disown
-sleep 2
+ORIGIN_PORT=$(bench_free_port)
+LISTEN_PORT=$(bench_free_port)
+METRICS_PORT=$(bench_free_port)
+CONFIG="$BENCH_DIR/coalesce.yaml"
+bench_render_config "$BENCH_ROOT/bench/coalesce.yaml" "$CONFIG" \
+  "LISTEN=$LISTEN_PORT" "ORIGIN=$ORIGIN_PORT" "METRICS=$METRICS_PORT"
+
+bench_spawn origin "$(bench_bin slow-origin)" "$ORIGIN_PORT" "$RENDER_MS"
+bench_wait_port 127.0.0.1 "$ORIGIN_PORT" "slow-origin"
+bench_start_harmost harmost "$CONFIG" "$LISTEN_PORT" "$METRICS_PORT"
+bench_origin_reset "$ORIGIN_PORT"
 
 echo "$CONCURRENCY concurrent requests for ONE url, ${RENDER_MS}ms render"
 echo
 OUT=$(seq 1 "$CONCURRENCY" | xargs -P "$CONCURRENCY" -I{} \
-  curl -s -o /dev/null -D - --max-time 30 "http://127.0.0.1:8080/product/iphone" 2>/dev/null)
+  curl -s -o /dev/null -D - --max-time 30 \
+  "http://127.0.0.1:$LISTEN_PORT/product/iphone" 2>/dev/null)
 
-RENDERS=$(echo "$OUT" | grep -i '^x-origin-total:' | tr -dc '0-9\n' | sort -n | tail -1)
+# Counted by the origin, not scraped from a response header: a coalesced
+# response carries the *leader's* headers, so header-derived counts measure
+# what was replayed rather than what was rendered.
+RENDERS=$(bench_origin_stat "$ORIGIN_PORT" total)
 STATUSES=$(echo "$OUT" | grep -ci '^HTTP/1.1 200')
+
 echo "  requests served        $STATUSES / $CONCURRENCY"
 echo "  origin renders         ${RENDERS:-?}"
 echo
 echo "  X-Harmost breakdown:"
 echo "$OUT" | grep -i '^x-harmost:' | tr -d '\r' | awk '{print "    " $2}' | sort | uniq -c
 echo
-if [ -n "$RENDERS" ] && [ "$RENDERS" -le 2 ] && [ "$STATUSES" -eq "$CONCURRENCY" ]; then
-  echo "PASS: $CONCURRENCY requests collapsed onto ${RENDERS} origin render(s)"
-else
-  echo "FAIL: served=$STATUSES renders=${RENDERS:-?}"; exit 1
-fi
+bench_print_params
+echo
+
+bench_result served "$STATUSES"
+bench_result origin_renders "$RENDERS"
+
+bench_assert_eq "$STATUSES" "$CONCURRENCY" "requests served"
+# Two renders, not one: the leader can finish and its entry expire while the
+# tail of the burst is still arriving. Three would mean collapsing failed.
+bench_assert_le "$RENDERS" 2 "origin renders"
+bench_assert_gt "$RENDERS" 0 "origin renders (nothing reached the origin at all)"
+bench_pass "$CONCURRENCY requests collapsed onto $RENDERS origin render(s)"

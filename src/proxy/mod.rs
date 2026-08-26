@@ -561,12 +561,18 @@ impl ProxyHttp for Harmost {
             if ctx.permit.is_some() {
                 ctx.permit_released_at = Some("body_end");
             }
-            // The permit represents *render* capacity, so it is returned the
-            // moment the origin stops rendering. Holding it until the client
-            // finished reading would let a deliberately slow reader occupy a
-            // slot sized for a 200ms render, which is a cheap way to defeat
-            // the limiter.
+            // The permit represents *render* capacity, and this is the
+            // earliest point at which the origin is known to have stopped
+            // rendering. It is not necessarily the moment it did: pingora
+            // paces upstream reads against downstream writes, so a slow reader
+            // delays when `end_of_stream` is observed. That gap is bounded by
+            // `timeouts.downstream_write` and closed properly only by a
+            // bounded response spool (roadmap phase 1).
             //
+            // Releasing earlier on the strength of a `Content-Length` was
+            // tried and reverted: a length describes the body's size, never
+            // that the origin has finished producing it. See
+            // `bench/slowclient.sh`.
             ctx.permit = None;
         }
         Ok(None)

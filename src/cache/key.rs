@@ -1,11 +1,12 @@
 //! Cache key construction.
 //!
-//! The key is *structural*, not hashed. The spec sketched `hash(host + path +
-//! ...)`, which a disk or distributed store would need — but for an in-process
-//! store, hashing only buys a shorter map key and costs collision safety. Two
-//! distinct pages that collide under a 64-bit hash are one user's document
-//! served to another; with structural equality that failure cannot happen at
-//! all. A short fingerprint is derived separately, for logs only.
+//! The key is built *structurally*: a struct of components with derived `Eq`
+//! and `Hash`, so two distinct pages cannot become one by colliding under a
+//! short hash. That guarantee ends at the boundary with `pingora-cache`, which
+//! takes a string primary and blake2-hashes it itself — so
+//! [`CacheKey::canonical_string`] is where the structural key has to be
+//! rendered without losing the distinctions it was built to keep. A separate
+//! short fingerprint is derived for logs only, and is never used for lookup.
 
 use crate::classifier::RequestMetadata;
 use crate::config::schema::{QueryMode, QueryPolicy};
@@ -42,11 +43,27 @@ impl CacheKey {
     /// Render the key as one canonical string.
     ///
     /// Pingora's `CacheKey` takes a string primary and hashes it itself, so
-    /// this is the bridge between our structural key and its storage key.
-    /// Components are separated by a byte that cannot appear in any of them,
-    /// so `host=a.com path=/b` and `host=a.com/b path=` cannot collide.
+    /// this is the bridge between our structural key and its storage key. Two
+    /// distinct structural keys rendering to one string is a cross-user
+    /// response leak, so the encoding has to be injective — `host=a.com
+    /// path=/b` and `host=a.com/b path=` must not collide.
+    ///
+    /// Each component is therefore length-prefixed, not merely separated. A
+    /// separator alone is injective only while no component can contain that
+    /// separator byte, which is true today (`http` rejects control characters
+    /// in URIs and header values) but is a property of a dependency rather
+    /// than of this function. A length prefix makes injectivity hold for any
+    /// input at all, which is what the property test asserts.
     pub fn canonical_string(&self) -> String {
-        let mut out = String::with_capacity(128);
+        let mut out = String::with_capacity(160);
+        let mut push = |part: &str| {
+            // The separators are kept as well: they cost nothing and keep a
+            // fingerprinted key readable when one turns up in a log.
+            out.push_str(&part.len().to_string());
+            out.push('\u{1e}');
+            out.push_str(part);
+            out.push('\u{1f}');
+        };
         for part in [
             self.scheme.as_str(),
             self.host.as_str(),
@@ -55,14 +72,15 @@ impl CacheKey {
             self.query.as_str(),
             self.deployment.as_deref().unwrap_or(""),
         ] {
-            out.push_str(part);
-            out.push('\u{1f}');
+            push(part);
         }
+        // The variant count is part of the encoding too: without it, one key
+        // with variants [a] and another with [a, b] where b renders empty
+        // could otherwise agree.
+        push(&self.variant.len().to_string());
         for (name, value) in &self.variant {
-            out.push_str(name);
-            out.push('\u{1e}');
-            out.push_str(value);
-            out.push('\u{1f}');
+            push(name);
+            push(value);
         }
         out
     }
@@ -424,5 +442,336 @@ mod tests {
         let b = key("/b", None, &c, &[], None);
         assert_eq!(a.fingerprint(), a.clone().fingerprint());
         assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+}
+
+/// Property tests for the parts of keying where a counterexample is a security
+/// bug rather than a wrong number.
+///
+/// The hand-written tests above pin the behaviours somebody thought to check.
+/// These assert the invariants that must hold for *every* input, including the
+/// malformed HTTP metadata a caller can put on the wire — a header value with
+/// the encoding's own separator bytes in it, a query string that is nothing but
+/// `&`, a path of control characters.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::config::schema::{QueryMode, QueryPolicy};
+    use http::{HeaderMap, HeaderName, HeaderValue, Method};
+    use proptest::prelude::*;
+
+    /// Component text drawn deliberately wider than HTTP permits: control
+    /// characters, the encoding's own separators, `&` and `=`. Injectivity of
+    /// the canonical encoding must not depend on `http`'s validation.
+    fn component() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                60 => prop::char::range('!', '~'),
+                10 => Just('\u{1f}'),
+                10 => Just('\u{1e}'),
+                10 => Just('&'),
+                10 => Just('='),
+            ],
+            0..12,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    /// Text guaranteed to contain none of the encoding's own bytes, so a
+    /// constructed collision is unambiguous about where the boundary moved.
+    fn safe() -> impl Strategy<Value = String> {
+        prop::string::string_regex("[a-z0-9]{0,6}").unwrap()
+    }
+
+    fn key_from(
+        scheme: &str,
+        host: &str,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+        headers: &HeaderMap,
+        variant: &[String],
+        deployment: Option<&str>,
+    ) -> CacheKey {
+        KeyBuilder {
+            scheme,
+            query_policy: None,
+            variant_headers: variant,
+            deployment,
+        }
+        .build(&RequestMetadata {
+            method,
+            host,
+            path,
+            query,
+            headers,
+        })
+    }
+
+    fn plain(scheme: &str, host: &str, path: &str, query: Option<&str>) -> CacheKey {
+        key_from(
+            scheme,
+            host,
+            &Method::GET,
+            path,
+            query,
+            &HeaderMap::new(),
+            &[],
+            None,
+        )
+    }
+
+    /// Assemble a key from raw components, bypassing `KeyBuilder`.
+    ///
+    /// The encoding has to be injective on its own terms. Driving it only
+    /// through `KeyBuilder` cannot demonstrate that: `http` rejects control
+    /// characters in header values, so a separator byte never reaches the
+    /// encoder by that route, and the property passes whether or not the
+    /// encoding is actually injective. Constructing the struct directly tests
+    /// the function rather than the validation upstream of it.
+    fn raw_key(parts: &[String], variant: &[(String, String)]) -> CacheKey {
+        CacheKey {
+            scheme: parts[0].clone(),
+            host: parts[1].clone(),
+            method: parts[2].clone(),
+            path: parts[3].clone(),
+            query: parts[4].clone(),
+            variant: variant.to_vec(),
+            deployment: Some(parts[5].clone()),
+        }
+    }
+
+    fn parts() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(component(), 6..=6)
+    }
+
+    fn variants() -> impl Strategy<Value = Vec<(String, String)>> {
+        prop::collection::vec((component(), component()), 0..4)
+    }
+
+    proptest! {
+        /// The invariant everything else rests on. `pingora-cache` hashes the
+        /// canonical string, so two keys that are structurally different but
+        /// render identically are one visitor's page stored under another
+        /// visitor's key.
+        ///
+        /// The generator emits the encoding's own separator bytes, `&` and `=`
+        /// far more often than chance would, because the collisions worth
+        /// finding are the ones where a component smuggles a boundary.
+        #[test]
+        fn canonical_string_is_injective(
+            left_parts in parts(), left_variant in variants(),
+            right_parts in parts(), right_variant in variants(),
+        ) {
+            let a = raw_key(&left_parts, &left_variant);
+            let b = raw_key(&right_parts, &right_variant);
+            prop_assert_eq!(a == b, a.canonical_string() == b.canonical_string());
+        }
+
+        /// Boundary shifting, constructed rather than searched for.
+        ///
+        /// Random generation will not find this: it needs one key's components
+        /// to be the *same text as another's* with the boundary moved, and
+        /// two independent draws never agree that way. Building the pair by
+        /// hand is what gives the property teeth — with a separator-only
+        /// encoding, `host = "x\u{1f}y", method = "z"` and `host = "x",
+        /// method = "y\u{1f}z"` render to the same string and share a cache
+        /// entry.
+        #[test]
+        fn a_separator_in_a_component_cannot_shift_a_boundary(
+            base in parts(), x in safe(), y in safe(), z in safe(),
+        ) {
+            let sep = '\u{1f}';
+            let mut left = base.clone();
+            left[1] = format!("{x}{sep}{y}");
+            left[2] = z.clone();
+
+            let mut right = base;
+            right[1] = x;
+            right[2] = format!("{y}{sep}{z}");
+
+            let a = raw_key(&left, &[]);
+            let b = raw_key(&right, &[]);
+            prop_assert_ne!(&a, &b);
+            prop_assert_ne!(a.canonical_string(), b.canonical_string());
+        }
+
+        /// The same construction against the variable-length half, where it is
+        /// cheaper still: one variant whose value carries a separator renders
+        /// exactly like two variants under a separator-only encoding.
+        #[test]
+        fn a_separator_in_a_variant_value_cannot_forge_an_extra_variant(
+            base in parts(),
+            first_name in safe(), first_value in safe(),
+            second_name in safe(), second_value in safe(),
+        ) {
+            let two = raw_key(&base, &[
+                (first_name.clone(), first_value.clone()),
+                (second_name.clone(), second_value.clone()),
+            ]);
+            let smuggled = raw_key(&base, &[(
+                first_name,
+                format!("{first_value}\u{1f}{second_name}\u{1e}{second_value}"),
+            )]);
+            prop_assert_ne!(&two, &smuggled);
+            prop_assert_ne!(two.canonical_string(), smuggled.canonical_string());
+        }
+
+        /// And through the real builder, where the values come from headers
+        /// `http` has already validated. This is the reachable-in-production
+        /// half of the same claim.
+        #[test]
+        fn variant_values_cannot_forge_another_key(
+            left in prop::collection::vec(component(), 0..3),
+            right in prop::collection::vec(component(), 0..3),
+        ) {
+            let names = ["x-a", "x-b", "x-c"];
+            let build = |values: &[String]| {
+                let mut headers = HeaderMap::new();
+                let mut wanted = Vec::new();
+                for (name, value) in names.iter().zip(values) {
+                    // Skip values `http` itself would reject; an
+                    // unrepresentable header never arrives.
+                    if let Ok(v) = HeaderValue::from_str(value) {
+                        headers.insert(HeaderName::from_static(name), v);
+                        wanted.push((*name).to_string());
+                    }
+                }
+                key_from("https", "h", &Method::GET, "/p", None, &headers, &wanted, None)
+            };
+            let a = build(&left);
+            let b = build(&right);
+            prop_assert_eq!(a == b, a.canonical_string() == b.canonical_string());
+        }
+
+        /// A deployment id must partition the key space. Two builds sharing an
+        /// entry is how a deploy serves the previous build's HTML against the
+        /// new build's asset hashes.
+        #[test]
+        fn deployment_ids_never_share_an_entry(
+            first in component(),
+            second in component(),
+            path in component(),
+        ) {
+            prop_assume!(first != second);
+            let headers = HeaderMap::new();
+            let a = key_from("https", "h", &Method::GET, &path, None, &headers, &[], Some(&first));
+            let b = key_from("https", "h", &Method::GET, &path, None, &headers, &[], Some(&second));
+            prop_assert_ne!(a.canonical_string(), b.canonical_string());
+        }
+
+        /// Reordering a query string must not mint a second entry — that is a
+        /// render per permutation — but only where reordering is meaning
+        /// preserving, which duplicate keys are not.
+        #[test]
+        fn unique_query_parameters_are_order_insensitive(
+            pairs in prop::collection::vec(
+                (prop::string::string_regex("[a-z]{1,6}").unwrap(),
+                 prop::string::string_regex("[a-z0-9]{0,6}").unwrap()),
+                0..6,
+            ),
+        ) {
+            let mut seen = std::collections::HashSet::new();
+            prop_assume!(pairs.iter().all(|(k, _)| seen.insert(k.clone())));
+
+            let forward = pairs.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&");
+            let reversed = pairs.iter().rev()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&");
+            prop_assert_eq!(canonical_query(&forward, None), canonical_query(&reversed, None));
+        }
+
+        /// Canonicalising an already-canonical query must be a no-op, or the
+        /// key depends on how many times the value happened to pass through.
+        #[test]
+        fn canonical_query_is_idempotent(raw in component()) {
+            let once = canonical_query(&raw, None);
+            prop_assert_eq!(canonical_query(&once, None), once);
+        }
+
+        /// An `include` allowlist is what stops a cache-busting parameter from
+        /// minting a render per request. Nothing outside the list may survive.
+        #[test]
+        fn include_policy_admits_only_listed_keys(
+            raw in prop::string::string_regex("([a-z]{1,4}=[a-z0-9]{0,4}&){0,5}[a-z]{1,4}=[a-z0-9]{0,4}").unwrap(),
+            allowed in prop::collection::vec(prop::string::string_regex("[a-z]{1,4}").unwrap(), 0..4),
+        ) {
+            let policy = QueryPolicy { mode: QueryMode::Include, keys: allowed.clone() };
+            for pair in canonical_query(&raw, Some(&policy)).split('&').filter(|p| !p.is_empty()) {
+                let key = pair.split('=').next().unwrap_or("");
+                prop_assert!(allowed.iter().any(|a| a == key), "kept unlisted key `{}`", key);
+            }
+        }
+
+        /// And the mirror image: an `exclude` list must remove every key it
+        /// names, whatever else is in the string.
+        #[test]
+        fn exclude_policy_removes_every_listed_key(
+            raw in prop::string::string_regex("([a-z]{1,4}=[a-z0-9]{0,4}&){0,5}[a-z]{1,4}=[a-z0-9]{0,4}").unwrap(),
+            denied in prop::collection::vec(prop::string::string_regex("[a-z]{1,4}").unwrap(), 0..4),
+        ) {
+            let policy = QueryPolicy { mode: QueryMode::Exclude, keys: denied.clone() };
+            for pair in canonical_query(&raw, Some(&policy)).split('&').filter(|p| !p.is_empty()) {
+                let key = pair.split('=').next().unwrap_or("");
+                prop_assert!(!denied.iter().any(|d| d == key), "kept excluded key `{}`", key);
+            }
+        }
+
+        /// Two clients that named different content codings must never share a
+        /// stored body, however the header was spelled.
+        #[test]
+        fn distinct_accept_encodings_do_not_share_an_entry(
+            left in prop::string::string_regex("(gzip|br|zstd|identity|\\*)(;q=0\\.[0-9])?(, ?(gzip|br|zstd))?").unwrap(),
+            right in prop::string::string_regex("(gzip|br|zstd|identity|\\*)(;q=0\\.[0-9])?(, ?(gzip|br|zstd))?").unwrap(),
+        ) {
+            let build = |raw: &str| {
+                let mut headers = HeaderMap::new();
+                headers.insert(http::header::ACCEPT_ENCODING, HeaderValue::from_str(raw).unwrap());
+                key_from("https", "h", &Method::GET, "/p", None, &headers, &[], None)
+            };
+            let a = build(&left);
+            let b = build(&right);
+            // Normalisation only strips whitespace and case, so anything that
+            // survives as a different string must land in a different entry.
+            let normalised_apart = {
+                let mut ha = HeaderMap::new();
+                ha.insert(http::header::ACCEPT_ENCODING, HeaderValue::from_str(&left).unwrap());
+                let mut hb = HeaderMap::new();
+                hb.insert(http::header::ACCEPT_ENCODING, HeaderValue::from_str(&right).unwrap());
+                let meta = |h: &HeaderMap| normalize_accept_encoding(&RequestMetadata {
+                    method: &Method::GET, host: "h", path: "/p", query: None, headers: h,
+                });
+                meta(&ha) != meta(&hb)
+            };
+            if normalised_apart {
+                prop_assert_ne!(a.canonical_string(), b.canonical_string());
+            }
+        }
+
+        /// Nothing in keying may panic. A panic in the request path is a denial
+        /// of service reachable by anyone who can send a header.
+        #[test]
+        fn malformed_metadata_never_panics(
+            scheme in component(), host in component(), path in component(),
+            query in component(), header_value in component(),
+            method in prop::sample::select(vec!["GET", "HEAD", "POST", "PURGE", "GTE"]),
+        ) {
+            let mut headers = HeaderMap::new();
+            if let Ok(v) = HeaderValue::from_str(&header_value) {
+                headers.insert(HeaderName::from_static("x-probe"), v);
+            }
+            let method = Method::from_bytes(method.as_bytes()).unwrap();
+            let key = key_from(
+                &scheme, &host, &method, &path, Some(&query),
+                &headers, &["x-probe".to_string()], Some(&host),
+            );
+            // Deriving both views must also be total.
+            let _ = key.canonical_string();
+            let _ = key.fingerprint();
+        }
     }
 }
