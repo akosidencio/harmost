@@ -35,7 +35,7 @@ docker info >/dev/null 2>&1 || fail "no Docker daemon reachable"
 
 if ! curl -fsS -o /dev/null --max-time 2 "$PROXY_URL/healthz" 2>/dev/null; then
   echo "Starting the Next.js fixture stack..."
-  "${COMPOSE[@]}" up --build --detach
+  "${COMPOSE[@]}" up --build --detach || fail "the fixture stack did not start"
   STARTED_STACK=1
   for attempt in $(seq 1 90); do
     if curl -fsS -o /dev/null "$PROXY_URL/healthz" \

@@ -57,7 +57,7 @@ wait_until_ready() {
 
 echo "Building and starting one Harmost instance with three Next.js origins..."
 down_stack
-"${COMPOSE[@]}" up --build --detach
+"${COMPOSE[@]}" up --build --detach || fail "the fixture stack did not start"
 wait_until_ready || fail "services did not become ready"
 
 RUN_ID="$(date +%s)-$$"

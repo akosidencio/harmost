@@ -21,14 +21,24 @@ const PROXY = process.env.PROXY_URL || "http://127.0.0.1:18080";
 const METRICS = process.env.METRICS_URL || "http://127.0.0.1:19090";
 
 let failures = 0;
+let failuresInCheck = 0;
 
+function beginCheck() {
+  failuresInCheck = 0;
+}
+
+/// Only reports success if nothing failed inside the current check. Printing
+/// PASS unconditionally at the end of a function that has already logged FAIL
+/// is exactly the kind of report this whole phase exists to remove.
 function pass(message) {
+  if (failuresInCheck > 0) return;
   console.log(`PASS: ${message}`);
 }
 
 function fail(message) {
   console.error(`FAIL: ${message}`);
   failures += 1;
+  failuresInCheck += 1;
 }
 
 function assert(condition, message) {
@@ -51,7 +61,15 @@ async function originRequests(route) {
   return sum;
 }
 
+// The link the homepage renders, and the route whose origin counter must move
+// when its prefetch is replayed. The two have to be named together: reading a
+// different route's counter is how this check first reported "0 renders" while
+// the router had in fact prefetched something else.
+const PREFETCH_PATH = "/products/atlas-runner";
+const PREFETCH_ROUTE = "products";
+
 async function checkPrefetch(browser) {
+  beginCheck();
   const context = await browser.newContext();
   const page = await context.newPage();
 
@@ -68,7 +86,7 @@ async function checkPrefetch(browser) {
   await page.goto(`${PROXY}/`, { waitUntil: "networkidle" });
   // The homepage's product link is in the viewport, so the App Router
   // prefetches it. Hovering is belt and braces for a headless viewport.
-  await page.hover('a[href="/products/atlas-runner"]').catch(() => {});
+  await page.hover(`a[href="${PREFETCH_PATH}"]`).catch(() => {});
   await page.waitForTimeout(1500);
 
   const prefetches = requests.filter(
@@ -77,48 +95,76 @@ async function checkPrefetch(browser) {
       request.headers["next-router-segment-prefetch"] !== undefined,
   );
 
+  // The router prefetches more than the link — its own segments among them —
+  // so the one this check is about has to be selected by path rather than
+  // taken as whichever arrived first.
+  const prefetch = prefetches.find(
+    (request) => new URL(request.url).pathname === PREFETCH_PATH,
+  );
+
   if (
     !assert(
-      prefetches.length > 0,
-      `the router issued no prefetch request; observed ${requests.length} requests: ` +
-        requests.map((r) => r.url).join(", "),
+      prefetch !== undefined,
+      `the router issued no prefetch for ${PREFETCH_PATH}; it prefetched ` +
+        (prefetches.length
+          ? prefetches.map((r) => new URL(r.url).pathname).join(", ")
+          : "nothing at all"),
     )
   ) {
     await context.close();
     return;
   }
-
-  const prefetch = prefetches[0];
   assert(
     prefetch.headers.rsc !== undefined,
     "a prefetch arrived without the RSC header, so it would not be keyed as a flight payload",
   );
 
-  // Replay the browser's own prefetch twice. A prefetch payload is keyed on
-  // the router state tree — near-unbounded cardinality — so Harmost collapses
-  // concurrent duplicates but must never store one. Two sequential replays
-  // must therefore cost two renders, not one.
+  // Replay the browser's own prefetch, twice over, in the two arrangements
+  // that pin down what "coalesced but never stored" means. A prefetch payload
+  // is keyed on the router state tree — near-unbounded cardinality — so it is
+  // worth collapsing a burst of them and never worth keeping one.
   const replayHeaders = { ...prefetch.headers };
   delete replayHeaders["content-length"];
+  // The body has to be drained, not just awaited: `fetch` resolves at the
+  // response headers, so an un-consumed reply is still an in-flight origin
+  // render, and a "sequential" replay issued on top of it is really a
+  // concurrent one. Getting this wrong makes the store look like it retained
+  // something when it had only coalesced.
+  const replay = async () => {
+    const response = await fetch(prefetch.url, { headers: replayHeaders });
+    await response.arrayBuffer();
+    return response;
+  };
 
-  const before = await originRequests("products");
-  await fetch(prefetch.url, { headers: replayHeaders });
-  await fetch(prefetch.url, { headers: replayHeaders });
-  const after = await originRequests("products");
-
+  const beforeBurst = await originRequests(PREFETCH_ROUTE);
+  await Promise.all([replay(), replay(), replay(), replay()]);
+  const afterBurst = await originRequests(PREFETCH_ROUTE);
   assert(
-    after - before === 2,
-    `two sequential replays of the browser's own prefetch cost ${after - before} origin renders; ` +
-      "a prefetch payload must be coalesced but never stored",
+    afterBurst - beforeBurst === 1,
+    `four concurrent replays of the browser's own prefetch cost ${afterBurst - beforeBurst} origin renders, expected 1`,
+  );
+
+  // Past the store's handoff window, nothing may remain: the next request has
+  // to render again. A retained prefetch payload would be an unbounded key
+  // space living in a bounded cache.
+  await page.waitForTimeout(500);
+  const beforeSecond = await originRequests(PREFETCH_ROUTE);
+  await replay();
+  const afterSecond = await originRequests(PREFETCH_ROUTE);
+  assert(
+    afterSecond - beforeSecond === 1,
+    `a replay issued after the flight had finished cost ${afterSecond - beforeSecond} origin renders, expected 1; ` +
+      "a prefetch payload was retained",
   );
 
   pass(
-    `the App Router prefetched ${new URL(prefetch.url).pathname}; replaying it twice cost two renders, so nothing was stored`,
+    `the App Router prefetched ${new URL(prefetch.url).pathname}; four concurrent replays cost one render, and a later one rendered again`,
   );
   await context.close();
 }
 
 async function checkServerAction(browser) {
+  beginCheck();
   const context = await browser.newContext();
   const page = await context.newPage();
 
