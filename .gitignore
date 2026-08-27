@@ -7,7 +7,20 @@ target/
 # Local overrides
 *.local.yaml
 
+# Fuzzing: cargo-fuzz's build output, generated corpora and crash artifacts.
+# The targets themselves are checked in; what a run produces is not.
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Browser harness for the Next.js fixture
+bench/browser/node_modules/
+bench/browser/package-lock.json
+
 # Next.js integration fixture
 fixtures/next-storefront/.next/
 fixtures/next-storefront/node_modules/
 fixtures/next-storefront/*.tsbuildinfo
+
+# docs
+docs/

@@ -188,12 +188,14 @@ impl ProxyHttp for Harmost {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
         let req = session.req_header();
+        // Rendered, never dropped: a `Host` that `to_str` cannot read used to
+        // collapse to the empty string, putting every such request into one
+        // shared cache entry.
         let host = req
             .headers
             .get("host")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
+            .map(crate::classifier::header_text)
+            .unwrap_or_default();
         let path = req.uri.path().to_string();
         let query = req.uri.query().map(str::to_string);
         let method = req.method.clone();
@@ -302,12 +304,14 @@ impl ProxyHttp for Harmost {
 
     fn cache_key_callback(&self, session: &Session, ctx: &mut Ctx) -> Result<PingoraCacheKey> {
         let req = session.req_header();
+        // Rendered, never dropped: a `Host` that `to_str` cannot read used to
+        // collapse to the empty string, putting every such request into one
+        // shared cache entry.
         let host = req
             .headers
             .get("host")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
+            .map(crate::classifier::header_text)
+            .unwrap_or_default();
         let path = req.uri.path().to_string();
         let query = req.uri.query().map(str::to_string);
 
@@ -561,12 +565,18 @@ impl ProxyHttp for Harmost {
             if ctx.permit.is_some() {
                 ctx.permit_released_at = Some("body_end");
             }
-            // The permit represents *render* capacity, so it is returned the
-            // moment the origin stops rendering. Holding it until the client
-            // finished reading would let a deliberately slow reader occupy a
-            // slot sized for a 200ms render, which is a cheap way to defeat
-            // the limiter.
+            // The permit represents *render* capacity, and this is the
+            // earliest point at which the origin is known to have stopped
+            // rendering. It is not necessarily the moment it did: pingora
+            // paces upstream reads against downstream writes, so a slow reader
+            // delays when `end_of_stream` is observed. That gap is bounded by
+            // `timeouts.downstream_write` and closed properly only by a
+            // bounded response spool (roadmap phase 1).
             //
+            // Releasing earlier on the strength of a `Content-Length` was
+            // tried and reverted: a length describes the body's size, never
+            // that the origin has finished producing it. See
+            // `bench/slowclient.sh`.
             ctx.permit = None;
         }
         Ok(None)
@@ -731,7 +741,7 @@ fn joined_header_values(
     let values = headers
         .get_all(name)
         .iter()
-        .filter_map(|value| value.to_str().ok())
+        .map(crate::classifier::header_text)
         .collect::<Vec<_>>();
     (!values.is_empty()).then(|| values.join(","))
 }

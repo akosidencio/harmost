@@ -36,16 +36,20 @@ impl NextJs {
     }
 
     fn is_rsc(req: &RequestMetadata<'_>) -> bool {
-        req.header("rsc").is_some()
+        // Presence, not content. `header(..).is_some()` would answer "no" for
+        // `RSC: <obs-text>`, classifying a flight payload as a document and
+        // keying it as one.
+        req.has_header("rsc")
     }
 
     fn is_prefetch(req: &RequestMetadata<'_>) -> bool {
-        req.header("next-router-prefetch").is_some()
-            || req.header("next-router-segment-prefetch").is_some()
+        req.has_header("next-router-prefetch") || req.has_header("next-router-segment-prefetch")
     }
 
     fn is_server_action(req: &RequestMetadata<'_>) -> bool {
-        req.header("next-action").is_some()
+        // A missed Server Action is classified as a document and becomes
+        // cacheable, so this check may never depend on the id being readable.
+        req.has_header("next-action")
     }
 
     fn in_draft_mode(req: &RequestMetadata<'_>) -> bool {
@@ -215,5 +219,61 @@ mod tests {
         );
         let hints = NextJs.classify_request(&get("/blog/post", &h));
         assert_eq!(hints.force_bypass, None);
+    }
+
+    /// Found by the `cookies` fuzz target.
+    ///
+    /// `HeaderValue` accepts obs-text (0x80..=0xFF) but `to_str` refuses it, so
+    /// reading the cookie header as a string dropped the *entire* header when a
+    /// single unrelated cookie carried one odd byte — and with it the draft-mode
+    /// cookie. Next.js parses the same header from bytes and honours the cookie,
+    /// so Harmost cached an unpublished render and served it publicly.
+    #[test]
+    fn a_non_ascii_byte_elsewhere_in_the_header_cannot_hide_the_draft_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"locale=\xd0\xa5; __prerender_bypass=abc").unwrap(),
+        );
+        let hints = NextJs.classify_request(&get("/preview", &headers));
+        assert_eq!(hints.force_bypass, Some("next_draft_mode"));
+    }
+
+    /// The same failure reached through a presence check. A prefetch payload
+    /// is keyed on the entire client route state, so it is collapsed but never
+    /// stored; a prefetch header whose bytes `to_str` cannot read used to make
+    /// the request look like an ordinary one, and an unbounded key space
+    /// became storable.
+    #[test]
+    fn an_unreadable_prefetch_header_is_still_a_prefetch() {
+        let mut headers = HeaderMap::new();
+        headers.insert("rsc", HeaderValue::from_static("1"));
+        headers.insert(
+            "next-router-prefetch",
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        let hints = NextJs.classify_request(&get("/products/iphone", &headers));
+        assert!(
+            hints.coalesce_only,
+            "a prefetch with an unreadable header became storable"
+        );
+    }
+
+    /// And the one with the worst consequence: an unreadable action id must
+    /// still classify as a mutation, or a state change becomes cacheable.
+    #[test]
+    fn an_unreadable_action_id_is_still_a_mutation() {
+        let mut headers = HeaderMap::new();
+        headers.insert("next-action", HeaderValue::from_bytes(b"\x80\x81").unwrap());
+        let post = Method::POST;
+        let hints = NextJs.classify_request(&RequestMetadata {
+            method: &post,
+            host: "shop.example.com",
+            path: "/cart",
+            query: None,
+            headers: &headers,
+        });
+        assert_eq!(hints.class, Some(RequestClass::Mutation));
+        assert_eq!(hints.force_bypass, Some("next_server_action"));
     }
 }

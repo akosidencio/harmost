@@ -6,6 +6,18 @@
 //! began) and `X-Origin-Peak` (highest seen since start). Those two headers are
 //! how the benchmark proves the ceiling held without trusting the proxy's own
 //! metrics.
+//!
+//! Three control endpoints exist so a benchmark never has to infer origin work
+//! from the proxy's own logs or from headers that may have been replayed out of
+//! the proxy's cache:
+//!
+//! * `GET /__stats`  — `{"in_flight":n,"peak":n,"total":n}` counted by the
+//!   origin itself. This is the ground truth for "how many renders did this
+//!   actually cost".
+//! * `GET /__reset`  — zero the counters, so one process can measure several
+//!   phases without a restart clouding the numbers.
+//! * `GET /healthz`  — liveness, deliberately excluded from the counters so an
+//!   active health check cannot inflate a render count.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,19 +61,18 @@ async fn main() -> std::io::Result<()> {
             let head = String::from_utf8_lossy(&buf[..n]);
             let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
 
+            // Control endpoints are answered before the counters are touched.
+            // A health probe or a stats poll is not origin work, and counting
+            // it would corrupt the very number the benchmarks assert on.
+            if let Some(body) = control_response(&path, &stats) {
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+                return;
+            }
+
             let now = stats.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             stats.peak.fetch_max(now, Ordering::SeqCst);
             let seq = stats.total.fetch_add(1, Ordering::SeqCst) + 1;
-
-            if path == "/healthz" {
-                let _ = sock
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                    )
-                    .await;
-                stats.in_flight.fetch_sub(1, Ordering::SeqCst);
-                return;
-            }
 
             // /stream/<n> emits n chunks with a render delay between each,
             // the way a server-rendered page streams a shell and then fills
@@ -157,4 +168,36 @@ async fn main() -> std::io::Result<()> {
             stats.in_flight.fetch_sub(1, Ordering::SeqCst);
         });
     }
+}
+
+/// Answer the non-render endpoints, or `None` if this path is a real render.
+fn control_response(path: &str, stats: &Stats) -> Option<String> {
+    let body = match path {
+        "/healthz" => "ok".to_string(),
+        "/__stats" => format!(
+            "{{\"in_flight\":{},\"peak\":{},\"total\":{}}}",
+            stats.in_flight.load(Ordering::SeqCst),
+            stats.peak.load(Ordering::SeqCst),
+            stats.total.load(Ordering::SeqCst),
+        ),
+        "/__reset" => {
+            // in_flight is deliberately not cleared: it is a live count, and
+            // zeroing it while requests are in flight would make it drift
+            // negative-by-saturation as they complete.
+            stats
+                .peak
+                .store(stats.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
+            stats.total.store(0, Ordering::SeqCst);
+            "reset".to_string()
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Cache-Control: no-store\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len(),
+    ))
 }

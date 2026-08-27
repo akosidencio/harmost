@@ -65,6 +65,7 @@ so behind something you can fail back to, and read
 - [Project maturity and expectations](#project-maturity-and-expectations)
 - [The problem](#the-problem)
 - [Why Harmost exists](#why-harmost-exists)
+- [Is Harmost for you?](#is-harmost-for-you)
 - [Intended benefits](#intended-benefits)
 - [What Harmost does](#what-harmost-does)
 - [How Harmost works](#how-harmost-works)
@@ -141,6 +142,73 @@ other React Server Components frameworks — and non-JavaScript SSR origins — 
 plausible targets. **None are supported today.** Additional adapters land only
 once the generic contract is stable enough that adding one cannot bend it; see
 [Roadmap](#roadmap) phase 4.
+
+## Is Harmost for you?
+
+The question is not whether you have high traffic. It is whether your peak
+concurrency can exceed your origin's render capacity, and what happens when it
+does. Small origins have very little capacity, so the answer is often yes at
+traffic volumes that sound unremarkable.
+
+Concurrency is arrival rate multiplied by render time. A Node process handles
+roughly 50 concurrent renders before its event loop begins queueing, so two
+pods give you on the order of 100. With a 500 ms render you reach that at about
+200 requests per second — and the requests that get you there are frequently
+not the ones you planned for:
+
+- **A visitor is not a request.** The App Router prefetches on hover and on
+  viewport entry, so one person browsing produces several origin requests.
+  What each costs depends on the route, but none of them appear in a page-view
+  count.
+- **Crawlers and scrapers do not care how popular you are.** An automated
+  client walking thousands of distinct URLs produces sustained concurrency
+  against your origin regardless of your organic traffic. Every URL is unique,
+  so every one is a cache miss and none of them can be collapsed. This is the
+  case where caching and coalescing offer nothing at all and bounded admission
+  is the only mechanism that applies.
+- **Small sites have spikier traffic than large ones.** A large site's load is
+  comparatively smooth. A small site's load is a launch, a drop, a newsletter
+  or a link from somewhere busy — a step change, not a curve.
+
+There is a second reason unrelated to outages. Without admission control, the
+only way to survive a peak is to provision for it: run enough pods for the
+worst thirty seconds and pay for them the rest of the day. Bounding origin work
+is what makes running fewer pods a considered decision rather than a gamble.
+
+### Harmost is likely to help if
+
+- You self-host a server-rendered application on infrastructure you own or
+  operate, and a slow or failing origin is your problem to fix.
+- A meaningful share of your traffic is dynamic, personalized or otherwise
+  uncacheable, so a conventional cache skips it.
+- Your traffic is bursty, automated, or both, and your headroom is a small
+  multiple of your steady-state load rather than a large one.
+- An origin overload costs you something — revenue, a launch, an on-call night.
+
+### Harmost is unlikely to help if
+
+- **Your site is static or fully pre-rendered.** There is no render cost to
+  govern; a CDN is the entire answer.
+- **You run on Vercel, Netlify or Cloudflare.** You do not own the origin, the
+  platform already collapses duplicate requests and scales the render tier for
+  you, and Harmost has nowhere useful to sit.
+- **Your origin is already mostly cacheable.** If ISR or a plain CDN absorbs
+  your traffic, a governor is protecting capacity that was never under threat.
+- **A spike-induced outage costs you nothing.** A personal site does not need
+  an additional hop, an additional configuration and an additional failure
+  mode.
+
+The cost side deserves the same scrutiny. Harmost is another process in your
+request path, another configuration to maintain and another failure mode to
+understand, and today it is
+[unproven software](#project-maturity-and-expectations). For a small
+deployment, adding a pod or putting a CDN in front is sometimes simply the
+better trade.
+
+If you want to know where you stand before installing anything, the useful
+measurements are your origin's **peak concurrent in-flight requests** and your
+**render latency** — not requests per day. Their product against your pod count
+is the number Harmost exists to bound.
 
 ## Intended benefits
 
@@ -298,10 +366,10 @@ $ ./bench/stream.sh 20 5 400
 One render, twenty responses, and every waiter held the shell within 9 ms while
 that render was still in progress.
 
-The proxy behavior was also checked from the fixture's `X-Origin-Total` header.
-The current `stream.sh` log-based origin counter can incorrectly print `0`; the
-reporter fix is the first roadmap phase and the sample above shows the verified
-render count rather than that reporting error.
+The render count comes from the fixture origin's own counter, read back from
+its `/__stats` endpoint. It used to be derived by grepping the *proxy's* access
+log for upstream lines — measuring the component under test with an expression
+that silently returned `0` whenever the log format changed.
 
 ## Private-response safety check
 
@@ -312,6 +380,7 @@ $ ./bench/safety.sh 50
 
   requests served        50 / 50
   distinct session ids   50
+  origin renders         50
 
   X-Harmost breakdown:
       50 MISS
@@ -349,22 +418,42 @@ The mechanism claims in this README have local benchmark scripts. Each starts a
 test origin and proxy, runs load, and tears both down:
 
 ```bash
-./bench/demo.sh 60 1000     # bounded admission: origin peak 10 vs 60 direct
-./bench/coalesce.sh 100     # 100 concurrent requests, one origin render
-./bench/stream.sh 20 5 400  # collapsing without breaking streaming
-./bench/safety.sh 50        # a Set-Cookie response is never shared
-./bench/slowclient.sh       # diagnose slow-reader backpressure and permit lifetime
-./bench/reload.sh           # SIGHUP reload, including a refused one
-./bench/nextjs.sh           # one Harmost process, three real Next.js origins
+./bench/all.sh                # every benchmark below, as one gate
+./bench/demo.sh 60 1000       # bounded admission: origin peak 10 vs 60 direct
+./bench/coalesce.sh 100       # 100 concurrent requests, one origin render
+./bench/stream.sh 20 5 400    # collapsing without breaking streaming
+./bench/safety.sh 50          # a Set-Cookie response is never shared
+./bench/slowclient.sh         # slow-reader backpressure and the permit lifetime bound
+./bench/reload.sh             # SIGHUP reload, including a refused one
+./bench/nextjs.sh             # one Harmost process, three real Next.js origins
+./bench/nextjs-browser.sh     # the same stack, driven by Chromium
 ```
 
+Every script asserts its own claim and exits non-zero when it fails, so each is
+a gate rather than a report. Each also prints the parameters it ran with next
+to its numbers; set `BENCH_REPORT_DIR` to collect one JSON file per benchmark
+carrying both, which is what CI publishes as an artifact. A result is a
+measurement of one machine, not a baseline, and the parameter block is what
+makes it comparable to another.
+
+The harness in [`bench/lib.sh`](./bench/lib.sh) tracks the exact pid of every
+process it starts and allocates its ports per run, so a benchmark cannot kill
+an unrelated Harmost on the same machine or measure whatever else was already
+listening on 8080.
+
 The focused scripts measure against [`bench/slow-origin`](./bench/slow-origin),
-a fixture that `sleep`s instead of rendering. `nextjs.sh` instead builds the
-standalone App Router application in
-[`fixtures/next-storefront`](./fixtures/next-storefront), starts three
-independently identified origins, and makes machine-checked assertions across
-their combined traffic. Neither setup predicts behaviour under real traffic —
-see [Project maturity](#project-maturity-and-expectations).
+a fixture that `sleep`s instead of rendering and reports its own render counts
+at `/__stats`, so no assertion depends on the proxy's account of its own work.
+`nextjs.sh` instead builds the standalone application in
+[`fixtures/next-storefront`](./fixtures/next-storefront) — which serves both an
+App Router and a Pages Router surface — starts three independently identified
+origins, and makes machine-checked assertions across their combined traffic.
+`nextjs-browser.sh` drives that same stack with Chromium, because the two
+behaviours a curl-written request cannot reach are the ones Next's own client
+constructs: a router prefetch carrying a real `Next-Router-State-Tree`, and a
+Server Action POST carrying an action id the build assigned. Neither setup
+predicts behaviour under real traffic — see
+[Project maturity](#project-maturity-and-expectations).
 
 ## Installation
 
@@ -737,14 +826,16 @@ not completed production hardening or operational validation.
 | Active health checks | done |
 | Graceful reload (SIGHUP) | done |
 | Stale-while-revalidate, stale-if-error | done |
-| Real Next.js standalone fixture | done; local Docker integration tested |
+| Real Next.js fixture (App Router + Pages Router) | done; local Docker integration tested |
+| Browser-driven prefetch and Server Action checks | done (Chromium, [`bench/nextjs-browser.sh`](./bench/nextjs-browser.sh)) |
+| Property tests and fuzz targets | done ([`fuzz/`](./fuzz)); run in CI |
 | Circuit breaking, least-loaded balancing | not started ([roadmap](#roadmap)) |
 | Cache purge API, OpenTelemetry | not started ([roadmap](#roadmap)) |
 
 The security- and correctness-sensitive parts — cache-key construction, response
 shareability, and bounded admission — remain isolated as testable logic beneath
-the Pingora proxy layer. The full workspace test suite (134 tests) runs without
-external network services.
+the Pingora proxy layer. The full workspace test suite (167 tests, including
+property tests over generated inputs) runs without external network services.
 
 "done, tested" means unit-tested and, where a `bench/` script exists, verified
 end to end against a local test origin. It does not mean production-validated;
@@ -759,21 +850,54 @@ that is not running.
 Ordered by dependency and risk rather than novelty. Later phases depend on the
 evidence and safety work before them.
 
-### 0. Make the evidence trustworthy
+### 0. Make the evidence trustworthy — done
 
-- Replace broad process-killing benchmark cleanup with exact PID tracking,
-  dynamic ports and machine-checked assertions. Fix the streaming origin-count
-  and reload-success reporters.
-- Extend the real App Router fixture and its HTTP assertions with Pages Router
-  coverage and browser-driven checks for prefetch and real Server Action form
-  submissions. Public SSR, RSC separation, mutation classification, Draft
-  Mode, Suspense streaming and `Set-Cookie` isolation are already exercised
-  locally.
-- Run unit and integration tests in CI on Linux, with a smaller macOS build
-  matrix; publish benchmark parameters with results rather than treating one
-  laptop run as a baseline.
-- Add property tests and fuzz targets for cache-key canonicalisation,
-  `Cache-Control`, `Vary`, cookies and malformed HTTP metadata.
+- **Benchmark harness.** [`bench/lib.sh`](./bench/lib.sh) tracks the exact pid
+  of every process it starts and allocates ports per run, replacing
+  `pkill -f target/debug/harmost` (which killed every Harmost on the machine)
+  and the hardcoded 3000/8080/9090. Readiness is polled rather than slept
+  through. Every script asserts and exits non-zero on failure — `reload.sh`
+  previously printed log lines and checked nothing, and now proves the new
+  ceiling took effect by measuring the origin's peak concurrency after the
+  reload rather than trusting the "config reloaded" message. `stream.sh`
+  counted renders by grepping the proxy's own access log, an expression that
+  returned `0` whenever the log format changed; both it and every other script
+  now read the fixture origin's own `/__stats` counter.
+- **Framework coverage.** The fixture serves a Pages Router surface alongside
+  the App Router, and `nextjs.sh` asserts across both: `getServerSideProps`
+  coalescing, the `/_next/data/<buildId>/…json` payload keyed apart from its
+  own document, and the `Set-Cookie` barrier holding on the legacy path.
+  [`bench/nextjs-browser.sh`](./bench/nextjs-browser.sh) drives the same stack
+  with Chromium for the two requests curl cannot construct — a real router
+  prefetch and a real Server Action form submission.
+- **CI.** Linux runs fmt, clippy, the test suite, the end-to-end benchmarks and
+  the containerised Next.js proof; macOS builds and runs the unit tests.
+  Benchmark results are published as an artifact together with the parameters
+  and the machine that produced them.
+- **Property tests and fuzz targets.** Proptest covers cache-key
+  canonicalisation, `Cache-Control`, `Vary`, cookies and malformed HTTP
+  metadata; six [fuzz targets](./fuzz/fuzz_targets) run in CI.
+
+That last item found two real bugs, which is the point of the phase:
+
+- **`HeaderValue::to_str` refuses obs-text that `HeaderValue` accepts**, and
+  every caller dropped the value on failure. One non-ASCII byte in an unrelated
+  cookie hid every cookie in the header — including `__prerender_bypass`, so a
+  Next.js draft-mode render was cached and served publicly while Next itself,
+  parsing the same header from bytes, honoured the cookie. The same pattern
+  made an unreadable `Next-Action` classify as a document (a mutation becomes
+  cacheable), an unreadable prefetch header make a near-unbounded key space
+  storable, and any variant header value that was not ASCII collapse to
+  "header absent", sharing one entry between clients that asked for different
+  things. Cookie lookup is now compared on bytes, presence checks no longer
+  read the value, and header values reach the key through a lossless encoding.
+- **The cache key rendered `deployment: None` and `deployment: Some("")`
+  identically.** Two structurally distinct keys shared one entry.
+
+The key's canonical encoding is now length-prefixed rather than merely
+separator-delimited, so its injectivity is a property of the function rather
+than of `http`'s input validation — asserted by a property test that fails
+against the old encoding.
 
 ### 1. Close protocol and security gaps
 

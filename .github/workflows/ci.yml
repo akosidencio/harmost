@@ -18,8 +18,10 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # Linux is the reference platform: it runs the full gate, including the
+  # end-to-end benchmarks and the containerised Next.js proof.
   test:
-    name: fmt + clippy + test
+    name: fmt + clippy + test (linux)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -52,3 +54,146 @@ jobs:
       # --all-targets silently skips doc tests, so run them separately.
       - name: Doc tests
         run: cargo test --workspace --doc --locked
+
+  # macOS is a supported development platform, not the reference one. It builds
+  # and runs the unit tests so a platform-specific compile error or a test that
+  # assumed Linux is caught; the end-to-end work is not duplicated here, because
+  # the timing-sensitive benchmarks are slower and flakier on macOS runners and
+  # a second copy of them buys no coverage.
+  build-macos:
+    name: build + test (macos)
+    runs-on: macos-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace --lib --locked
+
+  # The end-to-end evidence behind the README's claims. Every script asserts its
+  # own result and exits non-zero when it fails, so this is a gate rather than a
+  # report — and each one writes the parameters it ran with next to its numbers,
+  # published as an artifact so a result can be compared against another machine
+  # instead of being read as a universal baseline.
+  benchmarks:
+    name: end-to-end benchmarks (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Record the machine the numbers came from
+        run: |
+          {
+            echo "runner: ${{ runner.os }} ${{ runner.arch }}"
+            echo "cpus: $(nproc)"
+            echo "memory: $(free -h | awk '/^Mem:/ {print $2}')"
+            echo "kernel: $(uname -r)"
+            echo "rustc: $(rustc --version)"
+            echo "commit: ${{ github.sha }}"
+          } | tee benchmark-environment.txt
+
+      # A GitHub runner has two cores, so the concurrency is kept low enough
+      # that requests genuinely overlap rather than queueing behind the load
+      # generator itself. The Next.js proof runs in its own job.
+      - name: Run the benchmark suite
+        env:
+          BENCH_REPORT_DIR: ${{ github.workspace }}/benchmark-results
+          SKIP_DOCKER: "1"
+          DEMO_CONCURRENCY: "30"
+          COALESCE_CONCURRENCY: "30"
+          STREAM_CONCURRENCY: "16"
+          SAFETY_CONCURRENCY: "20"
+        run: ./bench/all.sh
+
+      - name: Publish results with the parameters that produced them
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmark-results/
+            benchmark-environment.txt
+          if-no-files-found: warn
+
+  # The real-framework proof. Kept separate because it builds three Next.js
+  # images and a Harmost image, and because a failure here means something
+  # different from a unit test failure: the policy is wrong about Next.js, not
+  # wrong about itself.
+  nextjs:
+    name: next.js integration proof (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: HTTP assertions
+        run: ./bench/nextjs.sh
+
+      - name: Browser-driven assertions
+        run: ./bench/nextjs-browser.sh
+
+  # Fuzz targets are built on every run so a target cannot rot unnoticed, and
+  # run briefly. A short run is a smoke test, not a campaign: it catches a
+  # target that panics immediately, which is the failure mode that matters for
+  # keeping them alive in CI.
+  fuzz:
+    name: fuzz targets (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libssl-dev pkg-config
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> target"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build every target
+        run: cargo fuzz build
+
+      - name: Run each target briefly
+        run: |
+          for target in $(cargo fuzz list); do
+            echo "=== $target ==="
+            cargo fuzz run "$target" -- -max_total_time=60 -print_final_stats=1
+          done
+
+      - name: Publish any crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

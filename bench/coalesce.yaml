@@ -1,11 +1,14 @@
 # Coalescing demo. The origin answers `no-store` (as a dynamically rendered
 # Next.js route does), so the route has to say out loud that these responses
 # are shareable before anything can be collapsed or cached.
+#
+# `@LISTEN@`, `@ORIGIN@` and `@METRICS@` are substituted by bench/lib.sh with
+# ports allocated for this run.
 version: 1
 server:
-  listen: "127.0.0.1:8080"
+  listen: "127.0.0.1:@LISTEN@"
 origin:
-  upstreams: ["127.0.0.1:3000"]
+  upstreams: ["127.0.0.1:@ORIGIN@"]
   concurrency:
     max: 50
     queue:
@@ -31,4 +34,4 @@ routes:
 
 telemetry:
   prometheus:
-    listen: "127.0.0.1:9090"
+    listen: "127.0.0.1:@METRICS@"
