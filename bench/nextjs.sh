@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# A real Next.js App Router integration proof: one Harmost process, three
-# standalone origins, and machine-checked public/private/streaming behavior.
+# A real Next.js integration proof: one Harmost process, three standalone
+# origins, and machine-checked public/private/streaming behaviour across both
+# the App Router and the Pages Router.
+#
+# The two things a curl-driven test cannot reach — a router prefetch and a real
+# Server Action submission — are covered by bench/nextjs-browser.sh, which
+# drives the same stack with Chromium.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -58,7 +63,7 @@ wait_until_ready || fail "services did not become ready"
 RUN_ID="$(date +%s)-$$"
 
 echo
-echo "1/7 identical public SSR requests coalesce across the origin pool"
+echo "1/10 identical public SSR requests coalesce across the origin pool"
 BEFORE=$(metric_sum products)
 seq 1 "$CONCURRENCY" | xargs -P "$CONCURRENCY" -I{} \
   curl -sS -o "$RESULT_DIR/coalesce-{}.html" -w '%{http_code}\n' \
@@ -73,7 +78,7 @@ RENDER_IDS=$(sed -n 's/.*data-render-id="\([^"]*\)".*/\1/p' "$RESULT_DIR"/coales
 echo "PASS: $CONCURRENCY responses, one origin render, one shared render id"
 
 echo
-echo "2/7 distinct paths are distributed across all three Next.js origins"
+echo "2/10 distinct paths are distributed across all three Next.js origins"
 for index in $(seq 1 18); do
   curl -fsS "$PROXY_URL/products/spread-$RUN_ID-$index" > "$RESULT_DIR/spread-$index.html"
 done
@@ -83,7 +88,7 @@ INSTANCE_COUNT=$(echo "$INSTANCES" | sed '/^$/d' | wc -l | tr -d ' ')
 echo "PASS: observed $(echo "$INSTANCES" | tr '\n' ' ')"
 
 echo
-echo "3/7 HTML and React Server Component payloads use separate cache keys"
+echo "3/10 HTML and React Server Component payloads use separate cache keys"
 RSC_PATH="/products/rsc-$RUN_ID"
 RSC_URL="$PROXY_URL$RSC_PATH"
 # This is the router tree emitted by the fixture homepage. Next canonicalizes
@@ -118,7 +123,7 @@ cmp -s "$RESULT_DIR/rsc.body" "$RESULT_DIR/rsc-again.body" || fail "cached RSC r
 echo "PASS: HTML and canonical RSC variants cached independently without mixing"
 
 echo
-echo "4/7 Set-Cookie responses are never shared"
+echo "4/10 Set-Cookie responses are never shared"
 PRIVATE_COUNT=16
 BEFORE=$(metric_sum private-session)
 seq 1 "$PRIVATE_COUNT" | xargs -P "$PRIVATE_COUNT" -I{} \
@@ -134,7 +139,7 @@ SESSIONS=$(sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' "$RESULT_DIR"/private-*.
 echo "PASS: $PRIVATE_COUNT requests, $PRIVATE_COUNT renders, $PRIVATE_COUNT sessions"
 
 echo
-echo "5/7 Next-Action mutation requests bypass a deliberately public route"
+echo "5/10 Next-Action mutation requests bypass a deliberately public route"
 MUTATION_COUNT=12
 BEFORE=$(metric_sum action-probe)
 seq 1 "$MUTATION_COUNT" | xargs -P "$MUTATION_COUNT" -I{} \
@@ -151,7 +156,7 @@ MUTATIONS=$(sed -n 's/.*"mutation_id":"\([^"]*\)".*/\1/p' "$RESULT_DIR"/mutation
 echo "PASS: $MUTATION_COUNT mutations bypassed cache reuse and coalescing"
 
 echo
-echo "6/7 Draft Mode bypasses a cached public preview without contaminating it"
+echo "6/10 Draft Mode bypasses a cached public preview without contaminating it"
 BEFORE=$(metric_sum preview)
 curl -fsS -o "$RESULT_DIR/preview-public.html" "$PROXY_URL/preview"
 curl -sS -D "$RESULT_DIR/draft.headers" -o /dev/null "$PROXY_URL/api/draft"
@@ -167,7 +172,7 @@ cmp -s "$RESULT_DIR/preview-public.html" "$RESULT_DIR/preview-public-again.html"
 echo "PASS: draft content bypassed; the public cache entry remained unchanged"
 
 echo
-echo "7/7 coalescing preserves a real Suspense stream"
+echo "7/10 coalescing preserves a real Suspense stream"
 STREAM_COUNT=10
 STREAM_URL="$PROXY_URL/flash-sale?run=$RUN_ID"
 BEFORE=$(metric_sum flash-sale)
@@ -185,6 +190,74 @@ STREAMED=$(awk -v first="$MAX_TTFB" -v total="$MEDIAN_TOTAL" 'BEGIN { print (fir
 [ "$ORIGIN_REQUESTS" -eq 1 ] || fail "$STREAM_COUNT streaming requests caused $ORIGIN_REQUESTS origin requests"
 [ "$STREAMED" -eq 1 ] || fail "max TTFB ${MAX_TTFB}s was not below half of median total ${MEDIAN_TOTAL}s"
 echo "PASS: one origin render; max TTFB ${MAX_TTFB}s, median total ${MEDIAN_TOTAL}s"
+
+echo
+echo "8/10 Pages Router getServerSideProps coalesces like the App Router"
+LEGACY_COUNT=16
+LEGACY_URL="$PROXY_URL/legacy/coalesce-$RUN_ID"
+BEFORE=$(metric_sum legacy-pages)
+seq 1 "$LEGACY_COUNT" | xargs -P "$LEGACY_COUNT" -I{} \
+  curl -sS -o "$RESULT_DIR/legacy-{}.html" -w '%{http_code}\n' \
+  "$LEGACY_URL" > "$RESULT_DIR/legacy-status"
+SERVED=$(grep -c '^200$' "$RESULT_DIR/legacy-status" || true)
+AFTER=$(metric_sum legacy-pages)
+ORIGIN_REQUESTS=$((AFTER - BEFORE))
+LEGACY_RENDER_IDS=$(sed -n 's/.*data-render-id="\([^"]*\)".*/\1/p' "$RESULT_DIR"/legacy-*.html | sort -u | wc -l | tr -d ' ')
+[ "$SERVED" -eq "$LEGACY_COUNT" ] || fail "served $SERVED/$LEGACY_COUNT Pages Router requests"
+[ "$ORIGIN_REQUESTS" -eq 1 ] || fail "$LEGACY_COUNT identical Pages Router requests reached the origins $ORIGIN_REQUESTS times"
+[ "$LEGACY_RENDER_IDS" -eq 1 ] || fail "coalesced Pages Router clients received $LEGACY_RENDER_IDS render ids"
+grep -q 'data-route-kind="pages-router-ssr"' "$RESULT_DIR/legacy-1.html" || fail "response did not come from the Pages Router"
+echo "PASS: $LEGACY_COUNT responses, one origin render, one shared render id"
+
+echo
+echo "9/10 the Pages Router data payload never mixes with its own document"
+# A client-side navigation to a Pages Router route fetches JSON props from
+# /_next/data/<buildId>/<route>.json. Same page, different URL, different
+# content type — and a browser handed the wrong one renders nothing.
+BUILD_ID=$(sed -n 's/.*"buildId":"\([^"]*\)".*/\1/p' "$RESULT_DIR/legacy-1.html" | head -1)
+[ -n "$BUILD_ID" ] || fail "could not read the Next.js build id out of the Pages Router document"
+DATA_PATH="/_next/data/$BUILD_ID/legacy/data-$RUN_ID.json"
+DOC_PATH="/legacy/data-$RUN_ID"
+BEFORE_DOC=$(metric_sum legacy-pages)
+BEFORE_DATA=$(metric_sum legacy-data)
+curl -fsS -D "$RESULT_DIR/legacy-doc.headers" -o "$RESULT_DIR/legacy-doc.body" "$PROXY_URL$DOC_PATH"
+curl -fsS -D "$RESULT_DIR/legacy-data.headers" -o "$RESULT_DIR/legacy-data.body" \
+  -H 'x-nextjs-data: 1' "$PROXY_URL$DATA_PATH"
+# Both again: each must come back from its own entry, unchanged.
+curl -fsS -o "$RESULT_DIR/legacy-doc-again.body" "$PROXY_URL$DOC_PATH"
+curl -fsS -o "$RESULT_DIR/legacy-data-again.body" \
+  -H 'x-nextjs-data: 1' "$PROXY_URL$DATA_PATH"
+AFTER_DOC=$(metric_sum legacy-pages)
+AFTER_DATA=$(metric_sum legacy-data)
+[ $((AFTER_DOC - BEFORE_DOC)) -eq 1 ] || fail "the Pages Router document was rendered $((AFTER_DOC - BEFORE_DOC)) times instead of once"
+[ $((AFTER_DATA - BEFORE_DATA)) -eq 1 ] || fail "the Pages Router data payload was rendered $((AFTER_DATA - BEFORE_DATA)) times instead of once"
+grep -qi '^content-type: text/html' "$RESULT_DIR/legacy-doc.headers" || fail "the Pages Router document was not HTML"
+grep -qi '^content-type: application/json' "$RESULT_DIR/legacy-data.headers" || fail "the Pages Router data route was not JSON"
+grep -q '"pageProps"' "$RESULT_DIR/legacy-data.body" || fail "the data route did not return page props"
+cmp -s "$RESULT_DIR/legacy-doc.body" "$RESULT_DIR/legacy-doc-again.body" || fail "the cached Pages Router document changed after a data request"
+cmp -s "$RESULT_DIR/legacy-data.body" "$RESULT_DIR/legacy-data-again.body" || fail "the cached Pages Router data payload changed on reuse"
+echo "PASS: document and data payload cached independently, one render each"
+
+echo
+echo "10/10 a Pages Router Set-Cookie is never shared either"
+# Same permissive route that just collapsed sixteen requests into one render.
+# `getServerSideProps` setting a cookie has to defeat it exactly as a Route
+# Handler does: the barrier is a property of the response, not of the API used
+# to produce it.
+LEGACY_SESSION_COUNT=12
+BEFORE=$(metric_sum legacy-pages)
+seq 1 "$LEGACY_SESSION_COUNT" | xargs -P "$LEGACY_SESSION_COUNT" -I{} \
+  curl -sS -D "$RESULT_DIR/legacy-session-{}.headers" -o /dev/null -w '%{http_code}\n' \
+  "$PROXY_URL/legacy/session" > "$RESULT_DIR/legacy-session-status"
+SERVED=$(grep -c '^200$' "$RESULT_DIR/legacy-session-status" || true)
+AFTER=$(metric_sum legacy-pages)
+ORIGIN_REQUESTS=$((AFTER - BEFORE))
+LEGACY_SESSIONS=$(sed -n 's/^[Ss]et-[Cc]ookie: legacy_session=\([^;]*\).*/\1/p' \
+  "$RESULT_DIR"/legacy-session-*.headers | tr -d '\r' | sort -u | wc -l | tr -d ' ')
+[ "$SERVED" -eq "$LEGACY_SESSION_COUNT" ] || fail "served $SERVED/$LEGACY_SESSION_COUNT Pages Router session requests"
+[ "$ORIGIN_REQUESTS" -eq "$LEGACY_SESSION_COUNT" ] || fail "$LEGACY_SESSION_COUNT cookie-setting requests caused $ORIGIN_REQUESTS origin requests"
+[ "$LEGACY_SESSIONS" -eq "$LEGACY_SESSION_COUNT" ] || fail "$LEGACY_SESSION_COUNT requests returned only $LEGACY_SESSIONS distinct sessions"
+echo "PASS: $LEGACY_SESSION_COUNT requests, $LEGACY_SESSION_COUNT renders, $LEGACY_SESSION_COUNT sessions"
 
 echo
 echo "PASS: real Next.js integration proof completed"

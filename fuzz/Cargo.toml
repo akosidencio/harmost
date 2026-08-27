@@ -1,0 +1,63 @@
+[package]
+name = "harmost-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+http = "1"
+serde-saphyr = "1"
+
+[dependencies.harmost]
+path = ".."
+features = ["fuzzing"]
+
+# Not a workspace member: cargo-fuzz builds it with its own sanitizer flags on
+# a nightly toolchain, and dragging that into `cargo build --workspace` would
+# make the ordinary build require nightly.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = true
+
+[[bin]]
+name = "cache_key"
+path = "fuzz_targets/cache_key.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cache_control"
+path = "fuzz_targets/cache_control.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "vary"
+path = "fuzz_targets/vary.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "query"
+path = "fuzz_targets/query.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cookies"
+path = "fuzz_targets/cookies.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false

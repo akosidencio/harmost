@@ -184,7 +184,9 @@ fn control_response(path: &str, stats: &Stats) -> Option<String> {
             // in_flight is deliberately not cleared: it is a live count, and
             // zeroing it while requests are in flight would make it drift
             // negative-by-saturation as they complete.
-            stats.peak.store(stats.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
+            stats
+                .peak
+                .store(stats.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
             stats.total.store(0, Ordering::SeqCst);
             "reset".to_string()
         }

@@ -120,6 +120,39 @@ routes:
     coalesce:
       enabled: true
 
+  # Pages Router. `/legacy/session` sets a cookie from `getServerSideProps`
+  # under exactly this permissive policy: the Set-Cookie barrier has to hold on
+  # the legacy code path too, not only on Route Handlers.
+  - id: legacy-pages
+    match: "/legacy/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 2s
+    coalesce:
+      enabled: true
+    concurrency:
+      max: 4
+      queue:
+        max: 50
+        timeout: 5s
+
+  # The Pages Router's JSON props payload for a client-side navigation. It is a
+  # separate URL from the document — unlike the App Router's RSC variant, which
+  # shares one — so the hazard is not key collision but classification: without
+  # a route of its own it falls to `private-default` and is never reused, which
+  # is safe but silently gives up the protection.
+  - id: legacy-data
+    match: "/_next/data/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 2s
+    coalesce:
+      enabled: true
+
   - id: private-session
     match: "/api/private-session"
     class: private_dynamic

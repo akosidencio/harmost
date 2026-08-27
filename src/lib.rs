@@ -26,3 +26,30 @@ pub mod upstream;
 
 pub use classifier::RequestClass;
 pub use config::Config;
+
+/// Entry points for the fuzz targets in `fuzz/`.
+///
+/// These are thin wrappers over internal parsers rather than a widening of the
+/// public API: the functions worth fuzzing — query canonicalisation, `Vary`
+/// evaluation, content-coding normalisation — are the ones a caller should
+/// never reach directly, because reaching them means bypassing the policy that
+/// decides whether they apply.
+///
+/// Enabled only by the `fuzzing` feature, which `fuzz/Cargo.toml` turns on.
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    use crate::classifier::RequestMetadata;
+    use crate::config::schema::QueryPolicy;
+
+    pub fn canonical_query(raw: &str, policy: Option<&QueryPolicy>) -> String {
+        crate::cache::key::canonical_query(raw, policy)
+    }
+
+    pub fn normalize_accept_encoding(req: &RequestMetadata<'_>) -> String {
+        crate::cache::key::normalize_accept_encoding(req)
+    }
+
+    pub fn unsupported_vary(vary: &str, key_headers: &[String]) -> Option<String> {
+        crate::cache::policy::unsupported_vary(vary, key_headers)
+    }
+}

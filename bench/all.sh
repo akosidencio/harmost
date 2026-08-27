@@ -43,6 +43,11 @@ if [ "${SKIP_DOCKER:-0}" = "1" ]; then
   echo "SKIPPED bench/nextjs.sh (SKIP_DOCKER=1)"
 elif docker info >/dev/null 2>&1; then
   run nextjs.sh
+  if [ "${SKIP_BROWSER:-0}" = "1" ]; then
+    echo "SKIPPED bench/nextjs-browser.sh (SKIP_BROWSER=1)"
+  else
+    run nextjs-browser.sh
+  fi
 else
   echo
   echo "SKIPPED bench/nextjs.sh — no Docker daemon reachable."

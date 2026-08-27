@@ -188,12 +188,14 @@ impl ProxyHttp for Harmost {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
         let req = session.req_header();
+        // Rendered, never dropped: a `Host` that `to_str` cannot read used to
+        // collapse to the empty string, putting every such request into one
+        // shared cache entry.
         let host = req
             .headers
             .get("host")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
+            .map(crate::classifier::header_text)
+            .unwrap_or_default();
         let path = req.uri.path().to_string();
         let query = req.uri.query().map(str::to_string);
         let method = req.method.clone();
@@ -302,12 +304,14 @@ impl ProxyHttp for Harmost {
 
     fn cache_key_callback(&self, session: &Session, ctx: &mut Ctx) -> Result<PingoraCacheKey> {
         let req = session.req_header();
+        // Rendered, never dropped: a `Host` that `to_str` cannot read used to
+        // collapse to the empty string, putting every such request into one
+        // shared cache entry.
         let host = req
             .headers
             .get("host")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
+            .map(crate::classifier::header_text)
+            .unwrap_or_default();
         let path = req.uri.path().to_string();
         let query = req.uri.query().map(str::to_string);
 
@@ -737,7 +741,7 @@ fn joined_header_values(
     let values = headers
         .get_all(name)
         .iter()
-        .filter_map(|value| value.to_str().ok())
+        .map(crate::classifier::header_text)
         .collect::<Vec<_>>();
     (!values.is_empty()).then(|| values.join(","))
 }

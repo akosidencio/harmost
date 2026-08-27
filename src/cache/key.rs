@@ -70,9 +70,19 @@ impl CacheKey {
             self.method.as_str(),
             self.path.as_str(),
             self.query.as_str(),
-            self.deployment.as_deref().unwrap_or(""),
         ] {
             push(part);
+        }
+        // Absence and emptiness are different states, and folding them
+        // together with `unwrap_or("")` made a deployment id of `""` render
+        // exactly like no deployment id at all. Found by the `cache_key` fuzz
+        // target.
+        match &self.deployment {
+            Some(id) => {
+                push("d");
+                push(id);
+            }
+            None => push("-"),
         }
         // The variant count is part of the encoding too: without it, one key
         // with variants [a] and another with [a, b] where b renders empty
@@ -142,16 +152,22 @@ fn normalize_host(host: &str, scheme: &str) -> String {
 ///
 /// Bounded to three values on purpose: keying on the raw header would mint a
 /// separate entry for every browser's exact ordering.
-fn normalize_accept_encoding(req: &RequestMetadata<'_>) -> String {
+pub(crate) fn normalize_accept_encoding(req: &RequestMetadata<'_>) -> String {
     // Preserve coding order and quality values. A compact br/gzip/identity
     // bucket is unsafe: origins may choose a different representation based on
     // weights, wildcard codings, or newer codings such as zstd.
-    let values = req
+    // Rendered rather than decoded: a header value `to_str` cannot read used to
+    // be dropped, which made the request identical to one that sent no
+    // `Accept-Encoding` at all and let it share that entry.
+    let joined = req
         .headers
         .get_all(http::header::ACCEPT_ENCODING)
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|raw| raw.split(','))
+        .map(crate::classifier::header_text)
+        .collect::<Vec<_>>()
+        .join(",");
+    let values = joined
+        .split(',')
         .map(|part| {
             part.split(';')
                 .map(|piece| piece.trim().to_ascii_lowercase().replace(' ', ""))
@@ -168,11 +184,14 @@ fn normalize_accept_encoding(req: &RequestMetadata<'_>) -> String {
 }
 
 fn header_values(req: &RequestMetadata<'_>, name: &str) -> Option<String> {
+    // Rendered rather than decoded. Dropping a value `to_str` could not read
+    // made the request indistinguishable from one that never sent the header,
+    // so two clients asking for different variants shared an entry.
     let values = req
         .headers
         .get_all(name)
         .iter()
-        .filter_map(|value| value.to_str().ok())
+        .map(crate::classifier::header_text)
         .collect::<Vec<_>>();
     (!values.is_empty()).then(|| values.join("\u{1d}"))
 }
@@ -184,7 +203,7 @@ fn header_values(req: &RequestMetadata<'_>, name: &str) -> Option<String> {
 /// parameter per request mints a unique key per request, and therefore a render
 /// per request. An `include` allowlist is the fix, and admission control is
 /// what bounds the damage until someone configures one.
-fn canonical_query(raw: &str, policy: Option<&QueryPolicy>) -> String {
+pub(crate) fn canonical_query(raw: &str, policy: Option<&QueryPolicy>) -> String {
     if raw.is_empty() {
         return String::new();
     }
@@ -300,6 +319,43 @@ mod tests {
         );
     }
 
+    /// Found alongside the `cookies` fuzz finding.
+    ///
+    /// `HeaderValue` accepts obs-text that `to_str` refuses, and the variant
+    /// values were collected with `.to_str().ok()` — so a header carrying one
+    /// such byte was dropped, making the request identical to one that never
+    /// sent the header, and to every other request whose value was equally
+    /// unreadable. Three clients asking for three different variants shared
+    /// one entry.
+    #[test]
+    fn variant_values_that_are_not_ascii_still_separate_entries() {
+        let mut absent = HeaderMap::new();
+        let _ = &mut absent;
+        let mut first = HeaderMap::new();
+        first.insert("x-variant", HeaderValue::from_bytes(b"\xd0\xa5").unwrap());
+        let mut second = HeaderMap::new();
+        second.insert("x-variant", HeaderValue::from_bytes(b"\xd0\xa6").unwrap());
+
+        let build = |headers: &HeaderMap| {
+            KeyBuilder {
+                scheme: "https",
+                query_policy: None,
+                variant_headers: &["x-variant".to_string()],
+                deployment: None,
+            }
+            .build(&RequestMetadata {
+                method: &Method::GET,
+                host: "shop.example.com",
+                path: "/p",
+                query: None,
+                headers,
+            })
+        };
+
+        assert_ne!(build(&first), build(&second));
+        assert_ne!(build(&first), build(&absent));
+    }
+
     #[test]
     fn brotli_and_gzip_clients_get_separate_entries() {
         let br = Ctx::new().with("accept-encoding", "gzip, deflate, br");
@@ -333,6 +389,18 @@ mod tests {
             key("/p", None, &zero_decimal, &[], None),
             key("/p", None, &accepts, &[], None)
         );
+    }
+
+    /// Found by the `cache_key` fuzz target. `unwrap_or("")` rendered "no
+    /// deployment id" and "a deployment id that is the empty string"
+    /// identically, so two structurally distinct keys shared one entry.
+    #[test]
+    fn an_empty_deployment_id_is_not_the_same_as_none() {
+        let c = Ctx::new();
+        let none = key("/p", None, &c, &[], None);
+        let empty = key("/p", None, &c, &[], Some(""));
+        assert_ne!(none, empty);
+        assert_ne!(none.canonical_string(), empty.canonical_string());
     }
 
     #[test]
@@ -483,6 +551,7 @@ mod proptests {
         prop::string::string_regex("[a-z0-9]{0,6}").unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)] // it mirrors the shape of a request
     fn key_from(
         scheme: &str,
         host: &str,
@@ -506,19 +575,6 @@ mod proptests {
             query,
             headers,
         })
-    }
-
-    fn plain(scheme: &str, host: &str, path: &str, query: Option<&str>) -> CacheKey {
-        key_from(
-            scheme,
-            host,
-            &Method::GET,
-            path,
-            query,
-            &HeaderMap::new(),
-            &[],
-            None,
-        )
     }
 
     /// Assemble a key from raw components, bypassing `KeyBuilder`.

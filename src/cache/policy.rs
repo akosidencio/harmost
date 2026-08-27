@@ -263,7 +263,7 @@ pub fn evaluate_response(
 }
 
 /// Returns the first `Vary` token the cache key cannot honour.
-fn unsupported_vary(vary: &str, key_headers: &[String]) -> Option<String> {
+pub(crate) fn unsupported_vary(vary: &str, key_headers: &[String]) -> Option<String> {
     for token in vary.split(',') {
         let token = token.trim().to_ascii_lowercase();
         if token.is_empty() {
@@ -518,5 +518,317 @@ mod tests {
             ),
             Disposition::Bypass(BypassReason::RouteDisabled)
         );
+    }
+}
+
+/// Property tests for the rules whose failure mode is a wrong response rather
+/// than a slow one.
+///
+/// The absolute barriers — `Set-Cookie`, an unsupported `Vary` — are stated in
+/// the documentation as holding for *every* configuration. That is a universal
+/// claim, and a universal claim is what a property test is for: an example
+/// test only ever shows it held for the configurations somebody thought of.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::config::schema::{RouteCache, Ttl};
+    use crate::config::units::Dur;
+    use proptest::prelude::*;
+
+    /// Header text drawn wide enough to include the separators and quoting a
+    /// `Cache-Control` parser has to survive: commas, equals, semicolons,
+    /// quotes and whitespace.
+    fn header_text() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                40 => prop::char::range('a', 'z'),
+                10 => prop::char::range('0', '9'),
+                10 => Just(','),
+                10 => Just('='),
+                6 => Just('"'),
+                6 => Just(' '),
+                6 => Just('-'),
+                6 => Just(';'),
+                6 => Just('*'),
+            ],
+            0..40,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn directive_list() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop::sample::select(vec![
+                "no-store",
+                "no-cache",
+                "private",
+                "public",
+                "max-age=60",
+                "s-maxage=30",
+                "stale-while-revalidate=10",
+                "stale-if-error=5",
+                "must-revalidate",
+                "immutable",
+            ]),
+            0..5,
+        )
+        .prop_map(|parts| parts.join(", "))
+    }
+
+    fn route() -> impl Strategy<Value = Option<RouteCache>> {
+        prop::option::of((any::<bool>(), prop::option::of(1u64..600)).prop_map(
+            |(override_origin, ttl_secs)| RouteCache {
+                enabled: None,
+                ttl: ttl_secs.map(|secs| Ttl {
+                    max: Some(Dur(Duration::from_secs(secs))),
+                }),
+                stale_while_revalidate: None,
+                stale_if_error: None,
+                query: None,
+                vary: None,
+                override_origin,
+            },
+        ))
+    }
+
+    proptest! {
+        /// The rule with no exceptions. A response that sets a cookie is
+        /// addressed to one client; storing it, or handing it to the waiters
+        /// already attached to this flight, distributes somebody's session to
+        /// strangers. No route configuration and no override reaches past it.
+        #[test]
+        fn set_cookie_is_never_shareable(
+            status in 100u16..600,
+            cc in prop::option::of(directive_list()),
+            vary in prop::option::of(header_text()),
+            route in route(),
+            key_headers in prop::collection::vec(prop::string::string_regex("x-[a-z]{1,5}").unwrap(), 0..4),
+            coalesce_only in any::<bool>(),
+            coalesce_override in any::<bool>(),
+        ) {
+            let res = ResponseMetadata {
+                status,
+                cache_control: cc.as_deref(),
+                set_cookie: true,
+                vary: vary.as_deref(),
+            };
+            let verdict = evaluate_response(
+                &res, route.as_ref(), &key_headers, coalesce_only, coalesce_override,
+            );
+            prop_assert_eq!(verdict, Shareability::NotShareable(BypassReason::SetCookie));
+        }
+
+        /// The second absolute rule. If the origin says it varies on something
+        /// the key does not carry, a stored entry would be served to requests
+        /// that should have received a different body.
+        #[test]
+        fn vary_outside_the_key_is_never_shareable(
+            status in prop::sample::select(CACHEABLE_STATUSES.to_vec()),
+            cc in prop::option::of(directive_list()),
+            route in route(),
+            coalesce_only in any::<bool>(),
+            coalesce_override in any::<bool>(),
+            unknown in prop::string::string_regex("x-unkeyed-[a-z]{1,5}").unwrap(),
+        ) {
+            let res = ResponseMetadata {
+                status,
+                cache_control: cc.as_deref(),
+                set_cookie: false,
+                vary: Some(&unknown),
+            };
+            let verdict = evaluate_response(
+                &res, route.as_ref(), &["accept-language".to_string()], coalesce_only, coalesce_override,
+            );
+            prop_assert_eq!(
+                verdict,
+                Shareability::NotShareable(BypassReason::UnsupportedVary(unknown.to_ascii_lowercase()))
+            );
+        }
+
+        /// `Vary: *` means "no two requests are equivalent". There is no key
+        /// that can honour it, so no configuration may claim otherwise.
+        #[test]
+        fn vary_star_is_never_shareable(
+            padding in prop::collection::vec(prop::sample::select(vec!["accept-encoding", "x-a", ""]), 0..3),
+            route in route(),
+            key_headers in prop::collection::vec(prop::string::string_regex("x-[a-z]{1,5}").unwrap(), 0..4),
+        ) {
+            let mut tokens = padding;
+            tokens.push("*");
+            let vary = tokens.join(", ");
+            let res = ResponseMetadata {
+                status: 200,
+                cache_control: Some("public, max-age=60"),
+                set_cookie: false,
+                vary: Some(&vary),
+            };
+            let verdict = evaluate_response(&res, route.as_ref(), &key_headers, false, false);
+            prop_assert!(matches!(
+                verdict,
+                Shareability::NotShareable(BypassReason::UnsupportedVary(_))
+            ));
+        }
+
+        /// A route's `ttl.max` is a ceiling, never a floor. Without an
+        /// override it may only shrink what the origin asked for; with one it
+        /// is the whole answer. Either way the stored entry never outlives it.
+        #[test]
+        fn route_ttl_max_is_never_exceeded(
+            origin_secs in 0u64..3600,
+            route_secs in 1u64..600,
+            override_origin in any::<bool>(),
+        ) {
+            let cc = format!("public, max-age={origin_secs}");
+            let route = RouteCache {
+                enabled: None,
+                ttl: Some(Ttl { max: Some(Dur(Duration::from_secs(route_secs))) }),
+                stale_while_revalidate: None,
+                stale_if_error: None,
+                query: None,
+                vary: None,
+                override_origin,
+            };
+            let res = ResponseMetadata {
+                status: 200,
+                cache_control: Some(&cc),
+                set_cookie: false,
+                vary: None,
+            };
+            if let Shareability::Shareable { ttl, .. } =
+                evaluate_response(&res, Some(&route), &[], false, false)
+            {
+                prop_assert!(ttl <= Duration::from_secs(route_secs));
+            }
+        }
+
+        /// Without an override, the origin's ceiling is also binding. A route
+        /// that could raise it would let a policy file overrule an origin that
+        /// said the response goes stale in ten seconds.
+        #[test]
+        fn origin_ttl_binds_unless_overridden(
+            origin_secs in 1u64..3600,
+            route_secs in prop::option::of(1u64..3600),
+        ) {
+            let cc = format!("public, max-age={origin_secs}");
+            let route = route_secs.map(|secs| RouteCache {
+                enabled: None,
+                ttl: Some(Ttl { max: Some(Dur(Duration::from_secs(secs))) }),
+                stale_while_revalidate: None,
+                stale_if_error: None,
+                query: None,
+                vary: None,
+                override_origin: false,
+            });
+            let res = ResponseMetadata {
+                status: 200,
+                cache_control: Some(&cc),
+                set_cookie: false,
+                vary: None,
+            };
+            if let Shareability::Shareable { ttl, .. } =
+                evaluate_response(&res, route.as_ref(), &[], false, false)
+            {
+                prop_assert!(ttl <= Duration::from_secs(origin_secs));
+            }
+        }
+
+        /// A status outside the cacheable set is never stored, whatever the
+        /// route says.
+        #[test]
+        fn uncacheable_statuses_are_never_stored(
+            status in 100u16..600,
+            route in route(),
+            cc in prop::option::of(directive_list()),
+        ) {
+            prop_assume!(!CACHEABLE_STATUSES.contains(&status));
+            let res = ResponseMetadata {
+                status,
+                cache_control: cc.as_deref(),
+                set_cookie: false,
+                vary: None,
+            };
+            let verdict = evaluate_response(&res, route.as_ref(), &[], false, false);
+            prop_assert_eq!(verdict, Shareability::NotShareable(BypassReason::Status(status)));
+        }
+
+        /// `no-store` is the origin's clearest possible refusal. Only the
+        /// fenced per-route override may outrank it, and validation refuses to
+        /// pair that override with a private class or a cookie-bearing route.
+        #[test]
+        fn no_store_is_honoured_unless_explicitly_overridden(
+            extra in directive_list(),
+            status in prop::sample::select(CACHEABLE_STATUSES.to_vec()),
+        ) {
+            let cc = format!("no-store, {extra}");
+            let res = ResponseMetadata {
+                status,
+                cache_control: Some(&cc),
+                set_cookie: false,
+                vary: None,
+            };
+            prop_assert_eq!(
+                evaluate_response(&res, None, &[], false, false),
+                Shareability::NotShareable(BypassReason::NoStore)
+            );
+        }
+
+        /// Parsing must be total. `Cache-Control` is attacker-influenced on the
+        /// way back from an origin that proxies third-party content, and a
+        /// panic in the response path takes the proxy down.
+        #[test]
+        fn cache_control_parsing_never_panics(raw in header_text()) {
+            let cc = CacheControl::parse(&raw);
+            let _ = cc.shared_ttl();
+        }
+
+        /// Directives Harmost does not implement must be inert, not
+        /// accidentally meaningful. Appending one may never change a decision.
+        #[test]
+        fn unknown_directives_do_not_change_the_parse(
+            known in directive_list(),
+            unknown in prop::string::string_regex("[a-z]{3,10}(=[0-9]{1,3})?").unwrap(),
+        ) {
+            let base = CacheControl::parse(&known);
+            prop_assume!(!known.is_empty());
+            let name = unknown.split('=').next().unwrap_or("");
+            prop_assume!(!matches!(
+                name,
+                "no-store" | "no-cache" | "private" | "public"
+                    | "max-age" | "s-maxage" | "stale-while-revalidate" | "stale-if-error"
+            ));
+            prop_assert_eq!(CacheControl::parse(&format!("{known}, {unknown}")), base);
+        }
+
+        /// A shared cache honours `s-maxage` ahead of `max-age`; that is what
+        /// makes it a shared cache rather than a browser.
+        #[test]
+        fn s_maxage_outranks_max_age(shared in 0u64..3600, private_age in 0u64..3600) {
+            let cc = CacheControl::parse(&format!("max-age={private_age}, s-maxage={shared}"));
+            prop_assert_eq!(cc.shared_ttl(), Some(Duration::from_secs(shared)));
+        }
+
+        /// A request carrying cookies is personalised until a route says
+        /// otherwise, whatever else is true about it.
+        #[test]
+        fn cookie_bearing_requests_bypass_unless_a_route_overrides(
+            cookie in prop::string::string_regex("[a-z_]{1,8}=[a-zA-Z0-9]{0,10}").unwrap(),
+            class in prop::sample::select(vec![
+                RequestClass::Static,
+                RequestClass::PublicDocument,
+                RequestClass::PublicDynamic,
+            ]),
+        ) {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::COOKIE, http::HeaderValue::from_str(&cookie).unwrap());
+            let req = RequestMetadata {
+                method: &http::Method::GET,
+                host: "shop.example.com",
+                path: "/p",
+                query: None,
+                headers: &headers,
+            };
+            let disposition = evaluate_request(&req, class, None, None, false, true, true);
+            prop_assert_eq!(disposition, Disposition::Bypass(BypassReason::Cookie));
+        }
     }
 }
