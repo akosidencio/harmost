@@ -1,0 +1,6 @@
+# `clippy::unwrap_used` and `clippy::expect_used` are denied for the crate (see
+# `[lints]` in Cargo.toml). Test code is exempt: an unwrap in a test *is* the
+# assertion, and rewriting 160-odd of them into `match` blocks would make the
+# tests harder to read for no gain in production safety.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

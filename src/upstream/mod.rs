@@ -3,6 +3,7 @@
 pub mod health;
 
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -92,22 +93,29 @@ impl UpstreamPool {
         // Nothing healthy: serve anyway rather than converting a degraded
         // origin into a guaranteed outage.
         let pool: &[&Backend] = if healthy.is_empty() {
-            return self
-                .backends
-                .get(self.next_index(path, self.backends.len()));
+            let len = NonZeroUsize::new(self.backends.len())?;
+            return self.backends.get(self.next_index(path, len));
         } else {
             &healthy
         };
-        pool.get(self.next_index(path, pool.len())).copied()
+        let len = NonZeroUsize::new(pool.len())?;
+        pool.get(self.next_index(path, len)).copied()
     }
 
-    fn next_index(&self, path: &str, len: usize) -> usize {
+    /// `len` is a `NonZeroUsize` because both arms divide by it. The emptiness
+    /// check lives in `select` above, and taking the precondition in the type
+    /// keeps it from drifting away from the division that depends on it.
+    fn next_index(&self, path: &str, len: NonZeroUsize) -> usize {
         match self.strategy {
             LoadBalancing::RoundRobin => self.cursor.fetch_add(1, Ordering::Relaxed) % len,
             // Sending a given path to a consistent backend also warms the
             // origin's own render cache and JIT state, which is free origin
             // work avoided on top of anything Harmost does.
-            LoadBalancing::HashByPath => (fnv1a(path.as_bytes()) % len as u64) as usize,
+            LoadBalancing::HashByPath => {
+                // The remainder is smaller than `len`, so it always fits back
+                // into a `usize`; `unwrap_or` is unreachable, not a fallback.
+                usize::try_from(fnv1a(path.as_bytes()) % len.get() as u64).unwrap_or(0)
+            }
         }
     }
 }

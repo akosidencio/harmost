@@ -51,9 +51,33 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked
 
+      # An optional feature that is never compiled in CI rots. This also covers
+      # the validation rules that branch on `cfg!(feature = "tls")`, which have
+      # opposite expected outcomes in the two builds.
+      - name: Clippy and test with TLS
+        run: |
+          cargo clippy --workspace --all-targets --locked --features tls -- -D warnings
+          cargo test --workspace --lib --locked --features tls
+
       # --all-targets silently skips doc tests, so run them separately.
       - name: Doc tests
         run: cargo test --workspace --doc --locked
+
+  # A dependency advisory is a finding about code this binary runs at full
+  # privilege, so it gates like any other. Ignores live in `.cargo/audit.toml`
+  # and each one carries a reason and a way out.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit
 
   # macOS is a supported development platform, not the reference one. It builds
   # and runs the unit tests so a platform-specific compile error or a test that
@@ -84,7 +108,9 @@ jobs:
   benchmarks:
     name: end-to-end benchmarks (linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Longer than the unit-test job: bench/tls.sh compiles a second binary with
+    # the TLS stack, and bench/adversarial.sh runs for a fixed wall-clock span.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -122,6 +148,13 @@ jobs:
           COALESCE_CONCURRENCY: "30"
           STREAM_CONCURRENCY: "16"
           SAFETY_CONCURRENCY: "20"
+          # The spool benchmark asserts on its own control case, so its
+          # parameters have to keep a two-core runner slow enough to reproduce
+          # the problem being fixed. It fails loudly rather than passing
+          # vacuously if they do not.
+          SPOOL_MIB: "8"
+          SPOOL_RATE: "24k"
+          ADVERSARIAL_SECONDS: "20"
         run: ./bench/all.sh
 
       - name: Publish results with the parameters that produced them
@@ -170,6 +203,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang cmake libssl-dev pkg-config
 
+      # `rust-toolchain.toml` pins the repo to a stable release, and that file
+      # wins over whatever rustup's default is — so every cargo call below is
+      # explicitly `+nightly`. cargo-fuzz needs it for `-Zsanitizer=address`.
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
@@ -181,13 +217,13 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Build every target
-        run: cargo fuzz build
+        run: cargo +nightly fuzz build
 
       - name: Run each target briefly
         run: |
-          for target in $(cargo fuzz list); do
+          for target in $(cargo +nightly fuzz list); do
             echo "=== $target ==="
-            cargo fuzz run "$target" -- -max_total_time=60 -print_final_stats=1
+            cargo +nightly fuzz run "$target" -- -max_total_time=60 -print_final_stats=1
           done
 
       - name: Publish any crash artifacts

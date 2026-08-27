@@ -1,0 +1,6 @@
+# Pinned so CI, developer machines and release builds agree. `rust-version` in
+# Cargo.toml states the minimum this crate supports; this states what actually
+# builds it.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

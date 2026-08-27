@@ -1,0 +1,67 @@
+# A configuration under sustained hostile traffic.
+#
+# Every reuse mechanism is switched on, because the point is to attack the
+# governor rather than to watch it pass traffic through. The budgets are small
+# so that a leak shows up in seconds rather than hours.
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+  trusted_proxies:
+    from: []
+origin:
+  upstreams: ["127.0.0.1:@ORIGIN@"]
+  concurrency:
+    max: @CEILING@
+    queue:
+      max: 200
+      timeout: 2s
+cache:
+  enabled: true
+  max_memory: @CACHE_MEMORY@
+  max_body_size: 2MiB
+coalesce:
+  enabled: true
+spool:
+  enabled: true
+  max_body: 256KiB
+  max_memory: 8MiB
+upgrade:
+  enabled: true
+  max_concurrent: 4
+timeouts:
+  downstream_write: 3s
+telemetry:
+  prometheus:
+    listen: "127.0.0.1:@METRICS@"
+# First match wins, so the routes that must never be shared are listed before
+# the catch-all that may be.
+routes:
+  # The route that must never be shared, sitting next to the one that may.
+  - id: private
+    match: "/private/**"
+    class: private_dynamic
+    cache:
+      enabled: false
+    coalesce:
+      enabled: false
+
+  - id: sockets
+    match: "/ws/**"
+
+  # The route an attacker wants to poison: public, cached, override in play.
+  # The catch-all, so that the oversized-body and malformed-body paths are
+  # inside the cache's budget rather than outside its policy.
+  - id: pages
+    match: "/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 3s
+      query:
+        mode: include
+        keys: ["q"]
+    coalesce:
+      enabled: true
+    spool:
+      enabled: true

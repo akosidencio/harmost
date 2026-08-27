@@ -26,6 +26,11 @@ pub enum RequestClass {
     /// work permit, because holding one for the life of the connection would
     /// starve every other route.
     Streaming,
+    /// A protocol upgrade — WebSocket, and anything else that turns one
+    /// request into a tunnel. Never cached, never coalesced, and bounded by
+    /// its own ceiling rather than the render permit, for the same reason as
+    /// `Streaming`: the connection outlives any render it could displace.
+    Upgrade,
     /// Could not be classified. Passes through untouched.
     Unknown,
 }
@@ -52,7 +57,10 @@ impl RequestClass {
     /// Streaming is exempt by design: an SSE connection held for an hour would
     /// otherwise occupy a slot sized for a 200ms render.
     pub fn consumes_origin_permit(self) -> bool {
-        !matches!(self, RequestClass::Static | RequestClass::Streaming)
+        !matches!(
+            self,
+            RequestClass::Static | RequestClass::Streaming | RequestClass::Upgrade
+        )
     }
 
     pub fn as_str(self) -> &'static str {
@@ -63,6 +71,7 @@ impl RequestClass {
             RequestClass::PrivateDynamic => "private_dynamic",
             RequestClass::Mutation => "mutation",
             RequestClass::Streaming => "streaming",
+            RequestClass::Upgrade => "upgrade",
             RequestClass::Unknown => "unknown",
         }
     }
@@ -142,6 +151,33 @@ impl<'a> RequestMetadata<'a> {
     pub fn is_safe_method(&self) -> bool {
         self.method == Method::GET || self.method == Method::HEAD
     }
+
+    /// Is this request asking to leave HTTP behind?
+    ///
+    /// Presence of the `Upgrade` header is the signal, deliberately without
+    /// also requiring `Connection: upgrade` and without reading either value.
+    /// The classification this drives only ever *removes* permissions —
+    /// nothing here is cacheable or coalescible — so a false positive costs a
+    /// cache entry and a false negative would hand a tunnel to the microcache.
+    /// HTTP/2 has no `Upgrade` mechanism at all, so an h2 request never
+    /// reaches this by accident.
+    pub fn is_upgrade(&self) -> bool {
+        self.headers.contains_key(header::UPGRADE)
+    }
+
+    // `HEAD`, `Range` and the `If-*` preconditions deliberately have no
+    // predicate here, because Harmost does not act on them itself.
+    // `pingora_cache::filters::upstream::request_filter` rewrites a
+    // cache-filling `HEAD` into a `GET` and strips `Range` and every `If-*`
+    // header from the upstream request, so the origin returns the whole `200`
+    // that a cache entry is made of, and the `206`/`304`/header-only response
+    // is derived downstream from the stored entry. Re-deriving any of that
+    // here would be a second implementation of the same rule, and the failure
+    // mode of two implementations is that they disagree.
+    //
+    // What *is* worth checking is that the resulting behaviour is right, which
+    // `bench/protocol.sh` does — from the outside, against the origin's own
+    // render counter.
 }
 
 /// What an adapter concluded about a request.

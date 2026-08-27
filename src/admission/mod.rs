@@ -11,8 +11,9 @@ pub mod limiter;
 
 use crate::classifier::RequestClass;
 use limiter::{Limiter, Permit, ShedReason};
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -50,6 +51,10 @@ pub struct AdmissionController {
     /// Keyed by route id and deliberately outliving any one config
     /// generation — a limiter carries in-flight state that a policy swap
     /// must not discard.
+    ///
+    /// `parking_lot` rather than `std`: this lock is taken on the request
+    /// path, and a poisoned `std` lock would leave every later request with
+    /// nothing to do but panic again.
     routes: RwLock<HashMap<String, Arc<Limiter>>>,
 }
 
@@ -74,10 +79,10 @@ impl AdmissionController {
         queue_max: usize,
         queue_timeout: Duration,
     ) -> Arc<Limiter> {
-        if let Some(l) = self.routes.read().unwrap().get(id) {
+        if let Some(l) = self.routes.read().get(id) {
             return l.clone();
         }
-        let mut w = self.routes.write().unwrap();
+        let mut w = self.routes.write();
         w.entry(id.to_string())
             .or_insert_with(|| Limiter::new(id, max, queue_max, queue_timeout))
             .clone()
@@ -98,7 +103,7 @@ impl AdmissionController {
         self.global.resize(global_max);
         self.global
             .set_queue(global_queue_max, global_queue_timeout);
-        let mut w = self.routes.write().unwrap();
+        let mut w = self.routes.write();
         for (id, max, q_max, q_timeout) in routes {
             match w.get(id) {
                 Some(existing) => {
@@ -273,8 +278,8 @@ mod tests {
             Duration::ZERO,
             &[("new".into(), 5, 0, Duration::ZERO)],
         );
-        assert!(c.routes.read().unwrap().get("old").is_none());
-        assert!(c.routes.read().unwrap().get("new").is_some());
+        assert!(c.routes.read().get("old").is_none());
+        assert!(c.routes.read().get("new").is_some());
     }
 
     #[tokio::test]

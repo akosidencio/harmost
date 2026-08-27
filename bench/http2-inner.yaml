@@ -1,0 +1,19 @@
+# The inner proxy of the HTTP/2 chain: speaks h2c downstream, HTTP/1.1 to the
+# fixture origin. It exists so the outer proxy has an h2 origin to talk to
+# without adding a second server implementation to the repository.
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+  h2c: true
+origin:
+  upstreams: ["127.0.0.1:@ORIGIN@"]
+  http_version: http1
+  concurrency:
+    max: 50
+cache:
+  enabled: false
+debug_headers: true
+routes:
+  - id: pages
+    match: "/**"
+    class: public_ssr

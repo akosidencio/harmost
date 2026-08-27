@@ -11,9 +11,20 @@
 //! Route ids come from the config file, so their cardinality is bounded by
 //! something a person wrote.
 
+// Every `expect` below is a `register_*!` inside a `LazyLock`. A failure means
+// a duplicate metric name or a malformed label set — a mistake in this file,
+// caught the first time the binary touches the metric, and with no runtime
+// recovery worth writing. `expect` rather than `allow`: if these ever stop
+// being the only panicking accessors here, the attribute itself goes stale
+// and says so.
+#![expect(
+    clippy::expect_used,
+    reason = "metric registration failure is a bug in this file, not a runtime condition"
+)]
+
 use prometheus::{
-    HistogramVec, IntCounterVec, IntGaugeVec, register_histogram_vec, register_int_counter_vec,
-    register_int_gauge_vec,
+    HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, register_histogram_vec,
+    register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
 };
 use std::sync::LazyLock;
 
@@ -122,6 +133,56 @@ pub static IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric registration")
 });
 
+pub static SPOOL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "harmost_spool_total",
+        "Responses that were spooled, by route and outcome",
+        &["route", "reason"]
+    )
+    .expect("metric registration")
+});
+
+pub static SPOOL_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_spool_bytes",
+        "Bytes currently held across every in-flight response spool"
+    )
+    .expect("metric registration")
+});
+
+pub static CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_cache_bytes",
+        "Bytes held by the response cache, including fills in progress"
+    )
+    .expect("metric registration")
+});
+
+pub static CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_cache_entries",
+        "Completed entries in the response cache"
+    )
+    .expect("metric registration")
+});
+
+pub static UPGRADES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "harmost_upgrade_total",
+        "Protocol upgrade requests, by route and decision",
+        &["route", "decision"]
+    )
+    .expect("metric registration")
+});
+
+pub static UPGRADES_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_upgrade_active",
+        "Upgraded connections currently held open"
+    )
+    .expect("metric registration")
+});
+
 /// Touch every metric family so a fresh scrape shows zeros rather than absent
 /// series. A dashboard that renders "no data" during an incident is worse than
 /// one that renders zero.
@@ -136,6 +197,12 @@ pub fn preregister() {
     LazyLock::force(&QUEUE_DEPTH);
     LazyLock::force(&LIMIT);
     LazyLock::force(&IN_FLIGHT);
+    LazyLock::force(&SPOOL);
+    LazyLock::force(&SPOOL_BYTES);
+    LazyLock::force(&CACHE_BYTES);
+    LazyLock::force(&CACHE_ENTRIES);
+    LazyLock::force(&UPGRADES);
+    LazyLock::force(&UPGRADES_ACTIVE);
 }
 
 #[cfg(test)]

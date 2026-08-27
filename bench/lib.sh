@@ -70,9 +70,13 @@ bench_cleanup() {
 
 # Build the workspace once, from the repository root, before anything is
 # spawned. A benchmark that races the compiler measures the compiler.
+# `BENCH_FEATURES` is for the scripts that need an optional feature compiled in
+# — `tls` today. It is a parameter rather than a default because the TLS stack
+# is a two-minute compile that every other benchmark would pay for.
 bench_build() {
   local flags=""
   if [ "${BENCH_PROFILE:-debug}" = "release" ]; then flags="--release"; fi
+  if [ -n "${BENCH_FEATURES:-}" ]; then flags="$flags --features $BENCH_FEATURES"; fi
   cargo build --workspace $flags -q || bench_fail "workspace build failed"
 }
 

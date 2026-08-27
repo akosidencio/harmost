@@ -63,7 +63,20 @@ impl FrameworkAdapter for NextJs {
     }
 
     fn classify_request(&self, req: &RequestMetadata<'_>) -> RequestHints {
-        // Draft mode outranks everything, including a route that declares
+        // An upgrade outranks even draft mode, because it is not a question
+        // about *this* framework at all: the request is asking to stop
+        // speaking HTTP. Every branch below assumes a request/response
+        // exchange, and `next dev`'s hot-reload socket is exactly the traffic
+        // that would otherwise be classified by path and handed to the cache.
+        if req.is_upgrade() {
+            return RequestHints {
+                class: Some(RequestClass::Upgrade),
+                force_bypass: Some("protocol_upgrade"),
+                ..Default::default()
+            };
+        }
+
+        // Draft mode outranks everything else, including a route that declares
         // itself public: the body contains unpublished content.
         if Self::in_draft_mode(req) {
             return RequestHints {

@@ -35,9 +35,10 @@ that Pingora has served more than 40 million Internet requests per second for
 years. The parts of a reverse proxy that are
 unglamorous and easy to get subtly wrong — connection pooling, HTTP/1 and
 HTTP/2 handling, graceful restarts, timeouts, the cache lock — are inherited
-from that codebase. Harmost currently exercises only part of that surface; see
-[Roadmap](#roadmap). What Harmost adds on top is the governor: classification,
-cache-key and shareability rules, and bounded origin admission.
+from that codebase, and Harmost now exercises that surface end to end: HTTP/1.1
+and HTTP/2 in both directions, TLS in both directions, `Upgrade` tunnelling,
+`Range` and conditional requests. What Harmost adds on top is the governor:
+classification, cache-key and shareability rules, and bounded origin admission.
 
 > A *harmost* (ἁρμοστής, from ἁρμόζω, "to fit, to keep in proper adjustment") was
 > an official posted to hold a system in correct adjustment.
@@ -45,8 +46,12 @@ cache-key and shareability rules, and bounded origin admission.
 ## Project maturity and expectations
 
 **Harmost has not been run in production, by anyone, ever.** It has no
-production users, no soak testing, no adversarial traffic history, and no
-third-party security review.
+production users, no soak testing and no third-party security review. There is
+now a [threat model](./docs/THREAT-MODEL.md) and a
+[twenty-second adversarial suite](./bench/adversarial.sh) in CI, which is a
+smoke test rather than a campaign — and the threat model is the author's own
+analysis, which is exactly the thing a threat model is least able to check about
+itself.
 
 Everything described below as a benefit is a **design goal supported by local
 tests**, not an outcome observed under real traffic. The focused benchmarks use
@@ -84,6 +89,7 @@ so behind something you can fail back to, and read
 - [Request coalescing and microcache architecture](#request-coalescing-and-microcache-architecture)
 - [Next.js caching and cache-key design](#nextjs-caching-and-cache-key-design)
 - [Configuration](#configuration)
+- [Security](#security)
 - [License](#license)
 
 ## The problem
@@ -468,12 +474,26 @@ testing and as a base for deployment work.
 docker pull ghcr.io/akosidencio/harmost:<version>
 ```
 
+The published image is built **with** `--features tls`, because nobody can
+recompile a container to turn a feature on.
+
 To build from source:
 
 ```bash
 git clone https://github.com/akosidencio/harmost.git
 cd harmost
 cargo build --release
+
+# Add native TLS termination and origin TLS. rustls, so this needs no cmake,
+# no Go and no system OpenSSL headers — it just costs about two minutes of
+# compile time, which is why it is not the default.
+cargo build --release --features tls
+```
+
+The container image takes the same choice as a build argument:
+
+```bash
+docker build --build-arg FEATURES=tls -t harmost:tls .
 ```
 
 The binary lands at `target/release/harmost`.
@@ -492,10 +512,17 @@ for a graceful shutdown. Harmost does not yet expose Pingora's complete
 zero-downtime upgrade workflow, so do not treat `SIGQUIT` alone as an upgrade
 procedure.
 
-The current listener and upstream connections are cleartext HTTP. Terminate TLS
-at a load balancer or ingress in front of Harmost and keep the Harmost-to-origin
-network private. Native downstream/upstream TLS and trusted-proxy handling are
-roadmap items.
+**Listeners are cleartext unless you build with `--features tls` and configure
+`server.tls`.** A binary built without the feature *rejects* a config containing
+`server.tls` or `origin.tls` rather than starting with a dead port.
+
+The recommended topology is still to terminate TLS at a load balancer or
+ingress in front of Harmost and keep the Harmost-to-origin network private —
+that edge is also your fail-back path. If you do that, set
+[`server.trusted_proxies`](#trusted-proxies): without it every forwarded header
+is ignored, so the origin sees your load balancer as the client and
+`X-Forwarded-Proto: http` on an HTTPS site. Ignoring them is the safe default
+and the wrong configuration.
 
 ## Using Harmost with Next.js
 
@@ -788,9 +815,22 @@ healthy, on the grounds that refusing to pick turns a degraded origin into a
 guaranteed outage — so a misconfigured probe degrades quietly rather than
 loudly, which is exactly how it goes unnoticed.
 
-**Do not put Harmost in front of `next dev`.** `Upgrade`/WebSocket handling is
-not implemented, so hot module reload will not work. Use it in front of
-`next start`.
+**`Upgrade`/WebSocket traffic is refused unless you enable it.** Hot module
+reload in `next dev`, and any WebSocket route in production, needs:
+
+```yaml
+upgrade:
+  enabled: true
+  max_concurrent: 100
+```
+
+A handshake arriving while this is off is answered `501 Not Implemented` — not
+the overload status, because nothing is overloaded and a retry will never
+succeed. When it is on, upgraded connections take their own ceiling and never a
+render permit: a socket is held for minutes and a render for milliseconds, so
+letting them share a budget means a handful of sockets can starve every page.
+They are also never cached and never coalesced, whatever the route says.
+See [`bench/websocket.sh`](./bench/websocket.sh).
 
 ### Verifying it is doing anything
 
@@ -828,13 +868,22 @@ not completed production hardening or operational validation.
 | Stale-while-revalidate, stale-if-error | done |
 | Real Next.js fixture (App Router + Pages Router) | done; local Docker integration tested |
 | Browser-driven prefetch and Server Action checks | done (Chromium, [`bench/nextjs-browser.sh`](./bench/nextjs-browser.sh)) |
-| Property tests and fuzz targets | done ([`fuzz/`](./fuzz)); run in CI |
+| Property tests and fuzz targets | done ([`fuzz/`](./fuzz)); 7 targets run in CI |
+| HTTP/2 downstream (h2c and ALPN) and upstream | done, tested ([`bench/http2.sh`](./bench/http2.sh)) |
+| `HEAD`, `Range`, conditional requests, disconnects, malformed bodies | done, tested ([`bench/protocol.sh`](./bench/protocol.sh)) |
+| `Upgrade`/WebSocket proxying, bounded separately from renders | done, tested, off by default ([`bench/websocket.sh`](./bench/websocket.sh)) |
+| Native TLS, downstream and upstream (`--features tls`) | done, tested ([`bench/tls.sh`](./bench/tls.sh)) |
+| Trusted proxies, forwarded scheme and client IP | done, tested ([`bench/forwarded.sh`](./bench/forwarded.sh)) |
+| Bounded response spool | done, tested ([`bench/spool.sh`](./bench/spool.sh)) |
+| Threat model | [written](./docs/THREAT-MODEL.md); **not independently reviewed** |
+| Independent review of cache keys and shareability | **not obtained**; brief prepared at [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) |
+| Sustained adversarial testing | 20s in CI ([`bench/adversarial.sh`](./bench/adversarial.sh)); a smoke test, not a campaign |
 | Circuit breaking, least-loaded balancing | not started ([roadmap](#roadmap)) |
 | Cache purge API, OpenTelemetry | not started ([roadmap](#roadmap)) |
 
 The security- and correctness-sensitive parts — cache-key construction, response
 shareability, and bounded admission — remain isolated as testable logic beneath
-the Pingora proxy layer. The full workspace test suite (167 tests, including
+the Pingora proxy layer. The full workspace test suite (216 tests, including
 property tests over generated inputs) runs without external network services.
 
 "done, tested" means unit-tested and, where a `bench/` script exists, verified
@@ -876,7 +925,8 @@ evidence and safety work before them.
   and the machine that produced them.
 - **Property tests and fuzz targets.** Proptest covers cache-key
   canonicalisation, `Cache-Control`, `Vary`, cookies and malformed HTTP
-  metadata; six [fuzz targets](./fuzz/fuzz_targets) run in CI.
+  metadata; six [fuzz targets](./fuzz/fuzz_targets) ran in CI at the time (a
+  seventh, covering forwarded-header resolution, arrived with phase 1).
 
 That last item found two real bugs, which is the point of the phase:
 
@@ -899,18 +949,83 @@ separator-delimited, so its injectivity is a property of the function rather
 than of `http`'s input validation — asserted by a property test that fails
 against the old encoding.
 
-### 1. Close protocol and security gaps
+### 1. Close protocol and security gaps — done, with one item outstanding
 
-- Exercise downstream and upstream HTTP/2 end to end, then add explicit tests
-  for `HEAD`, `Range`, conditional requests, disconnects and malformed bodies.
-- Support `Upgrade`/WebSocket traffic without weakening admission or cache
-  rules.
-- Add native downstream and upstream TLS, configurable trusted proxies, and
-  correct forwarded scheme/client-IP handling.
-- Write a threat model, run sustained adversarial tests, and obtain an
-  independent review of cache keys and response shareability.
-- Add a bounded response spool so a slow reader cannot retain a render permit
-  after the origin has actually finished.
+- **HTTP/2, downstream and upstream.** `server.h2c` accepts cleartext HTTP/2 on
+  the ordinary listener (Pingora peeks for the preface, so HTTP/1.1 clients are
+  unaffected); `server.tls.h2` offers `h2` over ALPN; `origin.http_version`
+  chooses what Harmost speaks to the origin.
+  [`bench/http2.sh`](./bench/http2.sh) exercises both ends by chaining two
+  Harmost processes, and checks that the governor's own rules survive the
+  protocol change rather than only that bytes move.
+- **`HEAD`, `Range`, conditional requests, disconnects, malformed bodies.**
+  Fourteen assertions in [`bench/protocol.sh`](./bench/protocol.sh), each
+  checking the *later, ordinary* request rather than the odd one: that a `GET`
+  after a `HEAD` still has a body, that a `206` was not stored under the
+  document's key, that a revalidation costs no origin render, that a truncated
+  or unterminated body is never promoted to a complete entry, and that six
+  clients hanging up mid-render leak no capacity against a ceiling of one.
+- **`Upgrade`/WebSocket.** Off by default and answered `501` when off. When on,
+  an upgrade takes `upgrade.max_concurrent` rather than a render permit, and is
+  never cached or coalesced. [`bench/websocket.sh`](./bench/websocket.sh) drives
+  a real RFC 6455 handshake — the fixture computes `Sec-WebSocket-Accept`
+  properly, so a proxy answering `101` on its own would fail — and renders a
+  page with every socket held open against a render ceiling of one.
+- **TLS and trusted proxies.** `--features tls` builds rustls termination
+  (`server.tls`) and origin TLS (`origin.tls`); rustls rather than
+  boringssl/openssl so the build needs no cmake, Go or system OpenSSL headers.
+  `server.trusted_proxies` gates every forwarded header behind the connection
+  peer's address, trusts nobody by default, and walks the hop chain from the
+  right. [`bench/tls.sh`](./bench/tls.sh) and
+  [`bench/forwarded.sh`](./bench/forwarded.sh).
+- **A bounded response spool.** `spool.enabled` closes the gap this README has
+  described since the first release: capacity now returns when the origin
+  finishes rather than when the client finishes reading. See
+  [Slow readers and render capacity](#slow-readers-and-render-capacity) for the
+  measurement and the trade-off it makes.
+- **Threat model and adversarial testing.**
+  [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) states what is protected,
+  from whom, by which mechanism, and — at equal length — what is deliberately
+  not defended. [`bench/adversarial.sh`](./bench/adversarial.sh) runs every
+  mechanism at once under sustained hostile traffic and asserts four properties
+  afterwards: the ceiling held, nothing private was shared, memory stayed inside
+  its budget, and nothing panicked.
+
+**Still outstanding: the independent review.** Obtaining a third-party review of
+cache-key construction and response shareability is not something the author can
+complete alone. [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) is
+written to make one cheap: eleven falsifiable claims, the attacks already tried
+so a reviewer does not repeat them, and the author's own assessment of where the
+design is weakest. Until someone takes it up, this phase is incomplete and the
+project status table says so.
+
+Three bugs this phase found, all fixed, all with regression tests verified to
+fail against the previous code:
+
+- **Over HTTP/2 the cache key had no host.** There is no `Host` header in
+  HTTP/2; the authority is the `:authority` pseudo-header, which Pingora
+  surfaces on the URI. Reading `Host` alone gave every h2 request an empty host
+  and merged **every virtual host on the listener into one cache entry** — a
+  cross-tenant response leak that appears the day `server.h2c` or `server.tls`
+  is switched on and is invisible before then. Found while writing
+  [`bench/http2.sh`](./bench/http2.sh), which fails against the old code with
+  two authorities at one path costing one origin render instead of two.
+- **`X-Forwarded-For` was appended to, not replaced.** Whatever the client sent
+  was kept and the observed peer added to the end, so an origin reading the
+  first entry — where every framework's `getClientIp` looks — read a value the
+  client chose. Since the origin's rate limits and audit logs are downstream of
+  that, it was a forged identity with real effects.
+- **`X-Forwarded-Proto` was hardcoded to `http`,** and the cache key's scheme
+  with it. Correct while Harmost only ever spoke cleartext; wrong the moment it
+  terminates TLS, and the symptom is a plaintext response served to a client
+  that asked for TLS.
+
+And one limitation of the dependency, refused rather than papered over:
+**`origin.tls.ca` is rejected at startup.** Pingora 0.8's rustls connector never
+reads the per-peer CA store — its `connect` path carries an explicit `TODO` and
+`peer.get_ca()` is unused — so accepting the key would mean a config naming a
+CA, a proxy verifying against the system roots, and no way to tell from outside.
+Use `SSL_CERT_FILE` / `SSL_CERT_DIR`, which the platform store does honour.
 
 ### 2. Become operable as a service
 
@@ -961,16 +1076,25 @@ against the old encoding.
 
 ### Current limitations and non-goals
 
-- A slow reader can delay observed origin end-of-stream and occupy a render
-  slot. `timeouts.downstream_write` bounds the stall but does not decouple it;
-  see [Slow readers and render capacity](#slow-readers-and-render-capacity).
+- **On a route without `spool.enabled`, a slow reader still delays observed
+  origin end-of-stream and occupies a render slot,** bounded only by
+  `timeouts.downstream_write`. The spool fixes this and is off by default
+  because it costs progressive rendering; see
+  [Slow readers and render capacity](#slow-readers-and-render-capacity).
 - Cache, coalescing and admission state are process-local. Replicas multiply
   origin ceilings unless their limits are partitioned, and one key can render
   once per replica.
 - The only cache backend is bounded in-process memory. Restarting clears it,
-  and FIFO eviction is intentionally simple rather than production-tuned.
-- Harmost does not terminate TLS, connect to TLS origins, or configure trusted
-  proxy boundaries yet.
+  and FIFO eviction is intentionally simple rather than production-tuned. There
+  is no purge API, so an entry that turns out to be wrong can only be waited out.
+- **There is no rate limiting of any kind.** Harmost bounds origin *work*, not
+  bytes, connections per source, or requests per second. Keep an edge in front.
+- `origin.tls.ca` is rejected: Pingora 0.8's rustls connector does not read a
+  per-peer CA store. Use `SSL_CERT_FILE` / `SSL_CERT_DIR`.
+- Several settings are startup-bound and a SIGHUP reload **refuses** rather than
+  silently ignores them: listeners, TLS, `trusted_proxies`, `origin.http_version`,
+  `spool.max_memory`, `upgrade.max_concurrent`, the cache budget and
+  `timeouts.origin`.
 - `serde_yaml`, which is deprecated, still enters the dependency tree through
   `pingora-core`'s own config parsing. Harmost's config is parsed with
   `serde-saphyr`.
@@ -998,15 +1122,82 @@ that generation has finished, so headers alone never release capacity.
 
 ## Slow readers and render capacity
 
-Pingora couples upstream reads to bounded downstream channels. A sufficiently
-slow client can therefore delay the moment upstream end-of-stream is observed,
-for both fixed-length and chunked responses. `timeouts.downstream_write` bounds
-that delay. Decoupling it completely requires a separate bounded response spool;
-until then the conservative choice is to hold the permit rather than let a
-fixed-length streaming origin bypass the concurrency ceiling.
+An origin work permit is meant to model *render* capacity: hold one while the
+origin is producing a response, hand it back when the origin has finished.
+Getting the second half right is harder than it sounds.
 
-Each access log line records `"permit_released":"body_end"` when capacity was
-returned normally.
+Pingora's proxy loop pairs each upstream read with a downstream write through a
+four-slot channel, so the origin can never run more than a few chunks ahead of
+the client. A client reading a 4 MiB page a kilobyte at a time therefore keeps
+that pairing alive, and upstream end-of-stream — the only honest signal that the
+origin stopped rendering — does not arrive until the client is done. The permit
+is held for the client's reading time rather than the origin's rendering time.
+Measured on this codebase: a 1 MiB body returned capacity in 91 ms, while a
+2 MiB body against a rate-limited reader held it until the request was shed
+three seconds later.
+
+### The response spool
+
+`spool.enabled` closes that gap. Response body bytes are absorbed into a bounded
+buffer immediately before the downstream write that would have blocked, so the
+origin is never paced by the client; when the upstream reports end of stream,
+the origin has genuinely finished and the permit goes back then. The buffered
+body is handed downstream afterwards and drains at whatever pace the client
+manages, with no origin capacity attached to it.
+
+```yaml
+spool:
+  enabled: false      # global default
+  max_body: 2MiB      # ceiling on one response
+  max_memory: 256MiB  # ceiling across every in-flight spool at once
+
+routes:
+  - id: product-pages
+    match: "/products/**"
+    spool:
+      enabled: true
+```
+
+**It costs progressive rendering.** A spooled response reaches the client only
+once the origin has finished producing it, so a streamed SSR shell no longer
+arrives early. That is why it is off by default, set per route, and refused
+outright on a `class: streaming` route.
+
+Two ceilings, because one is not enough: `max_body` bounds a single response
+and `max_memory` bounds every in-flight spool together, which is what stops a
+thousand slow readers turning a 2 MiB per-request bound into 2 GiB resident.
+Exceeding either is not an error — the buffered bytes are flushed, the rest of
+the body streams through as before, and the permit reverts to being bounded by
+`timeouts.downstream_write`. Degrading to the previous behaviour is always safe.
+
+[`bench/spool.sh`](./bench/spool.sh) measures both directions in one run,
+against an origin fixture that reports when it has finished *rendering*
+separately from when it has finished *writing*:
+
+| configuration | probe after the origin finished |
+| --- | --- |
+| spool off (the previous behaviour) | `503` after 8.0s — queued behind capacity nobody was using |
+| spool on | `200` in 233ms |
+| body larger than `spool.max_body` | `503` — degrades to the previous behaviour, body intact |
+
+The script **fails** if the control case also returns capacity quickly, because
+a run that cannot reproduce the problem cannot be evidence that it was fixed.
+Parameters: 8 MiB body, two readers at 32 KB/s, ceiling of 2,
+`timeouts.downstream_write: 60s` so that a write timeout cannot be what returns
+the capacity.
+
+### Reading it in the logs
+
+Each access log line records where the permit went:
+
+* `"permit_released":"origin_end"` — the response was spooled, so this is the
+  instant the origin finished.
+* `"permit_released":"body_end"` — it was not, so a slow client may have
+  delayed the observation.
+* `"permit_released":"-"` — this request never held a permit.
+
+`"spool"` records what the spool did: `complete`, `body_too_large`,
+`budget_exhausted`, or `-`.
 
 ## Request coalescing and microcache architecture
 
@@ -1084,6 +1275,99 @@ Three rules govern the config surface:
 
 Configuration is parsed with [`serde-saphyr`](https://crates.io/crates/serde-saphyr):
 pure Rust, actively maintained, and it reports the line and column of a bad key.
+
+### Listeners, TLS and HTTP/2
+
+TLS is behind a Cargo feature, because most deployments terminate it at a load
+balancer and an unused TLS stack is unused attack surface. rustls rather than
+boringssl or openssl: it is pure Rust, so building Harmost needs no cmake, no Go
+and no system OpenSSL headers.
+
+```bash
+cargo build --release --features tls
+```
+
+```yaml
+server:
+  listen: "0.0.0.0:8080"
+  # Accept cleartext HTTP/2 on the same listener. Pingora peeks for the
+  # connection preface, so HTTP/1.1 clients are unaffected.
+  h2c: false
+  tls:
+    listen: "0.0.0.0:8443"   # a second listener; `listen` stays cleartext
+    cert: "/etc/harmost/fullchain.pem"
+    key: "/etc/harmost/privkey.pem"
+    h2: true                 # offer h2 over ALPN, alongside http/1.1
+
+origin:
+  # http1 (default), http2 (prior-knowledge h2c over cleartext), or auto
+  # (ALPN negotiation, which requires origin.tls and is refused without it).
+  http_version: http1
+  tls:
+    sni: "origin.internal"   # required: no SNI means no hostname verification
+    verify_cert: true
+    verify_hostname: true
+```
+
+A binary built without `--features tls` **rejects** a config containing
+`server.tls` or `origin.tls` rather than starting with a dead port.
+
+### Trusted proxies
+
+`X-Forwarded-For` and `X-Forwarded-Proto` are set by whoever spoke to Harmost
+last. On a public listener that is the client, and believing them hands out two
+things: a forged identity in the origin's logs and rate limits, and — because
+the scheme is part of the cache key — **a cache partition the client controls**,
+which is one origin render per invented scheme string. Harmost would then be
+amplifying the origin work it exists to bound.
+
+So a forwarded header is read only from a peer inside a configured block.
+Nothing is trusted by default, which means an unconfigured Harmost cannot be
+lied to.
+
+```yaml
+server:
+  trusted_proxies:
+    # CIDR blocks whose forwarded headers are believed. A bare address is a
+    # single host; IPv6 and IPv4-mapped peers are handled.
+    from: ["10.0.0.0/8", "2001:db8::/32"]
+    client_ip: x_forwarded   # x_forwarded | forwarded (RFC 7239) | none
+    scheme: x_forwarded      # same
+```
+
+Three properties worth stating, because each has a failure mode that looks like
+working software:
+
+- **The hop chain is walked from the right,** stopping at the first address that
+  is not itself a trusted proxy. Reading the leftmost entry — the obvious
+  implementation — returns whatever the client wrote there.
+- **`X-Forwarded-For` is replaced, never appended to,** and `Forwarded` is
+  removed outright. Appending keeps the client's value in first position, which
+  is where every framework's `getClientIp` looks.
+- **The scheme is normalised to exactly `http` or `https` for everyone,** trusted
+  or not. That is a range check rather than a trust check: nothing else may ever
+  reach the cache key.
+
+### The response spool and upgrades
+
+Both are off by default and both are documented where their trade-offs are:
+[Slow readers and render capacity](#slow-readers-and-render-capacity) for
+`spool`, and [Using Harmost with Next.js](#using-harmost-with-nextjs) for
+`upgrade`.
+
+## Security
+
+[`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) states what Harmost protects,
+from whom, by which mechanism — and, at equal length, what it deliberately does
+not defend. It has not been independently reviewed.
+
+[`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) is a brief for a
+reviewer willing to attack the two components where a mistake is a
+confidentiality failure rather than a performance one: cache-key construction
+and response shareability. It states eleven falsifiable claims, lists the
+attacks already tried, and says where the author believes the design is weakest.
+**That review has not happened.** If you are qualified to do it, that is the
+single most valuable contribution available to this project right now.
 
 ## License
 

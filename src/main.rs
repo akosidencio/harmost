@@ -78,6 +78,8 @@ fn run(path: &str) -> ExitCode {
     harmost::telemetry::metrics::preregister();
 
     let listen = cfg.server.listen.clone();
+    let h2c = cfg.server.h2c;
+    let tls = cfg.server.tls.clone();
     let prometheus_listen = cfg.telemetry.prometheus.as_ref().map(|p| p.listen.clone());
     let concurrency = cfg.origin.concurrency.clone();
     let policy = match PolicySnapshot::build(cfg, 1) {
@@ -139,11 +141,59 @@ fn run(path: &str) -> ExitCode {
         ));
     }
 
-    let mut service = pingora_proxy::http_proxy_service(
-        &server.configuration,
-        Harmost::new(policy, admission, upstreams),
-    );
+    let harmost = match Harmost::new(policy, admission, upstreams) {
+        Ok(harmost) => harmost,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut service = pingora_proxy::http_proxy_service(&server.configuration, harmost);
+
+    // HTTP/2 over cleartext. Pingora peeks for the connection preface, so this
+    // listener still serves HTTP/1.1 clients; it only decides whether an h2
+    // preface is honoured or answered as a malformed HTTP/1.1 request.
+    if h2c {
+        // Refusing to start beats starting without the protocol that was
+        // asked for: a listener that silently speaks only HTTP/1.1 is a
+        // misconfiguration nobody notices until a client does.
+        let Some(logic) = service.app_logic_mut() else {
+            eprintln!("error: could not enable h2c: proxy service has no app logic");
+            return ExitCode::FAILURE;
+        };
+        logic
+            .server_options
+            .get_or_insert_with(Default::default)
+            .h2c = true;
+        eprintln!("  h2c enabled on {listen}");
+    }
+
     service.add_tcp(&listen);
+
+    // Validation has already refused a `server.tls` block in a build without
+    // the feature, so the `not(tls)` arm is unreachable in practice. It is
+    // written out anyway: an unreachable branch that fails loudly costs
+    // nothing, and the alternative — a `cfg` that silently drops the listener
+    // — is the failure this whole arrangement exists to avoid.
+    if let Some(tls) = &tls {
+        #[cfg(feature = "tls")]
+        match tls_settings(tls) {
+            Ok(settings) => {
+                service.add_tls_with_settings(&tls.listen, None, settings);
+                eprintln!("harmost listening on {} (TLS)", tls.listen);
+            }
+            Err(error) => {
+                eprintln!("error: server.tls: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            eprintln!("error: server.tls: {}", tls_settings(tls).unwrap_err());
+            return ExitCode::FAILURE;
+        }
+    }
+
     server.add_service(service);
 
     if let Some(addr) = &prometheus_listen {
@@ -156,6 +206,44 @@ fn run(path: &str) -> ExitCode {
     eprintln!("harmost listening on {listen}");
     eprintln!("  origin concurrency ceiling: {}", concurrency.max);
     server.run_forever();
+}
+
+/// Build the listener's TLS settings.
+///
+/// Two builds exist. With the `tls` feature this compiles against rustls and
+/// terminates TLS in process; without it the function refuses, and validation
+/// refuses earlier still. Neither build silently ignores a `server.tls` block:
+/// a config that asks for TLS and gets cleartext is the worst possible outcome,
+/// and the same reasoning is why every unimplemented key in this project is
+/// rejected rather than skipped.
+#[cfg(feature = "tls")]
+fn tls_settings(
+    tls: &harmost::config::schema::ServerTls,
+) -> std::result::Result<pingora_core::listeners::tls::TlsSettings, String> {
+    let mut settings = pingora_core::listeners::tls::TlsSettings::intermediate(&tls.cert, &tls.key)
+        .map_err(|error| {
+            format!(
+                "could not load cert `{}`/key `{}`: {error}",
+                tls.cert, tls.key
+            )
+        })?;
+    if tls.h2 {
+        // Offers `h2` alongside `http/1.1`, so an HTTP/1.1-only client is
+        // never locked out of the TLS listener.
+        settings.enable_h2();
+    }
+    Ok(settings)
+}
+
+#[cfg(not(feature = "tls"))]
+fn tls_settings(
+    _tls: &harmost::config::schema::ServerTls,
+) -> std::result::Result<std::convert::Infallible, String> {
+    Err(
+        "this binary was built without the `tls` feature; rebuild with \
+         `cargo build --features tls` or terminate TLS in front of Harmost"
+            .to_string(),
+    )
 }
 
 fn check(path: &str) -> ExitCode {
@@ -183,6 +271,47 @@ fn check(path: &str) -> ExitCode {
                 if overrides {
                     println!("  route `{}` overrides origin cache directives", r.id);
                 }
+            }
+            // Everything below trades a safety property for convenience.
+            // `check` is the last place someone reads before deploying, so it
+            // says so out loud rather than leaving it in the file.
+            if cfg.server.trusted_proxies.from.is_empty() {
+                println!(
+                    "  no server.trusted_proxies: forwarded client addresses and schemes \
+                     are ignored, and the connection peer is treated as the client"
+                );
+            } else {
+                println!(
+                    "  trusting forwarded headers from {} block(s)",
+                    cfg.server.trusted_proxies.from.len()
+                );
+            }
+            if let Some(tls) = &cfg.origin.tls
+                && (!tls.verify_cert || !tls.verify_hostname)
+            {
+                println!(
+                    "  WARNING: origin.tls does not verify the origin's certificate; \
+                     the connection is encrypted but not authenticated"
+                );
+            }
+            if cfg.upgrade.enabled {
+                println!(
+                    "  Upgrade/WebSocket proxying enabled, up to {} concurrent connections",
+                    cfg.upgrade.max_concurrent
+                );
+            }
+            if cfg.spool.enabled
+                || cfg
+                    .routes
+                    .iter()
+                    .any(|r| r.spool.as_ref().and_then(|spool| spool.enabled) == Some(true))
+            {
+                println!(
+                    "  response spooling enabled: up to {} bytes per response, {} bytes overall; \
+                     spooled routes lose progressive rendering",
+                    cfg.spool.max_body.get(),
+                    cfg.spool.max_memory.get()
+                );
             }
             ExitCode::SUCCESS
         }

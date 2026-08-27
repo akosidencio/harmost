@@ -71,6 +71,15 @@ impl Bytes {
         self.0
     }
 
+    /// The size as a `usize`, saturating rather than truncating.
+    ///
+    /// A budget wider than the address space cannot be honoured anyway, and
+    /// clamping says so; an `as usize` would instead turn a 5 GiB cache into a
+    /// 1 GiB one on a 32-bit target and report the larger number back.
+    pub fn as_usize(self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX)
+    }
+
     pub fn parse(s: &str) -> Result<Bytes, String> {
         let s = s.trim();
         if s.is_empty() {
