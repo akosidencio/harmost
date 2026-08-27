@@ -49,6 +49,12 @@ tls = ["pingora-core/rustls"]
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "test-util"] }
 proptest = "1"
 
+# The crate contains no `unsafe`. `forbid` turns that from a fact about today
+# into an invariant: adding a block is a compile error, not a review comment.
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
 # A panic in a proxy is a process-wide outage: every request in flight on that
 # worker dies with it. Production code has to say what it does when the
 # assumption fails, so both panicking accessors are hard errors. Tests are
@@ -58,9 +64,15 @@ proptest = "1"
 # escape hatch: a message explains a panic, it does not justify one. The two
 # places that genuinely cannot do anything else carry a scoped
 # `#[expect(clippy::expect_used, reason = ...)]` naming the reason.
+#
+# A silent truncation is the same class of bug one layer down: it is how a
+# configured duration or byte budget becomes a different one on a target with
+# narrower pointers. Every remaining `as` is clamped at the call site or
+# carries a scoped allow naming why it cannot lose data.
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+cast_possible_truncation = "deny"
 
 [profile.release]
 lto = "thin"

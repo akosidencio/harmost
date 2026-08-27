@@ -63,6 +63,22 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc --locked
 
+  # A dependency advisory is a finding about code this binary runs at full
+  # privilege, so it gates like any other. Ignores live in `.cargo/audit.toml`
+  # and each one carries a reason and a way out.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit
+
   # macOS is a supported development platform, not the reference one. It builds
   # and runs the unit tests so a platform-specific compile error or a test that
   # assumed Linux is caught; the end-to-end work is not duplicated here, because

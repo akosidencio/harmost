@@ -163,13 +163,13 @@ impl Harmost {
         let initial = policy.load();
         // `Storage` takes `&'static self` throughout, so the store and the
         // lock are created once and leaked deliberately at startup.
-        let store = BoundedStore::new(initial.config.cache.max_memory.get() as usize);
+        let store = BoundedStore::new(initial.config.cache.max_memory.as_usize());
         let cache_lock: &'static pingora_cache::lock::CacheKeyLockImpl = Box::leak(
             pingora_cache::lock::CacheLock::new_boxed(initial.config.timeouts.origin.as_duration()),
         );
         let trust = TrustPolicy::build(&initial.config.server.trusted_proxies)
             .map_err(|error| format!("server.trusted_proxies: {error}"))?;
-        let spool_budget = SpoolBudget::new(initial.config.spool.max_memory.get() as usize);
+        let spool_budget = SpoolBudget::new(initial.config.spool.max_memory.as_usize());
         // No queue: a tunnel that has to wait for a slot is a tunnel whose
         // handshake has already timed out somewhere else.
         let upgrades = Limiter::new(
@@ -405,7 +405,7 @@ impl ProxyHttp for Harmost {
         // being retained.
         session
             .cache
-            .set_max_file_size_bytes(ctx.policy.config.cache.max_body_size.get() as usize);
+            .set_max_file_size_bytes(ctx.policy.config.cache.max_body_size.as_usize());
         Ok(())
     }
 
@@ -531,7 +531,7 @@ impl ProxyHttp for Harmost {
                 if ctx.spool_enabled {
                     ctx.spool = Some(Spool::new(
                         self.spool_budget.clone(),
-                        ctx.policy.config.spool.max_body.get() as usize,
+                        ctx.policy.config.spool.max_body.as_usize(),
                     ));
                 }
                 metrics::ADMISSION
@@ -621,8 +621,8 @@ impl ProxyHttp for Harmost {
                 Ok(RespCacheable::Cacheable(CacheMeta::new(
                     fresh_until,
                     now,
-                    swr.as_secs().min(u32::MAX as u64) as u32,
-                    sie.as_secs().min(u32::MAX as u64) as u32,
+                    u32::try_from(swr.as_secs()).unwrap_or(u32::MAX),
+                    u32::try_from(sie.as_secs()).unwrap_or(u32::MAX),
                     stored,
                 )))
             }

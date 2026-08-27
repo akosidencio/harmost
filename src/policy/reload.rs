@@ -92,7 +92,8 @@ impl Reloader {
         }
         if cfg.timeouts.origin != current.config.timeouts.origin {
             return Err(
-                "timeouts.origin changed; Pingora's cache-lock writer age is startup-bound and needs a restart"
+                "timeouts.origin changed; Pingora's cache-lock writer age is startup-bound and needs \
+                 a restart"
                     .to_string(),
             );
         }
@@ -113,7 +114,8 @@ impl Reloader {
             || cfg.server.tls != current.config.server.tls
         {
             return Err(
-                "server.h2c or server.tls changed; listeners are bound at startup and                  that needs a restart (SIGQUIT performs a graceful upgrade)"
+                "server.h2c or server.tls changed; listeners are bound at startup and that needs a \
+                 restart (SIGQUIT performs a graceful upgrade)"
                     .to_string(),
             );
         }
@@ -126,13 +128,15 @@ impl Reloader {
         }
         if cfg.spool.max_memory != current.config.spool.max_memory {
             return Err(
-                "spool.max_memory changed; the spool budget is allocated once at startup and                  that needs a restart. spool.enabled and spool.max_body do reload"
+                "spool.max_memory changed; the spool budget is allocated once at startup and that \
+                 needs a restart. spool.enabled and spool.max_body do reload"
                     .to_string(),
             );
         }
         if cfg.upgrade.max_concurrent != current.config.upgrade.max_concurrent {
             return Err(
-                "upgrade.max_concurrent changed; the upgrade limiter is sized once at startup                  and that needs a restart"
+                "upgrade.max_concurrent changed; the upgrade limiter is sized once at startup and \
+                 that needs a restart"
                     .to_string(),
             );
         }

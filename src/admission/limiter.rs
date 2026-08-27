@@ -8,10 +8,19 @@
 //! raising a limit.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
+
+/// A timeout in whole milliseconds, saturating.
+///
+/// `Duration::as_millis` is a `u128`. Clamping keeps an absurd configured
+/// timeout absurd instead of wrapping it into a small one, and keeps the value
+/// below the range where `Instant::now() + timeout` would overflow.
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Why a request was not admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +84,11 @@ pub struct Limiter {
     debt: AtomicUsize,
     queue_depth: AtomicUsize,
     queue_max: AtomicUsize,
-    queue_timeout_ms: AtomicUsize,
+    /// Milliseconds, not a `Duration`, because it has to live in an atomic.
+    /// `u64` rather than `usize`: `Duration::as_millis` is a `u128`, and
+    /// narrowing it to a pointer-sized integer silently rewrites a large
+    /// configured timeout into a different one on a 32-bit target.
+    queue_timeout_ms: AtomicU64,
 
     pub admitted: AtomicUsize,
     pub queued: AtomicUsize,
@@ -96,7 +109,7 @@ impl Limiter {
             debt: AtomicUsize::new(0),
             queue_depth: AtomicUsize::new(0),
             queue_max: AtomicUsize::new(queue_max),
-            queue_timeout_ms: AtomicUsize::new(queue_timeout.as_millis() as usize),
+            queue_timeout_ms: AtomicU64::new(millis(queue_timeout)),
             admitted: AtomicUsize::new(0),
             queued: AtomicUsize::new(0),
             shed: AtomicUsize::new(0),
@@ -120,22 +133,45 @@ impl Limiter {
     }
 
     /// Move the ceiling without disturbing in-flight work.
+    ///
+    /// Callers are expected to be serialised — `apply_limits` drives this from
+    /// the single reload path. Two `resize` calls racing each other would
+    /// interleave their reads of `debt`, and the ceiling they settle on is
+    /// whichever wrote `limit` last rather than whichever was asked for.
     pub fn resize(self: &Arc<Self>, new_limit: usize) {
         let old = self.limit.swap(new_limit, Ordering::SeqCst);
         if new_limit > old {
             // Growing also cancels any outstanding shrink.
-            let mut grant = new_limit - old;
-            let debt = self.debt.swap(0, Ordering::SeqCst);
-            let cancelled = grant.min(debt);
-            grant -= cancelled;
-            if debt > cancelled {
-                self.debt.fetch_add(debt - cancelled, Ordering::SeqCst);
-            }
+            let grant = new_limit - old;
+            // One read-modify-write, not a swap-then-restore. Zeroing the debt
+            // and adding the remainder back leaves a window where a permit
+            // returning through `claim_debt` sees no debt to absorb and
+            // releases itself to the semaphore instead — admitting past the
+            // ceiling the shrink was still collecting for.
+            let cancelled = self
+                .debt
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |debt| {
+                    Some(debt.saturating_sub(grant))
+                })
+                // The closure never returns `None`, so this never fails.
+                .map_or(0, |before| before.min(grant));
+            let grant = grant - cancelled;
             if grant > 0 {
                 self.sem.add_permits(grant);
             }
         } else if new_limit < old {
             let owed = old - new_limit;
+            // Forgetting first and recording the remainder second leaves the
+            // mirror-image window: a permit returning in between is neither
+            // forgotten nor owed, so it goes back to the semaphore and the
+            // limiter overshoots by one until the next return settles it.
+            //
+            // Recording the debt first would close that window and open a
+            // worse one — the debt would be over-recorded while
+            // `forget_permits` runs, and concurrent returns could drive it to
+            // zero before the correction, so the correcting subtraction would
+            // underflow. The overshoot is bounded by one permit and
+            // self-correcting; the alternative is not.
             let forgotten = self.sem.forget_permits(owed);
             if forgotten < owed {
                 // The rest are out with in-flight requests; collect them as
@@ -156,11 +192,11 @@ impl Limiter {
     pub fn set_queue(&self, max: usize, timeout: Duration) {
         self.queue_max.store(max, Ordering::Relaxed);
         self.queue_timeout_ms
-            .store(timeout.as_millis() as usize, Ordering::Relaxed);
+            .store(millis(timeout), Ordering::Relaxed);
     }
 
     pub fn queue_timeout(&self) -> Duration {
-        Duration::from_millis(self.queue_timeout_ms.load(Ordering::Relaxed) as u64)
+        Duration::from_millis(self.queue_timeout_ms.load(Ordering::Relaxed))
     }
 
     /// Take a permit, or say why not.
@@ -348,6 +384,39 @@ mod tests {
         drop(a);
         assert!(l.acquire(None).await.is_ok());
         assert_eq!(l.limit(), 4);
+    }
+
+    /// A grow smaller than the outstanding debt cancels part of it and leaves
+    /// the rest owed. The whole debt must not fall on the floor: every permit
+    /// still owed has to be absorbed on its way back, or the limiter settles
+    /// above the ceiling it was just given.
+    #[tokio::test]
+    async fn growing_by_less_than_the_debt_leaves_the_remainder_owed() {
+        let l = lim(5, 0, 0);
+        let a = l.acquire(None).await.unwrap();
+        let b = l.acquire(None).await.unwrap();
+        let c = l.acquire(None).await.unwrap();
+        let d = l.acquire(None).await.unwrap();
+        let _e = l.acquire(None).await.unwrap();
+
+        l.resize(1); // owes 4; nothing is available to forget outright
+        l.resize(2); // cancels one, three still owed
+        assert_eq!(l.limit(), 2);
+
+        for (n, permit) in [a, b, c].into_iter().enumerate() {
+            drop(permit);
+            assert!(
+                l.acquire(None).await.is_err(),
+                "return {} of 3 must be absorbed against the remaining debt",
+                n + 1
+            );
+        }
+
+        drop(d);
+        assert!(
+            l.acquire(None).await.is_ok(),
+            "the debt is settled, so this return is the ceiling's own permit"
+        );
     }
 
     #[tokio::test]

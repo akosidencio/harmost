@@ -6,7 +6,9 @@
 //! takes a string primary and blake2-hashes it itself — so
 //! [`CacheKey::canonical_string`] is where the structural key has to be
 //! rendered without losing the distinctions it was built to keep. A separate
-//! short fingerprint is derived for logs only, and is never used for lookup.
+//! short fingerprint is derived for identifying one key in a trace, and is
+//! never used for lookup — nor, deliberately, written to the access log; see
+//! [`CacheKey::fingerprint`].
 
 use crate::classifier::RequestMetadata;
 use crate::config::schema::{QueryMode, QueryPolicy};
@@ -29,7 +31,19 @@ pub struct CacheKey {
 }
 
 impl CacheKey {
-    /// Stable short id for logs and traces. Never used for lookup.
+    /// A stable short id for one key. Never used for lookup.
+    ///
+    /// Deliberately not emitted by [`crate::telemetry::logging`]: that module
+    /// omits the query string because it routinely carries session tokens and
+    /// signed URLs, and this digest is taken over a tuple that *includes* the
+    /// query, under `DefaultHasher`'s fixed keys. Publishing it would hand
+    /// anyone holding the log a cheap way to confirm a guessed URL, which is
+    /// most of what leaving the query out was protecting.
+    ///
+    /// It is `pub` for the `cache_key` fuzz target, which asserts the property
+    /// that matters here — two keys that compare equal must never fingerprint
+    /// apart — from outside the crate. Wire it into a trace only where the
+    /// span is already narrower than the access log.
     pub fn fingerprint(&self) -> String {
         let mut h = DefaultHasher::new();
         self.hash(&mut h);

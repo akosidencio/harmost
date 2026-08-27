@@ -6,6 +6,7 @@
 
 use super::schema::*;
 use std::collections::HashSet;
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -141,13 +142,16 @@ fn validate_server_tls(cfg: &Config) -> Result<()> {
     };
     if !cfg!(feature = "tls") {
         return Err(err(
-            "server.tls is set but this binary was built without the `tls` feature;              rebuild with `cargo build --features tls`, or remove server.tls and              terminate TLS in front of Harmost",
+            "server.tls is set but this binary was built without the `tls` feature; rebuild with \
+             `cargo build --features tls`, or remove server.tls and terminate TLS in front of \
+             Harmost",
         ));
     }
     validate_listen(&tls.listen, "server.tls.listen")?;
     if tls.listen == cfg.server.listen {
         return Err(err(format!(
-            "server.tls.listen and server.listen are both `{}`;              one address cannot serve cleartext and TLS at once",
+            "server.tls.listen and server.listen are both `{}`; one address cannot serve cleartext \
+             and TLS at once",
             tls.listen
         )));
     }
@@ -182,7 +186,9 @@ fn validate_trusted_proxies(cfg: &Config) -> Result<()> {
         && cfg.server.trusted_proxies != TrustedProxies::default()
     {
         return Err(err(
-            "server.trusted_proxies names a client_ip or scheme source but `from` is empty,              so no peer is ever trusted and neither is read; list the CIDR blocks your              load balancer connects from",
+            "server.trusted_proxies names a client_ip or scheme source but `from` is empty, so no \
+             peer is ever trusted and neither is read; list the CIDR blocks your load balancer \
+             connects from",
         ));
     }
     Ok(())
@@ -195,14 +201,16 @@ fn validate_origin_tls(cfg: &Config) -> Result<()> {
         // failure is here rather than as a connection error per request.
         if cfg.origin.http_version == OriginHttpVersion::Auto {
             return Err(err(
-                "origin.http_version: auto negotiates over ALPN, which requires origin.tls;                  over cleartext choose http1 or http2 explicitly",
+                "origin.http_version: auto negotiates over ALPN, which requires origin.tls; over \
+                 cleartext choose http1 or http2 explicitly",
             ));
         }
         return Ok(());
     };
     if !cfg!(feature = "tls") {
         return Err(err(
-            "origin.tls is set but this binary was built without the `tls` feature;              rebuild with `cargo build --features tls`",
+            "origin.tls is set but this binary was built without the `tls` feature; rebuild with \
+             `cargo build --features tls`",
         ));
     }
     if tls.sni.trim().is_empty() {
@@ -213,12 +221,18 @@ fn validate_origin_tls(cfg: &Config) -> Result<()> {
     // Verifying the name against a chain nobody checked verifies nothing.
     if tls.verify_hostname && !tls.verify_cert {
         return Err(err(
-            "origin.tls sets verify_hostname without verify_cert; a hostname is only              meaningful once the chain that vouches for it has been checked",
+            "origin.tls sets verify_hostname without verify_cert; a hostname is only meaningful once \
+             the chain that vouches for it has been checked",
         ));
     }
     if tls.ca.is_some() {
         return Err(err(
-            "origin.tls.ca is not implemented: Pingora 0.8's rustls connector does not read              the per-peer CA store (its connect path carries an explicit TODO and never calls              peer.get_ca()), so naming a CA here would verify against the system roots anyway.              Add the CA to the platform trust store, or point SSL_CERT_FILE / SSL_CERT_DIR at              it — both are honoured — or set verify_cert: false if the origin is reachable only              over a private network",
+            "origin.tls.ca is not implemented: Pingora 0.8's rustls connector does not read the \
+             per-peer CA store (its connect path carries an explicit TODO and never calls \
+             peer.get_ca()), so naming a CA here would verify against the system roots anyway. Add \
+             the CA to the platform trust store, or point SSL_CERT_FILE / SSL_CERT_DIR at it — both \
+             are honoured — or set verify_cert: false if the origin is reachable only over a private \
+             network",
         ));
     }
     Ok(())
@@ -233,7 +247,8 @@ fn validate_spool(cfg: &Config) -> Result<()> {
     }
     if cfg.spool.max_body > cfg.spool.max_memory {
         return Err(err(format!(
-            "spool.max_body ({} bytes) exceeds spool.max_memory ({} bytes);              not one response could ever be spooled",
+            "spool.max_body ({} bytes) exceeds spool.max_memory ({} bytes); \
+             not one response could ever be spooled",
             cfg.spool.max_body.get(),
             cfg.spool.max_memory.get()
         )));
@@ -245,7 +260,8 @@ fn validate_spool(cfg: &Config) -> Result<()> {
         let asked = route.spool.as_ref().and_then(|spool| spool.enabled) == Some(true);
         if asked && route.class == Some(ClassOverride::Streaming) {
             return Err(err(format!(
-                "route `{}` is class streaming and sets spool.enabled: true;                  a spool withholds the body until the origin finishes, which is                  exactly what a streaming route must not do",
+                "route `{}` is class streaming and sets spool.enabled: true; a spool withholds the \
+                 body until the origin finishes, which is exactly what a streaming route must not do",
                 route.id
             )));
         }
@@ -256,7 +272,8 @@ fn validate_spool(cfg: &Config) -> Result<()> {
 fn validate_upgrade(cfg: &Config) -> Result<()> {
     if cfg.upgrade.enabled && cfg.upgrade.max_concurrent == 0 {
         return Err(err(
-            "upgrade.enabled is true but upgrade.max_concurrent is 0, which admits nothing;              set a ceiling or disable upgrades",
+            "upgrade.enabled is true but upgrade.max_concurrent is 0, which admits nothing; set a \
+             ceiling or disable upgrades",
         ));
     }
     Ok(())
@@ -308,11 +325,28 @@ fn check_coalesce_wait(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// The longest a request may be made to wait for a permit.
+///
+/// A queue deadline is a wait on the request path, so an hour is already far
+/// past anything an origin governor should allow; the bound exists to catch a
+/// wrong unit (`timeout: 30m` where `30s` was meant) and to keep the value out
+/// of the range where `Instant::now() + timeout` stops being representable.
+const MAX_QUEUE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 fn check_queue(c: &Concurrency, path: &str) -> Result<()> {
     if c.queue.max > 0 && c.queue.timeout == super::units::Dur::ZERO {
         return Err(err(format!(
-            "{path}.queue.max is {} but queue.timeout is 0; a queue with no deadline is unbounded in time",
+            "{path}.queue.max is {} but queue.timeout is 0; a queue with no deadline is unbounded in \
+             time",
             c.queue.max
+        )));
+    }
+    if c.queue.timeout.as_duration() > MAX_QUEUE_TIMEOUT {
+        return Err(err(format!(
+            "{path}.queue.timeout is {:?}, longer than the {:?} maximum; a request waiting \
+             that long for a permit has already failed somewhere else",
+            c.queue.timeout.as_duration(),
+            MAX_QUEUE_TIMEOUT
         )));
     }
     Ok(())
@@ -771,6 +805,53 @@ routes:
                 .unwrap_err()
                 .to_string()
                 .contains("no deadline")
+        );
+    }
+
+    #[test]
+    fn rejects_a_queue_deadline_longer_than_the_maximum() {
+        let cfg = parse(&format!(
+            "{BASE}
+routes:
+  - id: r
+    match: \"/x\"
+    concurrency:
+      max: 10
+      queue:
+        max: 100
+        timeout: 2h
+"
+        ));
+        assert!(
+            validate(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("longer than the")
+        );
+    }
+
+    /// The bound exists so that no accepted config can reach
+    /// `Instant::now() + timeout` with a value that is not representable.
+    #[test]
+    fn the_longest_accepted_queue_deadline_is_a_representable_instant() {
+        let cfg = parse(&format!(
+            "{BASE}
+routes:
+  - id: r
+    match: \"/x\"
+    concurrency:
+      max: 10
+      queue:
+        max: 100
+        timeout: 60m
+"
+        ));
+        validate(&cfg).expect("an hour is on the accepted side of the bound");
+        assert!(
+            tokio::time::Instant::now()
+                .into_std()
+                .checked_add(MAX_QUEUE_TIMEOUT)
+                .is_some()
         );
     }
 
