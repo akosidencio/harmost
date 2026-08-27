@@ -3,7 +3,7 @@ members = [".", "spike/pingora-cache", "bench/slow-origin"]
 
 [package]
 name = "harmost"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Origin workload governor for server-rendered applications"
@@ -34,9 +34,33 @@ log = "0.4"
 # API: enabling it outside `fuzz/` has no purpose.
 fuzzing = []
 
+# Native TLS termination and origin TLS.
+#
+# rustls rather than boringssl or openssl: it is pure Rust, so the build needs
+# no cmake, no Go and no system OpenSSL headers, which matters for a proxy
+# people are expected to build themselves. Off by default because most
+# deployments terminate TLS at a load balancer, and an unused TLS stack is
+# unused attack surface. A config with `server.tls` or `origin.tls` is
+# *rejected* by a binary built without it rather than quietly serving
+# cleartext.
+tls = ["pingora-core/rustls"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "test-util"] }
 proptest = "1"
+
+# A panic in a proxy is a process-wide outage: every request in flight on that
+# worker dies with it. Production code has to say what it does when the
+# assumption fails, so both panicking accessors are hard errors. Tests are
+# exempt via `clippy.toml` — a panicking assertion there is the point.
+#
+# `expect` is denied alongside `unwrap` rather than left as the sanctioned
+# escape hatch: a message explains a panic, it does not justify one. The two
+# places that genuinely cannot do anything else carry a scoped
+# `#[expect(clippy::expect_used, reason = ...)]` naming the reason.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
 
 [profile.release]
 lto = "thin"

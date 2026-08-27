@@ -7,6 +7,15 @@ pub struct Generic;
 
 /// Classify using HTTP semantics alone. Every adapter falls back to this.
 pub fn classify(req: &RequestMetadata<'_>) -> RequestClass {
+    // Before anything else, including the method check: an upgrade handshake
+    // is a `GET` that carries cookies, and every rule below it would classify
+    // one as an ordinary private document. It is neither — it is a request to
+    // stop speaking HTTP, and it must not reach the cache or the render
+    // permit under any other name.
+    if req.is_upgrade() {
+        return RequestClass::Upgrade;
+    }
+
     if !req.is_safe_method() {
         return match *req.method {
             Method::POST | Method::PUT | Method::PATCH | Method::DELETE => RequestClass::Mutation,
@@ -120,6 +129,41 @@ mod tests {
     fn streaming_does_not_consume_an_origin_permit() {
         assert!(!RequestClass::Streaming.consumes_origin_permit());
         assert!(RequestClass::PublicDocument.consumes_origin_permit());
+    }
+
+    #[test]
+    fn a_websocket_handshake_is_an_upgrade_not_a_document() {
+        // The handshake is a plain GET. Without the upgrade check it lands in
+        // `PublicDocument`, which is cacheable and coalescible — so two
+        // sockets would be collapsed onto one and the `101` would be offered
+        // to the microcache.
+        let mut h = HeaderMap::new();
+        h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        h.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        assert_eq!(
+            classify(&req(&Method::GET, "/socket", None, &h)),
+            RequestClass::Upgrade
+        );
+    }
+
+    #[test]
+    fn an_upgrade_outranks_the_cookie_and_query_rules() {
+        // A real handshake carries the session cookie and often a query
+        // string. Neither may reclassify it.
+        let mut h = HeaderMap::new();
+        h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        h.insert(header::COOKIE, HeaderValue::from_static("session=abc"));
+        assert_eq!(
+            classify(&req(&Method::GET, "/socket", Some("token=x"), &h)),
+            RequestClass::Upgrade
+        );
+    }
+
+    #[test]
+    fn an_upgrade_is_never_shareable_and_never_holds_a_render_permit() {
+        assert!(!RequestClass::Upgrade.storable_in_principle());
+        assert!(!RequestClass::Upgrade.coalescible_in_principle());
+        assert!(!RequestClass::Upgrade.consumes_origin_permit());
     }
 
     #[test]

@@ -96,6 +96,46 @@ impl Reloader {
                     .to_string(),
             );
         }
+        // Everything below is compiled or bound once in `Harmost::new` and is
+        // not swapped per request. Refusing the edit is the whole point: a
+        // reload that reported success while leaving the old trust policy in
+        // force would be a security setting that silently did not apply, and
+        // an operator would have every reason to believe it had.
+        if cfg.server.trusted_proxies != current.config.server.trusted_proxies {
+            return Err(
+                "server.trusted_proxies changed; the trust policy is compiled once at \
+                 startup, so a reload would report success while the old one stayed in \
+                 force; that needs a restart (SIGQUIT performs a graceful upgrade)"
+                    .to_string(),
+            );
+        }
+        if cfg.server.h2c != current.config.server.h2c
+            || cfg.server.tls != current.config.server.tls
+        {
+            return Err(
+                "server.h2c or server.tls changed; listeners are bound at startup and                  that needs a restart (SIGQUIT performs a graceful upgrade)"
+                    .to_string(),
+            );
+        }
+        if cfg.origin.tls != current.config.origin.tls
+            || cfg.origin.http_version != current.config.origin.http_version
+        {
+            return Err(
+                "origin.tls or origin.http_version changed; that needs a restart".to_string(),
+            );
+        }
+        if cfg.spool.max_memory != current.config.spool.max_memory {
+            return Err(
+                "spool.max_memory changed; the spool budget is allocated once at startup and                  that needs a restart. spool.enabled and spool.max_body do reload"
+                    .to_string(),
+            );
+        }
+        if cfg.upgrade.max_concurrent != current.config.upgrade.max_concurrent {
+            return Err(
+                "upgrade.max_concurrent changed; the upgrade limiter is sized once at startup                  and that needs a restart"
+                    .to_string(),
+            );
+        }
         drop(current);
 
         let route_limits: Vec<(String, usize, usize, std::time::Duration)> = cfg
@@ -278,10 +318,29 @@ routes:
             format!("{BASE}health:\n  path: /healthz\n  interval: 5s\n  timeout: 1s\n"),
             format!("{BASE}cache:\n  max_memory: 64MiB\n"),
             format!("{BASE}telemetry:\n  prometheus:\n    listen: \"127.0.0.1:9090\"\n"),
+            // The security-relevant one. A reload that reported success while
+            // leaving the old trust policy in force is a setting that silently
+            // did not apply, and an operator would have every reason to
+            // believe it had.
+            BASE.replace(
+                "  listen: \"127.0.0.1:8080\"",
+                "  listen: \"127.0.0.1:8080\"\n  trusted_proxies:\n    from: [\"10.0.0.0/8\"]",
+            ),
+            BASE.replace(
+                "  listen: \"127.0.0.1:8080\"",
+                "  listen: \"127.0.0.1:8080\"\n  h2c: true",
+            ),
+            BASE.replace(
+                "upstreams: [\"a:3000\"]",
+                "upstreams: [\"a:3000\"]\n  http_version: http2",
+            ),
+            format!("{BASE}spool:\n  max_memory: 16MiB\n"),
+            format!("{BASE}upgrade:\n  max_concurrent: 7\n"),
         ] {
             let (path, reloader, policy) = setup(BASE);
-            std::fs::write(&path.0, changed).unwrap();
-            assert!(reloader.reload().unwrap_err().contains("restart"));
+            std::fs::write(&path.0, &changed).unwrap();
+            let err = reloader.reload().unwrap_err();
+            assert!(err.contains("restart"), "config:\n{changed}\nerror: {err}");
             assert_eq!(policy.load().generation, 1);
         }
     }

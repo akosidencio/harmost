@@ -1,0 +1,40 @@
+# Upgrade/WebSocket proxying, with a ceiling of its own.
+#
+# `origin.concurrency.max` is deliberately 1: if an upgrade consumed a render
+# permit, a single open socket would block every page on the site, which is
+# exactly what the benchmark checks it does not do.
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+origin:
+  upstreams: ["127.0.0.1:@ORIGIN@"]
+  concurrency:
+    max: 1
+    queue:
+      max: 20
+      timeout: 5s
+upgrade:
+  enabled: @UPGRADE@
+  max_concurrent: @MAX_SOCKETS@
+cache:
+  enabled: true
+coalesce:
+  enabled: true
+timeouts:
+  # A socket is idle most of the time. Without this the tunnel is torn down
+  # mid-test and the benchmark measures the timeout rather than the proxy.
+  idle: 60s
+  origin: 60s
+  downstream_write: 60s
+debug_headers: true
+routes:
+  - id: sockets
+    match: "/ws/**"
+
+  - id: pages
+    match: "/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 5s

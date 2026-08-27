@@ -1,0 +1,32 @@
+# Benchmark config for the bounded response spool.
+#
+# The ceiling is 2 so that two slow readers can occupy the whole origin budget
+# and a third request has somewhere obvious to fail. The queue timeout is long
+# enough that a shed means "capacity never came back", not "the queue was
+# short".
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+origin:
+  upstreams: ["127.0.0.1:@ORIGIN@"]
+  concurrency:
+    max: 2
+    queue:
+      max: 10
+      timeout: 8s
+timeouts:
+  # Deliberately long. If the spool works, capacity comes back because the
+  # origin finished — not because a write timeout cut a slow client off. A
+  # short value here would let the old behaviour pass this benchmark.
+  downstream_write: 60s
+cache:
+  enabled: false
+spool:
+  enabled: @SPOOL@
+  max_body: @SPOOL_MAX_BODY@
+  max_memory: 64MiB
+debug_headers: true
+routes:
+  - id: pages
+    match: "/**"
+    class: public_ssr

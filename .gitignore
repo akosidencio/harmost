@@ -22,5 +22,12 @@ fixtures/next-storefront/.next/
 fixtures/next-storefront/node_modules/
 fixtures/next-storefront/*.tsbuildinfo
 
-# docs
-docs/
+# docs/ holds the author's own study and prep material, which is not part of the
+# repository. The two documents the README links to are the exception: a threat
+# model nobody can read is not a threat model, and the review brief exists
+# precisely to be handed to somebody else.
+# `docs/*` rather than `docs/`: git never descends into an excluded directory,
+# so a negation inside one is silently ignored.
+docs/*
+!docs/THREAT-MODEL.md
+!docs/CACHE-KEY-REVIEW.md

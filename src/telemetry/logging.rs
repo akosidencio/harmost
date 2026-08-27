@@ -18,13 +18,28 @@ pub struct AccessLog<'a> {
     pub class: &'a str,
     pub cache: &'a str,
     pub upstream: Option<&'a str>,
+    /// The client address Harmost concluded, which for a request from a
+    /// trusted proxy is the forwarded one and otherwise the connection peer.
+    /// Not the raw header: see [`crate::net::forwarded`].
+    pub client: &'a str,
+    /// `http` or `https` — the scheme the *client* used, which is also the
+    /// scheme in the cache key.
+    pub scheme: &'a str,
     pub status: u16,
     pub shed: bool,
     pub origin_ms: u128,
     pub total_ms: u128,
-    /// Where the origin permit was returned: "body_end" or "-"
-    /// when this request never held one.
+    /// Where the origin permit was returned.
+    ///
+    /// `origin_end` means the response was spooled, so this is the instant the
+    /// origin finished. `body_end` means it was not, so a slow client could
+    /// have delayed it. `-` means the request never held a permit. The
+    /// distinction is the difference between a real capacity measurement and
+    /// one contaminated by client behaviour.
     pub permit_released_at: &'a str,
+    /// What the response spool did: `complete`, `body_too_large`,
+    /// `budget_exhausted`, or `-` when this request was not spooled.
+    pub spool: &'a str,
 }
 
 impl AccessLog<'_> {
@@ -37,7 +52,10 @@ impl AccessLog<'_> {
         write_str(&mut s, "class", self.class);
         write_str(&mut s, "cache", self.cache);
         write_str(&mut s, "upstream", self.upstream.unwrap_or("-"));
+        write_str(&mut s, "client", self.client);
+        write_str(&mut s, "scheme", self.scheme);
         write_str(&mut s, "permit_released", self.permit_released_at);
+        write_str(&mut s, "spool", self.spool);
         let _ = write!(
             s,
             "\"status\":{},\"shed\":{},\"origin_ms\":{},\"total_ms\":{}}}",
@@ -55,7 +73,10 @@ impl AccessLog<'_> {
             ("class", self.class),
             ("cache", self.cache),
             ("upstream", self.upstream.unwrap_or("-")),
+            ("client", self.client),
+            ("scheme", self.scheme),
             ("permit_released", self.permit_released_at),
+            ("spool", self.spool),
         ] {
             if !s.is_empty() {
                 s.push(' ');
@@ -115,11 +136,14 @@ mod tests {
             class: "public_document",
             cache: "hit",
             upstream: Some("next-1:3000"),
+            client: "203.0.113.7",
+            scheme: "https",
             status: 200,
             shed: false,
             origin_ms: 0,
             total_ms: 3,
-            permit_released_at: "headers",
+            permit_released_at: "origin_end",
+            spool: "complete",
         }
         .to_json()
     }
@@ -138,7 +162,7 @@ mod tests {
         assert!(out.contains(r#""path":"/a\"b""#), "{out}");
         assert_eq!(
             out.matches(r#"","#).count(),
-            7,
+            10,
             "field count changed: {out}"
         );
     }
@@ -177,11 +201,14 @@ mod tests {
             class: "public_document",
             cache: "hit",
             upstream: None,
+            client: "-",
+            scheme: "http",
             status: 200,
             shed: false,
             origin_ms: 0,
             total_ms: 1,
             permit_released_at: "-",
+            spool: "-",
         }
         .to_json();
         assert!(out.contains(r#""upstream":"-""#));
@@ -198,11 +225,14 @@ mod tests {
             class: "public_document",
             cache: "hit",
             upstream: None,
+            client: "-",
+            scheme: "http",
             status: 200,
             shed: false,
             origin_ms: 1,
             total_ms: 2,
             permit_released_at: "body_end",
+            spool: "-",
         };
         out = entry.to_text();
         assert!(!out.contains('\n'));

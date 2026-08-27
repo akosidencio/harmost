@@ -1,0 +1,29 @@
+# Downstream h2c and upstream h2, with the cache and coalescing on so the tests
+# can check that the governor's own rules still apply over HTTP/2.
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+  h2c: true
+origin:
+  upstreams: ["127.0.0.1:@ORIGIN@"]
+  http_version: @UPSTREAM_VERSION@
+  concurrency:
+    max: @CEILING@
+    queue:
+      max: 200
+      timeout: 10s
+cache:
+  enabled: true
+coalesce:
+  enabled: true
+debug_headers: true
+routes:
+  - id: pages
+    match: "/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 5s
+    coalesce:
+      enabled: true

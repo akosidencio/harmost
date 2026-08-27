@@ -82,6 +82,13 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64
+          # The published image includes TLS. Unlike a source build, nobody can
+          # recompile a container to turn a feature on, so shipping without it
+          # would make `server.tls` unusable for every image user — and the
+          # config would be *rejected* at startup rather than silently ignored,
+          # which is correct but a poor first experience.
+          build-args: |
+            FEATURES=tls
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

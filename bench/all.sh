@@ -12,6 +12,30 @@ export BENCH_REPORT_DIR=${BENCH_REPORT_DIR:-}
 FAILED=""
 PASSED=""
 
+# Is a Docker daemon actually reachable?
+#
+# Not `docker info` on its own: with Docker Desktop installed but not running,
+# that command blocks rather than failing, and the whole gate stalls on it with
+# no output. A bounded probe turns "the daemon is down" into the skip it should
+# always have been.
+docker_available() {
+  # Backgrounded directly rather than inside `( … ) &`: with a subshell, `$!`
+  # is the subshell and killing it leaves the real `docker` process running and
+  # still holding the terminal. `$!` has to be the process being bounded.
+  docker info >/dev/null 2>&1 &
+  local probe=$! waited=0
+  while kill -0 "$probe" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [ "$waited" -gt 50 ]; then
+      kill -KILL "$probe" 2>/dev/null
+      wait "$probe" 2>/dev/null
+      return 1
+    fi
+    sleep 0.2
+  done
+  wait "$probe"
+}
+
 run() { # script, args...
   local script=$1; shift
   echo
@@ -35,13 +59,44 @@ run safety.sh "${SAFETY_CONCURRENCY:-30}"
 run reload.sh
 run slowclient.sh
 
+# Phase 1: protocol coverage, the security properties around forwarded
+# metadata, and the response spool.
+run protocol.sh
+run forwarded.sh
+run http2.sh
+run spool.sh "${SPOOL_MIB:-8}" "${SPOOL_RATE:-32k}"
+run adversarial.sh "${ADVERSARIAL_SECONDS:-20}"
+
+# WebSockets need a Python interpreter for the client. Skipped loudly, on the
+# same reasoning as the Docker block below.
+if command -v python3 >/dev/null; then
+  run websocket.sh
+else
+  echo
+  echo "SKIPPED bench/websocket.sh — no python3 for the WebSocket client."
+  FAILED="$FAILED websocket.sh(no-python3)"
+fi
+
+# TLS needs its own build (`--features tls`, a two-minute compile) and
+# openssl to mint a certificate. SKIP_TLS=1 acknowledges leaving it out.
+if [ "${SKIP_TLS:-0}" = "1" ]; then
+  echo
+  echo "SKIPPED bench/tls.sh (SKIP_TLS=1)"
+elif command -v openssl >/dev/null; then
+  run tls.sh
+else
+  echo
+  echo "SKIPPED bench/tls.sh — no openssl to mint a test certificate."
+  FAILED="$FAILED tls.sh(no-openssl)"
+fi
+
 # The Next.js proof needs Docker. It is skipped loudly rather than quietly: a
 # suite that reports success while silently omitting its only real-framework
 # test is exactly the kind of evidence this phase exists to remove.
 if [ "${SKIP_DOCKER:-0}" = "1" ]; then
   echo
   echo "SKIPPED bench/nextjs.sh (SKIP_DOCKER=1)"
-elif docker info >/dev/null 2>&1; then
+elif docker_available; then
   run nextjs.sh
   if [ "${SKIP_BROWSER:-0}" = "1" ]; then
     echo "SKIPPED bench/nextjs-browser.sh (SKIP_BROWSER=1)"
@@ -50,7 +105,7 @@ elif docker info >/dev/null 2>&1; then
   fi
 else
   echo
-  echo "SKIPPED bench/nextjs.sh — no Docker daemon reachable."
+  echo "SKIPPED bench/nextjs.sh — no Docker daemon reachable within 10s."
   echo "  The real Next.js integration proof did NOT run. Set SKIP_DOCKER=1 to"
   echo "  acknowledge this deliberately."
   FAILED="$FAILED nextjs.sh(no-docker)"

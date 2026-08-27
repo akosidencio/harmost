@@ -25,6 +25,10 @@ pub struct Config {
     #[serde(default)]
     pub overload: Overload,
     #[serde(default)]
+    pub spool: Spool,
+    #[serde(default)]
+    pub upgrade: Upgrade,
+    #[serde(default)]
     pub deployment: Deployment,
     #[serde(default)]
     pub routes: Vec<Route>,
@@ -42,18 +46,91 @@ pub struct Config {
 pub struct Server {
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Accept HTTP/2 over cleartext on `listen`.
+    ///
+    /// Pingora sniffs the connection preface, so an h2c listener still serves
+    /// HTTP/1.1 clients. Off by default: h2c is only reachable by a client
+    /// that already knows to speak it, and turning it on changes how request
+    /// headers arrive (no `Host`, repeated `Cookie` lines) on a path that
+    /// classification and cache keying both read.
+    #[serde(default)]
+    pub h2c: bool,
+    /// Terminate TLS here rather than in front of Harmost.
+    #[serde(default)]
+    pub tls: Option<ServerTls>,
+    /// Who is allowed to tell Harmost about the client.
+    #[serde(default)]
+    pub trusted_proxies: TrustedProxies,
 }
 
 impl Default for Server {
     fn default() -> Self {
         Server {
             listen: default_listen(),
+            h2c: false,
+            tls: None,
+            trusted_proxies: TrustedProxies::default(),
         }
     }
 }
 
 fn default_listen() -> String {
     "0.0.0.0:8080".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerTls {
+    /// A second listener. `server.listen` keeps serving cleartext, so an
+    /// operator can run both during a migration without a second process.
+    pub listen: String,
+    /// PEM certificate chain: leaf first, then intermediates.
+    pub cert: String,
+    /// PEM private key.
+    pub key: String,
+    /// Offer `h2` in ALPN. `http/1.1` is always offered as well, so a client
+    /// that cannot speak HTTP/2 is never locked out.
+    #[serde(default = "yes")]
+    pub h2: bool,
+}
+
+/// Forwarded metadata is a claim, not a fact.
+///
+/// `X-Forwarded-For` and `X-Forwarded-Proto` are set by whoever spoke to us
+/// last, and anyone on the internet can spoof both. Harmost therefore reads
+/// them only from a peer whose address is in `from`. Everyone else is treated
+/// as the client, whatever they claim — which is also why `from` is empty by
+/// default: an unconfigured Harmost cannot be lied to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedProxies {
+    /// CIDR blocks whose forwarded headers are believed. `10.0.0.0/8`,
+    /// `192.168.1.7/32` and `2001:db8::/32` all parse; a bare address is
+    /// treated as a single-host prefix.
+    #[serde(default)]
+    pub from: Vec<String>,
+    /// Where the client address comes from when the peer is trusted.
+    #[serde(default)]
+    pub client_ip: ForwardedSource,
+    /// Where the original scheme comes from when the peer is trusted.
+    ///
+    /// The scheme is part of the cache key, so a spoofable one is a cache
+    /// partition an attacker controls.
+    #[serde(default)]
+    pub scheme: ForwardedSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardedSource {
+    /// `X-Forwarded-For` / `X-Forwarded-Proto`.
+    #[default]
+    XForwarded,
+    /// RFC 7239 `Forwarded: for=...;proto=...`.
+    Forwarded,
+    /// Believe nothing. The connection peer is the client and the listener
+    /// decides the scheme.
+    None,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +141,59 @@ pub struct Origin {
     pub load_balancing: LoadBalancing,
     #[serde(default)]
     pub concurrency: Concurrency,
+    /// Speak TLS to the origin.
+    #[serde(default)]
+    pub tls: Option<OriginTls>,
+    /// Which HTTP version to speak to the origin.
+    #[serde(default)]
+    pub http_version: OriginHttpVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginTls {
+    /// SNI and the name the certificate is checked against. Required: a peer
+    /// with an empty SNI cannot be hostname-verified, and silently not
+    /// verifying is the failure mode this key exists to prevent.
+    pub sni: String,
+    /// Verify the origin's certificate chain.
+    ///
+    /// `false` is accepted for a self-signed origin behind a private network,
+    /// and is loud in `harmost check` because it turns the connection into
+    /// encryption without authentication.
+    #[serde(default = "yes")]
+    pub verify_cert: bool,
+    /// Also require the certificate to match `sni`.
+    #[serde(default = "yes")]
+    pub verify_hostname: bool,
+    /// PEM bundle to trust in addition to the system roots.
+    ///
+    /// Accepted by the schema and **rejected at startup**: Pingora 0.8's
+    /// rustls connector never reads the per-peer CA store — its `connect`
+    /// carries a `TODO: setup CA/verify cert store from peer` and
+    /// `peer.get_ca()` is unused. Silently ignoring it would mean a config
+    /// that names a CA, a proxy that verifies against the system roots
+    /// instead, and no way to tell from the outside. Use `SSL_CERT_FILE` /
+    /// `SSL_CERT_DIR`, which the platform store does honour.
+    #[serde(default)]
+    pub ca: Option<String>,
+}
+
+/// HTTP/1.1 by default because that is what `next start` speaks.
+///
+/// `http2` over cleartext is prior-knowledge h2c: there is no ALPN to
+/// negotiate with and no upgrade dance, so an origin that does not speak it
+/// answers with a protocol error rather than falling back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginHttpVersion {
+    #[default]
+    Http1,
+    Http2,
+    /// Offer both in ALPN and take what the origin picks. Only meaningful with
+    /// `origin.tls`; over cleartext there is nothing to negotiate with, so
+    /// validation refuses the combination.
+    Auto,
 }
 
 /// v0.1 ships round-robin and hash-by-path only.
@@ -265,6 +395,91 @@ fn d_30s() -> Dur {
     Dur(std::time::Duration::from_secs(30))
 }
 
+/// A bounded buffer between the origin and a slow client.
+///
+/// Without it, an origin work permit is held until the *client* has finished
+/// reading, because Pingora paces upstream reads against downstream writes.
+/// With it, response body bytes are absorbed here so the origin is never made
+/// to wait on the client, `end_of_stream` is observed when the origin has
+/// actually finished, and the permit goes back then.
+///
+/// The cost is progressive rendering: a spooled response reaches the client
+/// only once the origin has finished producing it. That is why it is off by
+/// default and set per route.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spool {
+    /// Default for every route. A route may override it either way.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ceiling on one response. A body that outgrows it stops being spooled:
+    /// what is buffered is flushed, the rest streams through, and the permit
+    /// is held as it was before — bounded by `timeouts.downstream_write`.
+    #[serde(default = "default_spool_body")]
+    pub max_body: Bytes,
+    /// Ceiling across every in-flight spool at once. This is the number that
+    /// stops a thousand slow readers from turning a per-request bound into a
+    /// process-wide one.
+    #[serde(default = "default_spool_memory")]
+    pub max_memory: Bytes,
+}
+
+impl Default for Spool {
+    fn default() -> Self {
+        Spool {
+            enabled: false,
+            max_body: default_spool_body(),
+            max_memory: default_spool_memory(),
+        }
+    }
+}
+
+fn default_spool_body() -> Bytes {
+    Bytes(2 * 1024 * 1024)
+}
+fn default_spool_memory() -> Bytes {
+    Bytes(256 * 1024 * 1024)
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSpool {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// `Upgrade`-carrying requests: WebSocket, and anything else that turns one
+/// request into a long-lived tunnel.
+///
+/// These are refused by default. An upgraded connection is neither cacheable
+/// nor coalescible and lives far longer than a render, so admitting one
+/// against the render ceiling would let a handful of sockets consume the
+/// capacity the origin needs to answer pages.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upgrade {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ceiling on concurrent upgraded connections, counted separately from
+    /// `origin.concurrency`. There is no queue: a tunnel that has to wait is
+    /// a tunnel that has already failed.
+    #[serde(default = "default_upgrade_max")]
+    pub max_concurrent: usize,
+}
+
+impl Default for Upgrade {
+    fn default() -> Self {
+        Upgrade {
+            enabled: false,
+            max_concurrent: default_upgrade_max(),
+        }
+    }
+}
+
+fn default_upgrade_max() -> usize {
+    100
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Overload {
@@ -315,6 +530,8 @@ pub struct Route {
     pub coalesce: Option<RouteCoalesce>,
     #[serde(default)]
     pub concurrency: Option<Concurrency>,
+    #[serde(default)]
+    pub spool: Option<RouteSpool>,
 }
 
 /// `match: "/products/**"` and the expanded table form both parse.

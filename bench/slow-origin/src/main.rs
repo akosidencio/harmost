@@ -29,6 +29,12 @@ struct Stats {
     in_flight: AtomicUsize,
     peak: AtomicUsize,
     total: AtomicUsize,
+    /// Upgraded connections currently held open, and how many there have been.
+    /// Counted apart from `total` on purpose: a socket is not a render, and a
+    /// benchmark asserting "the upgrade consumed no render capacity" needs the
+    /// two numbers to be independently readable.
+    sockets_open: AtomicUsize,
+    sockets_total: AtomicUsize,
 }
 
 #[tokio::main]
@@ -41,6 +47,8 @@ async fn main() -> std::io::Result<()> {
         in_flight: AtomicUsize::new(0),
         peak: AtomicUsize::new(0),
         total: AtomicUsize::new(0),
+        sockets_open: AtomicUsize::new(0),
+        sockets_total: AtomicUsize::new(0),
     });
 
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
@@ -67,6 +75,14 @@ async fn main() -> std::io::Result<()> {
             if let Some(body) = control_response(&path, &stats) {
                 let _ = sock.write_all(body.as_bytes()).await;
                 let _ = sock.flush().await;
+                return;
+            }
+
+            // A WebSocket handshake is not a render either. It takes the
+            // socket counters and leaves `total` alone, which is what lets a
+            // benchmark prove an upgrade cost no render capacity.
+            if path.starts_with("/ws") {
+                serve_websocket(sock, &head, &stats).await;
                 return;
             }
 
@@ -123,7 +139,140 @@ async fn main() -> std::io::Result<()> {
                 return;
             }
 
+            // Bodies that are deliberately wrong on the wire. Both look like
+            // a normal cacheable response right up to the point where they
+            // stop, which is what makes them worth testing: a cache that
+            // stores what it received rather than what was promised would
+            // serve the truncation to everyone afterwards.
+            if path.starts_with("/truncated") {
+                let promised: usize = tail_number(&path).unwrap_or(4096);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/html\r\n\
+                     Content-Length: {promised}\r\n\
+                     Cache-Control: public, max-age=60\r\n\
+                     X-Origin-Total: {seq}\r\n\r\n"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                // Half of what was promised, then the connection closes.
+                let _ = sock.write_all(&vec![b'x'; promised / 2]).await;
+                let _ = sock.flush().await;
+                stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            if path.starts_with("/badchunk") {
+                let head = "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/html\r\n\
+                     Transfer-Encoding: chunked\r\n\
+                     Cache-Control: public, max-age=60\r\n\r\n";
+                let _ = sock.write_all(head.as_bytes()).await;
+                // One well-formed chunk, then no terminating `0\r\n\r\n`.
+                let _ = sock.write_all(b"10\r\n0123456789abcdef\r\n").await;
+                let _ = sock.flush().await;
+                stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+
+            // /echo-headers reports what the *origin* received, which is the
+            // only place the forwarded-header rules can be checked from. A
+            // proxy that concluded the right client address and then sent a
+            // different one upstream would look correct in its own access log
+            // and be wrong everywhere the origin uses the value.
+            if path.starts_with("/echo-headers") {
+                let body = format!(
+                    "{{\"x_forwarded_for\":\"{}\",\"x_forwarded_proto\":\"{}\",\"forwarded\":\"{}\",\"host\":\"{}\"}}",
+                    header_value(&head, "x-forwarded-for").unwrap_or_default(),
+                    header_value(&head, "x-forwarded-proto").unwrap_or_default(),
+                    header_value(&head, "forwarded").unwrap_or_default(),
+                    header_value(&head, "host").unwrap_or_default(),
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Cache-Control: private, no-store\r\n\
+                     X-Origin-Total: {seq}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+                stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+
+            // /rendered/<MiB> separates rendering from transmitting.
+            //
+            // Every other endpoint here counts a request as in flight until
+            // its last byte is written, which conflates the two. A real SSR
+            // origin does not: React finishes, the event loop is free, and the
+            // bytes drain at whatever pace the network manages. That
+            // distinction is the entire subject of the response spool, so the
+            // benchmark for it needs an origin that can say "I have finished
+            // rendering" while a slow client is still reading.
+            if path.starts_with("/rendered") {
+                let mib = tail_number(&path).unwrap_or(1);
+                let body = format!(
+                    "<html><body>rendered {path}{}</body></html>",
+                    "x".repeat(mib * 1024 * 1024)
+                );
+                tokio::time::sleep(Duration::from_millis(render_ms)).await;
+                // The render is over. Everything after this line is transport,
+                // and the counters must not attribute it to the origin.
+                stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/html\r\n\
+                     Content-Length: {}\r\n\
+                     Cache-Control: private, no-cache, no-store, max-age=0, must-revalidate\r\n\
+                     X-Origin-Total: {seq}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+                return;
+            }
+
             tokio::time::sleep(Duration::from_millis(render_ms)).await;
+
+            // /validated/* carries an ETag and Last-Modified and answers
+            // conditional requests itself, so a test can tell a 304 the origin
+            // produced from a 304 the cache produced.
+            if path.starts_with("/validated") {
+                let etag = format!("\"v-{}\"", tail_number(&path).unwrap_or(1));
+                let matched = header_value(&head, "if-none-match")
+                    .is_some_and(|value| value.split(',').any(|t| t.trim() == etag));
+                let response = if matched {
+                    format!(
+                        "HTTP/1.1 304 Not Modified\r\n\
+                         ETag: {etag}\r\n\
+                         Cache-Control: public, max-age=60\r\n\
+                         X-Origin-Total: {seq}\r\n\
+                         Connection: close\r\n\r\n"
+                    )
+                } else {
+                    let body = format!("<html><body>validated {path}</body></html>");
+                    format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/html\r\n\
+                         Content-Length: {}\r\n\
+                         ETag: {etag}\r\n\
+                         Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\
+                         Cache-Control: public, max-age=60\r\n\
+                         Accept-Ranges: bytes\r\n\
+                         X-Origin-Total: {seq}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+                stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
 
             // /private/* sets a session cookie. Nothing that does this may
             // ever be shared between requests, no matter what the route
@@ -175,10 +324,12 @@ fn control_response(path: &str, stats: &Stats) -> Option<String> {
     let body = match path {
         "/healthz" => "ok".to_string(),
         "/__stats" => format!(
-            "{{\"in_flight\":{},\"peak\":{},\"total\":{}}}",
+            "{{\"in_flight\":{},\"peak\":{},\"total\":{},\"sockets_open\":{},\"sockets_total\":{}}}",
             stats.in_flight.load(Ordering::SeqCst),
             stats.peak.load(Ordering::SeqCst),
             stats.total.load(Ordering::SeqCst),
+            stats.sockets_open.load(Ordering::SeqCst),
+            stats.sockets_total.load(Ordering::SeqCst),
         ),
         "/__reset" => {
             // in_flight is deliberately not cleared: it is a live count, and
@@ -188,6 +339,7 @@ fn control_response(path: &str, stats: &Stats) -> Option<String> {
                 .peak
                 .store(stats.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
             stats.total.store(0, Ordering::SeqCst);
+            stats.sockets_total.store(0, Ordering::SeqCst);
             "reset".to_string()
         }
         _ => return None,
@@ -200,4 +352,223 @@ fn control_response(path: &str, stats: &Stats) -> Option<String> {
          Connection: close\r\n\r\n{body}",
         body.len(),
     ))
+}
+
+// ---------------------------------------------------------------- protocols
+
+/// The trailing `/<number>` of a path, if there is one.
+fn tail_number(path: &str) -> Option<usize> {
+    path.rsplit('/').next().and_then(|s| s.parse().ok())
+}
+
+/// One request header's value, matched case-insensitively.
+fn header_value(head: &str, name: &str) -> Option<String> {
+    head.lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+}
+
+/// A real WebSocket server: RFC 6455 handshake, then an echo of every text
+/// frame until the client sends a close.
+///
+/// Faithful rather than approximate on purpose. A fixture that answered `101`
+/// with a wrong `Sec-WebSocket-Accept` would still tunnel bytes through the
+/// proxy — which is all Harmost handles — and would therefore pass a test that
+/// a browser would fail. Computing the accept key is forty lines and removes
+/// that whole class of false confidence.
+async fn serve_websocket(mut sock: tokio::net::TcpStream, head: &str, stats: &Arc<Stats>) {
+    let Some(key) = header_value(head, "sec-websocket-key") else {
+        let _ = sock
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+        return;
+    };
+    let accept = websocket_accept(&key);
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    if sock.write_all(response.as_bytes()).await.is_err() {
+        return;
+    }
+    let _ = sock.flush().await;
+
+    stats.sockets_open.fetch_add(1, Ordering::SeqCst);
+    stats.sockets_total.fetch_add(1, Ordering::SeqCst);
+
+    let mut buf = vec![0u8; 4096];
+    while let Ok(n) = sock.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+        // Only what the echo needs: a client-masked frame with a payload
+        // short enough to fit the 7-bit length. The bench client sends
+        // nothing else.
+        let frame = &buf[..n];
+        if frame.len() < 2 {
+            break;
+        }
+        let opcode = frame[0] & 0x0f;
+        if opcode == 0x8 {
+            // Close: echo it back and hang up, so the client sees a clean
+            // shutdown rather than a reset it cannot distinguish from a bug.
+            let _ = sock.write_all(&[0x88, 0x00]).await;
+            break;
+        }
+        let masked = frame[1] & 0x80 != 0;
+        let length = (frame[1] & 0x7f) as usize;
+        let mask_at = 2;
+        if !masked || frame.len() < mask_at + 4 + length {
+            break;
+        }
+        let mask = &frame[mask_at..mask_at + 4];
+        let payload: Vec<u8> = frame[mask_at + 4..mask_at + 4 + length]
+            .iter()
+            .enumerate()
+            .map(|(i, byte)| byte ^ mask[i % 4])
+            .collect();
+        // Server frames are never masked.
+        let mut out = vec![0x81, payload.len() as u8];
+        out.extend_from_slice(&payload);
+        if sock.write_all(&out).await.is_err() {
+            break;
+        }
+        let _ = sock.flush().await;
+    }
+    stats.sockets_open.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// `base64(sha1(key + RFC 6455 GUID))`.
+fn websocket_accept(key: &str) -> String {
+    const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    base64(&sha1(format!("{key}{GUID}").as_bytes()))
+}
+
+/// SHA-1, per FIPS 180-4. Present because a fixture should not drag a
+/// dependency tree into the workspace for one hash, and because the only
+/// alternative — a wrong accept key — would make the WebSocket test prove less
+/// than it appears to.
+fn sha1(message: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let bit_len = (message.len() as u64) * 8;
+
+    let mut padded = message.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in padded.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in block.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((n >> (18 - i * 6)) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha1_matches_the_published_vectors() {
+        assert_eq!(
+            sha1(b"abc")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            sha1(b"")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+    }
+
+    #[test]
+    fn the_accept_key_matches_the_rfc_6455_example() {
+        // RFC 6455 §1.3 works the example through end to end. If this is
+        // wrong, the fixture still tunnels bytes and the WebSocket benchmark
+        // still passes — while a real browser refuses the handshake.
+        assert_eq!(
+            websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn base64_pads_every_remainder() {
+        assert_eq!(base64(b"a"), "YQ==");
+        assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64(b"abc"), "YWJj");
+    }
 }

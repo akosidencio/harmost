@@ -4,17 +4,25 @@
 //! [`ProxyHttp::proxy_upstream_filter`] rather than `request_filter`:
 //!
 //! ```text
+//! early_request_filter  resolve the client address and scheme from the
+//!                       connection, believing forwarded headers only from a
+//!                       trusted peer
 //! request_filter        classify, resolve route
 //! request_cache_filter  enable the cache if this route may reuse
 //! cache lookup          hit, or wait on the cache lock as a coalesced follower
 //! proxy_upstream_filter admission — only reached on a genuine miss
 //! upstream_peer         pick a backend
+//! response_body_filter  spool the body, so the origin is never paced by the
+//!                       client and the permit can go back when the origin is
+//!                       genuinely finished
 //! ```
 //!
 //! Putting admission earlier would make cache hits and coalesced followers
 //! queue for origin capacity they never consume. Pingora documents this hook
 //! for exactly this purpose: "deferring checks like rate limiting ... to when
 //! they are actually needed after cache miss".
+
+pub mod spool;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -33,8 +41,10 @@ use crate::admission::{Admission, AdmissionController};
 use crate::cache::policy::{Disposition, Shareability, evaluate_request, evaluate_response};
 use crate::cache::{BoundedStore, KeyBuilder};
 use crate::classifier::{FrameworkAdapter, RequestClass, RequestMetadata, nextjs::NextJs};
-use crate::config::schema::{LogFormat, RouteCache, Timeouts};
+use crate::config::schema::{LogFormat, OriginHttpVersion, RouteCache, Timeouts};
+use crate::net::forwarded::{ClientFacts, ListenerScheme, TrustPolicy};
 use crate::policy::PolicySnapshot;
+use crate::proxy::spool::{Spool, SpoolBudget, SpoolOutcome};
 use crate::telemetry::logging::AccessLog;
 use crate::telemetry::metrics;
 use crate::upstream::UpstreamPool;
@@ -49,16 +59,27 @@ pub struct Ctx {
     pub route_id: Option<String>,
     /// Origin capacity, held for as long as this request is consuming it.
     ///
-    /// Known gap: because the body is streamed straight through, this is
-    /// released when the *client* finishes reading, not when the origin
-    /// finishes rendering. A slow reader therefore occupies a slot sized for a
-    /// render. The fix is a bounded decoupling buffer plus the downstream write
-    /// timeout; until then `timeouts.downstream_write` is what bounds it.
+    /// Released at the upstream's end of stream. Whether that instant is
+    /// honest depends on the spool: with one, the origin was never paced by
+    /// the client, so end of stream *is* the moment the origin finished.
+    /// Without one, Pingora pairs upstream reads with downstream writes and a
+    /// slow reader delays the observation — bounded only by
+    /// `timeouts.downstream_write`. See [`spool`].
     pub permit: Option<Permit>,
+    /// Capacity for an upgraded connection, counted separately from renders
+    /// because it is held for the life of a tunnel rather than a render.
+    pub upgrade_permit: Option<Permit>,
     pub shed: bool,
     pub upstream: Option<String>,
     pub origin_started: Option<Instant>,
     pub origin_finished_ms: Option<u128>,
+
+    /// The connection facts, resolved once in `early_request_filter`.
+    ///
+    /// Resolved there rather than read at each use so that one request cannot
+    /// see two different answers, and so the trusted-proxy decision is made
+    /// exactly once per request.
+    pub client: ClientFacts,
 
     /// Cache policy resolved during `request_filter` and consumed later in the
     /// pipeline, where the request header is no longer convenient to re-read.
@@ -70,6 +91,14 @@ pub struct Ctx {
     pub coalesce_override: bool,
     /// Where the origin permit was given back, for the access log.
     pub permit_released_at: Option<&'static str>,
+
+    /// Does this route ask for a response spool?
+    pub spool_enabled: bool,
+    /// The buffer itself, created once the request holds a permit worth
+    /// protecting. `None` means the body streams straight through.
+    pub spool: Option<Spool>,
+    /// Recorded before the spool is dropped, for the access log.
+    pub spool_outcome: Option<SpoolOutcome>,
 }
 
 impl Ctx {
@@ -80,10 +109,16 @@ impl Ctx {
             class: RequestClass::Unknown,
             route_id: None,
             permit: None,
+            upgrade_permit: None,
             shed: false,
             upstream: None,
             origin_started: None,
             origin_finished_ms: None,
+            client: ClientFacts {
+                client_ip: None,
+                scheme: "http",
+                peer_trusted: false,
+            },
             route_cache: None,
             key_headers: Vec::new(),
             transient_only: false,
@@ -91,6 +126,9 @@ impl Ctx {
             may_coalesce: false,
             coalesce_override: false,
             permit_released_at: None,
+            spool_enabled: false,
+            spool: None,
+            spool_outcome: None,
         }
     }
 }
@@ -104,6 +142,16 @@ pub struct Harmost {
     /// Built once at startup. Pingora's lock constructor controls how long a
     /// writer may own a key; follower wait time is configured per request.
     cache_lock: &'static pingora_cache::lock::CacheKeyLockImpl,
+    /// Who may describe the client. Compiled once; a reload that changes it is
+    /// refused for the same reason a listen-address change is, because a
+    /// request already in flight would otherwise straddle two trust models.
+    trust: TrustPolicy,
+    /// The process-wide ceiling on spooled response bytes.
+    spool_budget: Arc<SpoolBudget>,
+    /// Concurrent upgraded connections. Separate from the render ceiling: a
+    /// tunnel is held for minutes, a render for milliseconds, and letting the
+    /// two share a budget means a handful of sockets can starve every page.
+    upgrades: Arc<Limiter>,
 }
 
 impl Harmost {
@@ -111,7 +159,7 @@ impl Harmost {
         policy: Arc<ArcSwap<PolicySnapshot>>,
         admission: Arc<AdmissionController>,
         upstreams: Arc<UpstreamPool>,
-    ) -> Self {
+    ) -> std::result::Result<Self, String> {
         let initial = policy.load();
         // `Storage` takes `&'static self` throughout, so the store and the
         // lock are created once and leaked deliberately at startup.
@@ -119,16 +167,30 @@ impl Harmost {
         let cache_lock: &'static pingora_cache::lock::CacheKeyLockImpl = Box::leak(
             pingora_cache::lock::CacheLock::new_boxed(initial.config.timeouts.origin.as_duration()),
         );
+        let trust = TrustPolicy::build(&initial.config.server.trusted_proxies)
+            .map_err(|error| format!("server.trusted_proxies: {error}"))?;
+        let spool_budget = SpoolBudget::new(initial.config.spool.max_memory.get() as usize);
+        // No queue: a tunnel that has to wait for a slot is a tunnel whose
+        // handshake has already timed out somewhere else.
+        let upgrades = Limiter::new(
+            "upgrade",
+            initial.config.upgrade.max_concurrent,
+            0,
+            std::time::Duration::ZERO,
+        );
         drop(initial);
 
-        Harmost {
+        Ok(Harmost {
             store,
             cache_lock,
             adapter: Arc::new(NextJs),
             upstreams,
             admission,
             policy,
-        }
+            trust,
+            spool_budget,
+            upgrades,
+        })
     }
 
     /// Route limiter for this request, created on first use.
@@ -141,6 +203,24 @@ impl Harmost {
             c.queue.max,
             c.queue.timeout.as_duration(),
         ))
+    }
+
+    /// Answer an upgrade request that Harmost will not proxy.
+    ///
+    /// `501` rather than the overload status: nothing is overloaded, the proxy
+    /// simply does not implement this. Sending the overload `503` would invite
+    /// a client to retry something that will never succeed, and would put a
+    /// configuration mistake into the same metric as real origin pressure.
+    async fn refuse_upgrade(&self, session: &mut Session, policy: &PolicySnapshot) -> Result<()> {
+        let mut resp = ResponseHeader::build(501, Some(3))?;
+        resp.insert_header("Cache-Control", "no-store")?;
+        resp.insert_header("Connection", "close")?;
+        if policy.config.debug_headers {
+            resp.insert_header("X-Harmost", "UPGRADE-DISABLED")?;
+        }
+        session.as_downstream_mut().set_keepalive(None);
+        session.write_response_header(Box::new(resp), true).await?;
+        Ok(())
     }
 
     async fn refuse(&self, session: &mut Session, policy: &PolicySnapshot) -> Result<()> {
@@ -183,19 +263,26 @@ impl ProxyHttp for Harmost {
         if !timeout.is_zero() {
             session.as_downstream_mut().set_write_timeout(Some(timeout));
         }
+
+        // Resolve who the client is and what scheme they used, once, before
+        // anything reads either. Both are claims when Harmost sits behind a
+        // load balancer, and the scheme in particular is part of the cache
+        // key — a client that could set it would own a key dimension and turn
+        // one URL into an unbounded number of renders.
+        ctx.client = self.trust.resolve(
+            session
+                .client_addr()
+                .and_then(|address| address.as_inet())
+                .map(|address| address.ip()),
+            &session.req_header().headers,
+            listener_scheme(session),
+        );
         Ok(())
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
         let req = session.req_header();
-        // Rendered, never dropped: a `Host` that `to_str` cannot read used to
-        // collapse to the empty string, putting every such request into one
-        // shared cache entry.
-        let host = req
-            .headers
-            .get("host")
-            .map(crate::classifier::header_text)
-            .unwrap_or_default();
+        let host = request_host(req);
         let path = req.uri.path().to_string();
         let query = req.uri.query().map(str::to_string);
         let method = req.method.clone();
@@ -243,6 +330,26 @@ impl ProxyHttp for Harmost {
         metrics::REQUESTS
             .with_label_values(&[route_label, ctx.class.as_str()])
             .inc();
+
+        // Spooling is per route, defaulting to the global setting. Decided
+        // here because this is the last hook that has the route in hand and
+        // the first that runs before any response byte exists.
+        ctx.spool_enabled = route
+            .and_then(|r| r.config.spool.as_ref())
+            .and_then(|spool| spool.enabled)
+            .unwrap_or(ctx.policy.config.spool.enabled);
+
+        // An upgrade leaves HTTP behind, so every filter after this one stops
+        // applying. Refuse it here, before the cache is consulted and before
+        // a backend is chosen.
+        if ctx.class == RequestClass::Upgrade && !ctx.policy.config.upgrade.enabled {
+            metrics::UPGRADES
+                .with_label_values(&[route_label, "disabled"])
+                .inc();
+            let policy = ctx.policy.clone();
+            self.refuse_upgrade(session, &policy).await?;
+            return Ok(true);
+        }
 
         let disposition = evaluate_request(
             &meta,
@@ -304,14 +411,7 @@ impl ProxyHttp for Harmost {
 
     fn cache_key_callback(&self, session: &Session, ctx: &mut Ctx) -> Result<PingoraCacheKey> {
         let req = session.req_header();
-        // Rendered, never dropped: a `Host` that `to_str` cannot read used to
-        // collapse to the empty string, putting every such request into one
-        // shared cache entry.
-        let host = req
-            .headers
-            .get("host")
-            .map(crate::classifier::header_text)
-            .unwrap_or_default();
+        let host = request_host(req);
         let path = req.uri.path().to_string();
         let query = req.uri.query().map(str::to_string);
 
@@ -324,7 +424,12 @@ impl ProxyHttp for Harmost {
         };
 
         let key = KeyBuilder {
-            scheme: "http",
+            // The effective scheme, not the listener's. An https request and
+            // an http one for the same URL are different entries: they can
+            // legitimately produce different bodies (absolute URLs, redirects,
+            // HSTS), and merging them is how a plaintext response reaches a
+            // client that asked for TLS.
+            scheme: ctx.client.scheme,
             query_policy: ctx.route_cache.as_ref().and_then(|c| c.query.as_ref()),
             variant_headers: &ctx.key_headers,
             deployment: ctx.policy.config.deployment.id.as_deref(),
@@ -347,11 +452,45 @@ impl ProxyHttp for Harmost {
             self.refuse(session, &ctx.policy).await?;
             return Ok(false);
         }
+        let route_label = ctx.route_id.as_deref().unwrap_or("-").to_string();
+
+        // An upgrade is admitted against its own ceiling and never against
+        // the render ceiling. `admit` would return `Exempt` for this class,
+        // which would let an unbounded number of tunnels through.
+        if ctx.class == RequestClass::Upgrade {
+            // No queue: `acquire` with no deadline either takes a slot now or
+            // refuses now.
+            match self.upgrades.acquire(None).await {
+                Ok(permit) => {
+                    ctx.upgrade_permit = Some(permit);
+                    metrics::UPGRADES
+                        .with_label_values(&[&route_label, "admitted"])
+                        .inc();
+                    metrics::UPGRADES_ACTIVE.set(
+                        (self
+                            .upgrades
+                            .limit()
+                            .saturating_sub(self.upgrades.available()))
+                            as i64,
+                    );
+                    return Ok(true);
+                }
+                Err(reason) => {
+                    ctx.shed = true;
+                    metrics::UPGRADES
+                        .with_label_values(&[&route_label, &format!("shed_{}", reason.as_str())])
+                        .inc();
+                    let policy = ctx.policy.clone();
+                    self.refuse(session, &policy).await?;
+                    return Ok(false);
+                }
+            }
+        }
+
         let route_limiter = ctx
             .route_id
             .as_deref()
             .and_then(|id| self.limiter_for(&ctx.policy, id));
-        let route_label = ctx.route_id.as_deref().unwrap_or("-").to_string();
         let outcome = self
             .admission
             .admit(ctx.class, route_limiter.as_ref())
@@ -385,6 +524,16 @@ impl ProxyHttp for Harmost {
         match outcome {
             Admission::Admitted(permits) => {
                 ctx.permit = Some(permits.into_inner());
+                // The spool exists to give a permit back early, so it is
+                // created only where there is a permit to give back. A class
+                // that is exempt from admission — static, streaming — has
+                // nothing to gain and everything to lose from being buffered.
+                if ctx.spool_enabled {
+                    ctx.spool = Some(Spool::new(
+                        self.spool_budget.clone(),
+                        ctx.policy.config.spool.max_body.get() as usize,
+                    ));
+                }
                 metrics::ADMISSION
                     .with_label_values(&[&route_label, "admitted"])
                     .inc();
@@ -523,21 +672,60 @@ impl ProxyHttp for Harmost {
         metrics::ORIGIN_REQUESTS
             .with_label_values(&[ctx.route_id.as_deref().unwrap_or("-"), &backend.address])
             .inc();
-        let mut peer = HttpPeer::new(backend.socket, false, String::new());
+        let origin = &ctx.policy.config.origin;
+        let mut peer = match &origin.tls {
+            Some(tls) => {
+                let mut peer = HttpPeer::new(backend.socket, true, tls.sni.clone());
+                peer.options.verify_cert = tls.verify_cert;
+                peer.options.verify_hostname = tls.verify_hostname;
+                peer
+            }
+            None => HttpPeer::new(backend.socket, false, String::new()),
+        };
+        peer.options.alpn = match origin.http_version {
+            OriginHttpVersion::Http1 => pingora_core::protocols::ALPN::H1,
+            // Over cleartext this is prior-knowledge h2c: there is no ALPN on
+            // the wire, and Pingora reads the minimum version as the caller
+            // asserting the origin speaks it.
+            OriginHttpVersion::Http2 => pingora_core::protocols::ALPN::H2,
+            OriginHttpVersion::Auto => pingora_core::protocols::ALPN::H2H1,
+        };
         configure_peer_timeouts(&mut peer, &ctx.policy.config.timeouts);
         Ok(Box::new(peer))
     }
 
     async fn upstream_request_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         upstream: &mut RequestHeader,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
     ) -> Result<()> {
-        if let Some(peer) = session.client_addr().and_then(|address| address.as_inet()) {
-            upstream.append_header("X-Forwarded-For", peer.ip().to_string())?;
+        // `insert_header`, never `append_header`.
+        //
+        // Appending kept whatever the client sent and added the peer to the
+        // end of it, so an origin reading the *first* entry — which is where
+        // every framework's `getClientIp` looks — read a value the client
+        // chose. Since the origin's own rate limits and audit logs are
+        // downstream of this, that is a forged identity with real effects.
+        //
+        // What Harmost sends is the one address it concluded, and the
+        // conclusion already accounts for the hop chain: see
+        // [`crate::net::forwarded`].
+        match ctx.client.client_ip {
+            Some(address) => {
+                upstream.insert_header("X-Forwarded-For", address.to_string())?;
+            }
+            // No address to state. Removing the header is not optional: a
+            // stale client-supplied value left in place is exactly the forgery
+            // this is here to prevent.
+            None => {
+                upstream.remove_header("X-Forwarded-For");
+            }
         }
-        upstream.insert_header("X-Forwarded-Proto", "http")?;
+        upstream.insert_header("X-Forwarded-Proto", ctx.client.scheme)?;
+        // Same reasoning. Harmost does not emit RFC 7239 `Forwarded` itself,
+        // so anything arriving under that name is a claim nobody vouched for.
+        upstream.remove_header("Forwarded");
         Ok(())
     }
 
@@ -563,22 +751,68 @@ impl ProxyHttp for Harmost {
                 .origin_started
                 .map(|started| started.elapsed().as_millis());
             if ctx.permit.is_some() {
-                ctx.permit_released_at = Some("body_end");
+                // Two different claims, and the log has to distinguish them.
+                //
+                // `origin_end`: this request was spooled and the spool was
+                // still absorbing, so no downstream write ever applied
+                // backpressure to the origin. End of stream is therefore the
+                // moment the origin finished, and the permit is released at
+                // the moment it stopped representing work.
+                //
+                // `body_end`: nothing was spooled, so Pingora paced upstream
+                // reads against downstream writes and a slow reader delayed
+                // this observation. The permit was still held for real, just
+                // for longer than the render took — bounded by
+                // `timeouts.downstream_write`.
+                //
+                // Releasing early on the strength of a `Content-Length` was
+                // tried and reverted: a length describes the body's size,
+                // never that the origin has finished producing it. See
+                // `bench/slowclient.sh`.
+                ctx.permit_released_at = Some(match &ctx.spool {
+                    Some(spool) if spool.is_active() => "origin_end",
+                    _ => "body_end",
+                });
             }
-            // The permit represents *render* capacity, and this is the
-            // earliest point at which the origin is known to have stopped
-            // rendering. It is not necessarily the moment it did: pingora
-            // paces upstream reads against downstream writes, so a slow reader
-            // delays when `end_of_stream` is observed. That gap is bounded by
-            // `timeouts.downstream_write` and closed properly only by a
-            // bounded response spool (roadmap phase 1).
-            //
-            // Releasing earlier on the strength of a `Content-Length` was
-            // tried and reverted: a length describes the body's size, never
-            // that the origin has finished producing it. See
-            // `bench/slowclient.sh`.
             ctx.permit = None;
         }
+        Ok(None)
+    }
+
+    /// The downstream side of the body path, and where the spool lives.
+    ///
+    /// This runs after Pingora has written the chunk to the cache and
+    /// immediately before the write that a slow client would block. Taking the
+    /// bytes here rather than in `upstream_response_body_filter` is the whole
+    /// trick: the earlier hook runs *before* the cache write, so withholding
+    /// there would store an empty entry.
+    fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Ctx,
+    ) -> Result<Option<std::time::Duration>> {
+        let Some(spool) = ctx.spool.as_mut() else {
+            return Ok(None);
+        };
+        // An upgraded connection is a tunnel in both directions. Buffering it
+        // would hold one side's bytes until the other side said something,
+        // which for an interactive protocol is a deadlock rather than a delay.
+        if session.was_upgraded() {
+            return Ok(None);
+        }
+        let was_active = spool.is_active();
+        *body = spool.offer(body.take(), end_of_stream);
+
+        if was_active && !spool.is_active() {
+            let outcome = spool.outcome().unwrap_or(SpoolOutcome::Complete);
+            ctx.spool_outcome = Some(outcome);
+            metrics::SPOOL
+                .with_label_values(&[ctx.route_id.as_deref().unwrap_or("-"), outcome.as_str()])
+                .inc();
+        }
+        metrics::SPOOL_BYTES.set(self.spool_budget.used() as i64);
         Ok(None)
     }
 
@@ -621,6 +855,11 @@ impl ProxyHttp for Harmost {
             (None, None) => 0,
         };
 
+        let client = ctx
+            .client
+            .client_ip
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| "-".to_string());
         let access = AccessLog {
             method: session.req_header().method.as_str(),
             // Path only — the query string routinely carries tokens.
@@ -629,11 +868,14 @@ impl ProxyHttp for Harmost {
             class: ctx.class.as_str(),
             cache,
             upstream: ctx.upstream.as_deref(),
+            client: &client,
+            scheme: ctx.client.scheme,
             status,
             shed: ctx.shed,
             origin_ms,
             total_ms: ctx.started.elapsed().as_millis(),
             permit_released_at: ctx.permit_released_at.unwrap_or("-"),
+            spool: ctx.spool_outcome.map(SpoolOutcome::as_str).unwrap_or("-"),
         };
         let line = match ctx.policy.config.telemetry.logging.format {
             LogFormat::Json => access.to_json(),
@@ -642,11 +884,30 @@ impl ProxyHttp for Harmost {
         log::info!("{line}");
 
         // Normally already released at upstream end-of-stream; this covers
-        // the paths that never got there (shed, cache hit, upstream error).
-        // Then republish the gauges: updating them only on the way in leaves
-        // `in_flight` reading stale while the proxy is idle, which is the
-        // moment an operator is most likely to be looking at it.
+        // the paths that never got there (shed, cache hit, upstream error,
+        // and a client that disconnected mid-body). Then republish the gauges:
+        // updating them only on the way in leaves `in_flight` reading stale
+        // while the proxy is idle, which is the moment an operator is most
+        // likely to be looking at it.
         ctx.permit = None;
+        // Dropping the spool returns its share of the global byte budget. On
+        // the disconnect path this is the only thing that does — end of stream
+        // never arrives — so it happens here rather than nowhere.
+        ctx.spool = None;
+        metrics::SPOOL_BYTES.set(self.spool_budget.used() as i64);
+        // Published on the way out rather than from a timer, for the same
+        // reason as the limiter gauges: a sampled memory number misses the
+        // spike that caused the incident someone is reading it during.
+        metrics::CACHE_BYTES.set(self.store.bytes_used() as i64);
+        metrics::CACHE_ENTRIES.set(self.store.entries() as i64);
+        if ctx.upgrade_permit.take().is_some() {
+            metrics::UPGRADES_ACTIVE.set(
+                (self
+                    .upgrades
+                    .limit()
+                    .saturating_sub(self.upgrades.available())) as i64,
+            );
+        }
         let global = self.admission.global();
         metrics::IN_FLIGHT
             .with_label_values(&["global"])
@@ -666,6 +927,47 @@ impl ProxyHttp for Harmost {
                 .with_label_values(&[l.name()])
                 .set(l.queue_depth() as i64);
         }
+    }
+}
+
+/// The authority this request names, over either protocol version.
+///
+/// HTTP/1.1 puts it in `Host`. HTTP/2 abolished that header and replaced it
+/// with the `:authority` pseudo-header, which Pingora surfaces on the URI
+/// rather than in the header map — so reading `Host` alone answers "" for
+/// every h2 request, and an empty host in the cache key merges every virtual
+/// host on the listener into one entry. That is a cross-tenant response leak
+/// that appears the moment `server.h2c` or `server.tls` is switched on and
+/// affects nothing before then, which is exactly the kind of change that
+/// reaches production unnoticed.
+///
+/// Rendered, never dropped: a `Host` whose bytes `to_str` refuses used to
+/// collapse to the empty string, with the same consequence.
+fn request_host(req: &RequestHeader) -> String {
+    if let Some(host) = req.headers.get(http::header::HOST) {
+        return crate::classifier::header_text(host);
+    }
+    req.uri
+        .authority()
+        .map(|authority| authority.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// Which scheme is this connection actually speaking?
+///
+/// Read from the connection's own TLS digest rather than from configuration,
+/// because a process can serve both a cleartext and a TLS listener at once and
+/// the answer differs per connection. This is the unforgeable half of the
+/// scheme decision; the forgeable half is the forwarded header, and
+/// [`TrustPolicy`] decides whether to believe it.
+fn listener_scheme(session: &Session) -> ListenerScheme {
+    let is_tls = session
+        .digest()
+        .is_some_and(|digest| digest.ssl_digest.is_some());
+    if is_tls {
+        ListenerScheme::Https
+    } else {
+        ListenerScheme::Http
     }
 }
 
@@ -750,6 +1052,52 @@ fn joined_header_values(
 mod tests {
     use super::*;
     use crate::config::schema::VaryPolicy;
+
+    /// A request shaped the way Pingora hands one over from an HTTP/2
+    /// session: `:authority` on the URI, no `Host` header anywhere.
+    fn h2_request(authority: &str, path: &str) -> RequestHeader {
+        let mut req = RequestHeader::build("GET", path.as_bytes(), None).unwrap();
+        req.set_uri(
+            http::Uri::builder()
+                .scheme("https")
+                .authority(authority)
+                .path_and_query(path)
+                .build()
+                .unwrap(),
+        );
+        req
+    }
+
+    #[test]
+    fn the_authority_is_found_over_both_protocol_versions() {
+        // HTTP/1.1: the `Host` header.
+        let mut h1 = RequestHeader::build("GET", b"/products/x", None).unwrap();
+        h1.insert_header("host", "shop.example.com").unwrap();
+        assert_eq!(request_host(&h1), "shop.example.com");
+
+        // HTTP/2: no `Host` at all — the authority lives on the URI, exactly
+        // as Pingora surfaces `:authority`. Reading only the header answers
+        // "", and an empty host in the cache key puts every virtual host on
+        // the listener into one entry.
+        let h2 = h2_request("shop.example.com", "/products/x");
+        assert!(
+            h2.headers.get(http::header::HOST).is_none(),
+            "this test is meaningless if the builder synthesised a Host header"
+        );
+        assert_eq!(request_host(&h2), "shop.example.com");
+
+        // Neither: still not a panic, and still not a shared key by accident —
+        // an empty host is at least honest about being empty.
+        let bare = RequestHeader::build("GET", b"/x", None).unwrap();
+        assert_eq!(request_host(&bare), "");
+    }
+
+    #[test]
+    fn two_authorities_never_produce_one_key_over_http2() {
+        let first = h2_request("a.example.com", "/p");
+        let second = h2_request("b.example.com", "/p");
+        assert_ne!(request_host(&first), request_host(&second));
+    }
 
     #[test]
     fn route_vary_headers_are_merged_with_framework_variants() {

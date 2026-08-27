@@ -66,6 +66,11 @@ pub fn validate(cfg: &Config) -> Result<()> {
     }
 
     validate_listen(&cfg.server.listen, "server.listen")?;
+    validate_server_tls(cfg)?;
+    validate_trusted_proxies(cfg)?;
+    validate_origin_tls(cfg)?;
+    validate_spool(cfg)?;
+    validate_upgrade(cfg)?;
     if let Some(prometheus) = &cfg.telemetry.prometheus {
         validate_listen(&prometheus.listen, "telemetry.prometheus.listen")?;
     }
@@ -119,6 +124,139 @@ fn check_unimplemented(cfg: &Config) -> Result<()> {
             "deployment.id_header is not implemented — a cache key is built before the \
              response exists, so the id cannot come from a response header; use \
              deployment.id instead",
+        ));
+    }
+    Ok(())
+}
+
+/// TLS asked for and TLS delivered must be the same thing.
+///
+/// The failure this exists to prevent is a binary built without the `tls`
+/// feature accepting a `server.tls` block and then serving nothing on that
+/// address — an operator would see a valid config, a running process, and a
+/// port that refuses connections, with no line anywhere saying why.
+fn validate_server_tls(cfg: &Config) -> Result<()> {
+    let Some(tls) = &cfg.server.tls else {
+        return Ok(());
+    };
+    if !cfg!(feature = "tls") {
+        return Err(err(
+            "server.tls is set but this binary was built without the `tls` feature;              rebuild with `cargo build --features tls`, or remove server.tls and              terminate TLS in front of Harmost",
+        ));
+    }
+    validate_listen(&tls.listen, "server.tls.listen")?;
+    if tls.listen == cfg.server.listen {
+        return Err(err(format!(
+            "server.tls.listen and server.listen are both `{}`;              one address cannot serve cleartext and TLS at once",
+            tls.listen
+        )));
+    }
+    if tls.cert.is_empty() || tls.key.is_empty() {
+        return Err(err("server.tls.cert and server.tls.key must both be set"));
+    }
+    // Checked here rather than at bind time so that `harmost check` catches a
+    // missing certificate before a deploy rather than after one.
+    for (path, label) in [(&tls.cert, "cert"), (&tls.key, "key")] {
+        if !std::path::Path::new(path).exists() {
+            return Err(err(format!("server.tls.{label} `{path}` does not exist")));
+        }
+    }
+    Ok(())
+}
+
+/// A trust list that cannot be parsed is a trust list that does not protect
+/// anything, and the symptom — forwarded headers silently ignored — looks
+/// exactly like a working deployment until someone reads the logs.
+fn validate_trusted_proxies(cfg: &Config) -> Result<()> {
+    let proxies = &cfg.server.trusted_proxies;
+    for block in &proxies.from {
+        crate::net::forwarded::Cidr::parse(block)
+            .map_err(|error| err(format!("server.trusted_proxies.from: {error}")))?;
+    }
+    // Naming a source without naming anyone to believe is a policy that reads
+    // as "trust X-Forwarded-For" and behaves as "trust nothing".
+    let reads_headers =
+        proxies.client_ip != ForwardedSource::None || proxies.scheme != ForwardedSource::None;
+    if proxies.from.is_empty()
+        && reads_headers
+        && cfg.server.trusted_proxies != TrustedProxies::default()
+    {
+        return Err(err(
+            "server.trusted_proxies names a client_ip or scheme source but `from` is empty,              so no peer is ever trusted and neither is read; list the CIDR blocks your              load balancer connects from",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_origin_tls(cfg: &Config) -> Result<()> {
+    let Some(tls) = &cfg.origin.tls else {
+        // ALPN only exists inside a TLS handshake. Asking to negotiate over
+        // cleartext is a request that cannot be honoured, and the honest
+        // failure is here rather than as a connection error per request.
+        if cfg.origin.http_version == OriginHttpVersion::Auto {
+            return Err(err(
+                "origin.http_version: auto negotiates over ALPN, which requires origin.tls;                  over cleartext choose http1 or http2 explicitly",
+            ));
+        }
+        return Ok(());
+    };
+    if !cfg!(feature = "tls") {
+        return Err(err(
+            "origin.tls is set but this binary was built without the `tls` feature;              rebuild with `cargo build --features tls`",
+        ));
+    }
+    if tls.sni.trim().is_empty() {
+        return Err(err(
+            "origin.tls.sni is empty; a peer with no SNI cannot be hostname-verified",
+        ));
+    }
+    // Verifying the name against a chain nobody checked verifies nothing.
+    if tls.verify_hostname && !tls.verify_cert {
+        return Err(err(
+            "origin.tls sets verify_hostname without verify_cert; a hostname is only              meaningful once the chain that vouches for it has been checked",
+        ));
+    }
+    if tls.ca.is_some() {
+        return Err(err(
+            "origin.tls.ca is not implemented: Pingora 0.8's rustls connector does not read              the per-peer CA store (its connect path carries an explicit TODO and never calls              peer.get_ca()), so naming a CA here would verify against the system roots anyway.              Add the CA to the platform trust store, or point SSL_CERT_FILE / SSL_CERT_DIR at              it — both are honoured — or set verify_cert: false if the origin is reachable only              over a private network",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_spool(cfg: &Config) -> Result<()> {
+    if cfg.spool.max_body.get() == 0 {
+        return Err(err("spool.max_body must be greater than zero"));
+    }
+    if cfg.spool.max_memory.get() == 0 {
+        return Err(err("spool.max_memory must be greater than zero"));
+    }
+    if cfg.spool.max_body > cfg.spool.max_memory {
+        return Err(err(format!(
+            "spool.max_body ({} bytes) exceeds spool.max_memory ({} bytes);              not one response could ever be spooled",
+            cfg.spool.max_body.get(),
+            cfg.spool.max_memory.get()
+        )));
+    }
+    // Spooling a streaming route would hold every chunk until the last one,
+    // which is the opposite of what the class is for. Refused rather than
+    // ignored: silently not spooling is indistinguishable from spooling.
+    for route in &cfg.routes {
+        let asked = route.spool.as_ref().and_then(|spool| spool.enabled) == Some(true);
+        if asked && route.class == Some(ClassOverride::Streaming) {
+            return Err(err(format!(
+                "route `{}` is class streaming and sets spool.enabled: true;                  a spool withholds the body until the origin finishes, which is                  exactly what a streaming route must not do",
+                route.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_upgrade(cfg: &Config) -> Result<()> {
+    if cfg.upgrade.enabled && cfg.upgrade.max_concurrent == 0 {
+        return Err(err(
+            "upgrade.enabled is true but upgrade.max_concurrent is 0, which admits nothing;              set a ceiling or disable upgrades",
         ));
     }
     Ok(())
@@ -319,6 +457,194 @@ cache:
         )
         .unwrap_err();
         assert!(e.to_string().contains("unknown field"), "{e}");
+    }
+
+    #[test]
+    fn rejects_an_unparseable_trusted_proxy_block() {
+        // A trust list that does not parse is a trust list that protects
+        // nothing, and the symptom looks exactly like a working deployment.
+        let cfg = parse(&format!(
+            "{BASE}
+server:
+  trusted_proxies:
+    from: [\"10.0.0.0/33\"]
+"
+        ));
+        let e = validate(&cfg).unwrap_err().to_string();
+        assert!(e.contains("trusted_proxies"), "{e}");
+    }
+
+    #[test]
+    fn accepts_ipv4_ipv6_and_bare_addresses_in_the_trust_list() {
+        let cfg = parse(&format!(
+            "{BASE}
+server:
+  trusted_proxies:
+    from: [\"10.0.0.0/8\", \"2001:db8::/32\", \"127.0.0.1\"]
+    client_ip: forwarded
+    scheme: forwarded
+"
+        ));
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_forwarded_source_with_nobody_to_believe() {
+        let cfg = parse(&format!(
+            "{BASE}
+server:
+  trusted_proxies:
+    client_ip: forwarded
+    scheme: forwarded
+"
+        ));
+        let e = validate(&cfg).unwrap_err().to_string();
+        assert!(e.contains("`from` is empty"), "{e}");
+    }
+
+    #[test]
+    fn the_default_trust_policy_is_accepted_and_believes_nobody() {
+        // The default is not "unset and therefore an error": it is a real
+        // policy — trust no peer — and it must validate.
+        let cfg = parse(BASE);
+        validate(&cfg).unwrap();
+        assert!(cfg.server.trusted_proxies.from.is_empty());
+    }
+
+    #[test]
+    fn rejects_alpn_negotiation_over_cleartext() {
+        // There is no ALPN outside a TLS handshake, so `auto` over cleartext
+        // is a request that cannot be honoured. Refused here rather than as a
+        // connection error on every request.
+        let cfg = parse(
+            "version: 1
+origin:
+  upstreams: [\"next-1:3000\"]
+  http_version: auto
+",
+        );
+        let e = validate(&cfg).unwrap_err().to_string();
+        assert!(e.contains("requires origin.tls"), "{e}");
+    }
+
+    #[test]
+    fn accepts_prior_knowledge_h2c_to_the_origin() {
+        let cfg = parse(
+            "version: 1
+origin:
+  upstreams: [\"next-1:3000\"]
+  http_version: http2
+",
+        );
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn rejects_tls_when_the_binary_cannot_serve_it() {
+        // The failure being prevented: a valid config, a running process, and
+        // a TLS port that refuses connections with nothing in the logs.
+        let cfg = parse(&format!(
+            "{BASE}
+server:
+  tls:
+    listen: \"0.0.0.0:8443\"
+    cert: /nonexistent/fullchain.pem
+    key: /nonexistent/privkey.pem
+"
+        ));
+        let e = validate(&cfg).unwrap_err().to_string();
+        if cfg!(feature = "tls") {
+            assert!(e.contains("does not exist"), "{e}");
+        } else {
+            assert!(e.contains("`tls` feature"), "{e}");
+        }
+    }
+
+    #[test]
+    fn rejects_an_origin_ca_that_the_connector_would_ignore() {
+        // The greengate rule: a key that is accepted and then ignored lets
+        // someone ship believing a protection is on. Here the belief would be
+        // "the origin's certificate is checked against my CA".
+        let cfg = parse(
+            "version: 1
+origin:
+  upstreams: [\"next-1:3000\"]
+  tls:
+    sni: origin.internal
+    ca: /etc/harmost/ca.pem
+",
+        );
+        let e = validate(&cfg).unwrap_err().to_string();
+        if cfg!(feature = "tls") {
+            assert!(e.contains("origin.tls.ca is not implemented"), "{e}");
+        } else {
+            assert!(e.contains("`tls` feature"), "{e}");
+        }
+    }
+
+    #[test]
+    fn rejects_hostname_verification_without_chain_verification() {
+        let cfg = parse(
+            "version: 1
+origin:
+  upstreams: [\"next-1:3000\"]
+  tls:
+    sni: origin.internal
+    verify_cert: false
+",
+        );
+        let e = validate(&cfg).unwrap_err().to_string();
+        if cfg!(feature = "tls") {
+            assert!(e.contains("verify_hostname without verify_cert"), "{e}");
+        } else {
+            assert!(e.contains("`tls` feature"), "{e}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_spool_ceiling_that_can_never_be_met() {
+        let cfg = parse(&format!(
+            "{BASE}
+spool:
+  enabled: true
+  max_body: 8MiB
+  max_memory: 4MiB
+"
+        ));
+        let e = validate(&cfg).unwrap_err().to_string();
+        assert!(e.contains("exceeds spool.max_memory"), "{e}");
+    }
+
+    #[test]
+    fn rejects_spooling_a_streaming_route() {
+        // A spool withholds the body until the origin finishes, which is the
+        // one thing a streaming route must not do. Refused rather than
+        // ignored: silently not spooling is indistinguishable from spooling.
+        let cfg = parse(&format!(
+            "{BASE}
+routes:
+  - id: feed
+    match: \"/feed\"
+    class: streaming
+    spool:
+      enabled: true
+"
+        ));
+        let e = validate(&cfg).unwrap_err().to_string();
+        assert!(e.contains("class streaming"), "{e}");
+    }
+
+    #[test]
+    fn rejects_an_upgrade_ceiling_that_admits_nothing() {
+        let cfg = parse(&format!(
+            "{BASE}
+upgrade:
+  enabled: true
+  max_concurrent: 0
+"
+        ));
+        let e = validate(&cfg).unwrap_err().to_string();
+        assert!(e.contains("admits nothing"), "{e}");
     }
 
     #[test]

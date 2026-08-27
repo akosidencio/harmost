@@ -51,6 +51,14 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked
 
+      # An optional feature that is never compiled in CI rots. This also covers
+      # the validation rules that branch on `cfg!(feature = "tls")`, which have
+      # opposite expected outcomes in the two builds.
+      - name: Clippy and test with TLS
+        run: |
+          cargo clippy --workspace --all-targets --locked --features tls -- -D warnings
+          cargo test --workspace --lib --locked --features tls
+
       # --all-targets silently skips doc tests, so run them separately.
       - name: Doc tests
         run: cargo test --workspace --doc --locked
@@ -84,7 +92,9 @@ jobs:
   benchmarks:
     name: end-to-end benchmarks (linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Longer than the unit-test job: bench/tls.sh compiles a second binary with
+    # the TLS stack, and bench/adversarial.sh runs for a fixed wall-clock span.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -122,6 +132,13 @@ jobs:
           COALESCE_CONCURRENCY: "30"
           STREAM_CONCURRENCY: "16"
           SAFETY_CONCURRENCY: "20"
+          # The spool benchmark asserts on its own control case, so its
+          # parameters have to keep a two-core runner slow enough to reproduce
+          # the problem being fixed. It fails loudly rather than passing
+          # vacuously if they do not.
+          SPOOL_MIB: "8"
+          SPOOL_RATE: "24k"
+          ADVERSARIAL_SECONDS: "20"
         run: ./bench/all.sh
 
       - name: Publish results with the parameters that produced them

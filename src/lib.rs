@@ -19,6 +19,7 @@ pub mod admission;
 pub mod cache;
 pub mod classifier;
 pub mod config;
+pub mod net;
 pub mod policy;
 pub mod proxy;
 pub mod telemetry;

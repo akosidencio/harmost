@@ -1,0 +1,44 @@
+# Benchmark config for HTTP semantics: HEAD, Range, conditional requests,
+# disconnects and malformed bodies.
+#
+# `/validated/**` is cacheable so the tests have a stored entry to range into
+# and revalidate against. `/slow/**` is not, so the disconnect test measures
+# admission rather than a cache hit.
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+origin:
+  upstreams: ["127.0.0.1:@ORIGIN@"]
+  concurrency:
+    max: @CEILING@
+    queue:
+      max: 20
+      timeout: 1s
+timeouts:
+  origin: 20s
+cache:
+  enabled: true
+  max_memory: 64MiB
+  max_body_size: 8MiB
+debug_headers: true
+routes:
+  - id: validated
+    match: "/validated/**"
+    class: public_ssr
+
+  # The origin marks these `public, max-age=60` on the way out, so anything
+  # stored here was stored on the origin's own say-so — no override is in
+  # play, which keeps the truncation test about durability rather than policy.
+  - id: broken
+    match: "/truncated/**"
+    class: public_ssr
+
+  - id: broken-chunked
+    match: "/badchunk/**"
+    class: public_ssr
+
+  - id: slow
+    match: "/slow/**"
+    class: private_dynamic
+    cache:
+      enabled: false

@@ -3,6 +3,26 @@ version: 1
 
 server:
   listen: "0.0.0.0:8080"
+  # Cleartext HTTP/2. Pingora peeks for the connection preface, so this
+  # listener still serves HTTP/1.1 clients.
+  h2c: false
+  # Native TLS termination. Needs a binary built with `--features tls`; one
+  # built without it *rejects* this block rather than leaving the port dead.
+  # tls:
+  #   listen: "0.0.0.0:8443"
+  #   cert: "/etc/harmost/fullchain.pem"
+  #   key: "/etc/harmost/privkey.pem"
+  #   h2: true
+  #
+  # Who may tell Harmost about the client. Empty by default, which means no
+  # forwarded header is read from anyone: the connection peer is the client and
+  # the listener decides the scheme. That default is deliberate — the scheme is
+  # part of the cache key, so a client that could set it would own a key
+  # dimension and mint one origin render per invented value.
+  trusted_proxies:
+    from: []
+    # client_ip: x_forwarded   # x_forwarded | forwarded | none
+    # scheme: x_forwarded
 
 origin:
   upstreams:
@@ -10,6 +30,12 @@ origin:
     - "next-2:3000"
   # Hashing by path also warms the origin's own render cache and JIT state.
   load_balancing: hash_by_path
+  # http1 (default), http2 (prior-knowledge h2c), or auto (ALPN, needs tls).
+  http_version: http1
+  # tls:
+  #   sni: "origin.internal"    # required; no SNI means no hostname check
+  #   verify_cert: true
+  #   verify_hostname: true
   concurrency:
     max: 500
     queue:
@@ -41,6 +67,29 @@ timeouts:
   origin: 30s
   downstream_write: 30s
 
+# A bounded buffer between the origin and a slow client.
+#
+# Without it, an origin permit is held until the *client* finishes reading,
+# because Pingora paces upstream reads against downstream writes. With it, the
+# origin is never made to wait on the client, so the permit goes back when the
+# origin has actually finished rendering.
+#
+# The cost is progressive rendering: a spooled response reaches the client only
+# once the origin has finished producing it. Hence off by default and per route.
+spool:
+  enabled: false
+  max_body: 2MiB       # ceiling on one response
+  max_memory: 256MiB   # ceiling across every in-flight spool at once
+
+# WebSocket and other protocol upgrades. Refused with 501 while this is off.
+#
+# An upgraded connection is held for minutes and a render for milliseconds, so
+# they never share a budget: an upgrade takes a slot here and never a render
+# permit. Nothing upgraded is ever cached or coalesced.
+upgrade:
+  enabled: false
+  max_concurrent: 100
+
 deployment:
   id: "build-local"
 
@@ -61,6 +110,10 @@ routes:
       stale_while_revalidate: 30s
       stale_if_error: 5m
     coalesce:
+      enabled: true
+    # Product pages are large and fully rendered before they are sent, so
+    # buffering them costs nothing that streaming was providing.
+    spool:
       enabled: true
     concurrency:
       max: 100
