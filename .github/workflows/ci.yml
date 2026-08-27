@@ -203,6 +203,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang cmake libssl-dev pkg-config
 
+      # `rust-toolchain.toml` pins the repo to a stable release, and that file
+      # wins over whatever rustup's default is — so every cargo call below is
+      # explicitly `+nightly`. cargo-fuzz needs it for `-Zsanitizer=address`.
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
@@ -214,13 +217,13 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Build every target
-        run: cargo fuzz build
+        run: cargo +nightly fuzz build
 
       - name: Run each target briefly
         run: |
-          for target in $(cargo fuzz list); do
+          for target in $(cargo +nightly fuzz list); do
             echo "=== $target ==="
-            cargo fuzz run "$target" -- -max_total_time=60 -print_final_stats=1
+            cargo +nightly fuzz run "$target" -- -max_total_time=60 -print_final_stats=1
           done
 
       - name: Publish any crash artifacts
