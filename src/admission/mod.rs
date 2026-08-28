@@ -88,6 +88,18 @@ impl AdmissionController {
             .clone()
     }
 
+    /// Every route limiter currently registered, for the admin status
+    /// document. A snapshot of the `Arc`s rather than a borrow, so the read
+    /// lock is held for the length of a clone and not for the length of
+    /// rendering a JSON document.
+    pub fn route_limiters(&self) -> Vec<Arc<Limiter>> {
+        let mut limiters: Vec<Arc<Limiter>> = self.routes.read().values().cloned().collect();
+        // Stable order: a status document whose fields move between scrapes
+        // is one nobody can diff.
+        limiters.sort_by(|a, b| a.name().cmp(b.name()));
+        limiters
+    }
+
     /// Apply new limits from a reloaded config, in place.
     ///
     /// Limiters are resized rather than replaced, and one that has disappeared

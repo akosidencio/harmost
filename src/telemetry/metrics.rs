@@ -158,6 +158,29 @@ pub static CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("metric registration")
 });
 
+/// The configured cache budget.
+///
+/// Published so `harmost_cache_bytes` has a denominator. Occupancy on its own
+/// is a number nobody can act on: "512MB used" is healthy or an emergency
+/// depending entirely on the ceiling, and an alert that hardcodes the ceiling
+/// goes stale the first time someone edits the config.
+pub static CACHE_MAX_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_cache_max_bytes",
+        "Configured cache.max_memory, the ceiling harmost_cache_bytes is measured against"
+    )
+    .expect("metric registration")
+});
+
+/// The configured spool budget, for the same reason.
+pub static SPOOL_MAX_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_spool_max_bytes",
+        "Configured spool.max_memory, the ceiling harmost_spool_bytes is measured against"
+    )
+    .expect("metric registration")
+});
+
 pub static CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "harmost_cache_entries",
@@ -183,6 +206,55 @@ pub static UPGRADES_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("metric registration")
 });
 
+/// Span lifecycle: `recorded`, `dropped` (a full queue), `exported`,
+/// `export_failed`. Bounded: the four outcomes in [`super::otlp`].
+///
+/// `dropped` is the one to alert on. It is the signal that the tracing queue
+/// is too small for the traffic, and it says so without the export path having
+/// to slow a single request down to tell you.
+pub static SPANS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "harmost_spans_total",
+        "Spans by outcome: recorded, dropped, exported, export_failed",
+        &["outcome"]
+    )
+    .expect("metric registration")
+});
+
+/// 1 while the process is draining, 0 otherwise.
+///
+/// A gauge rather than a counter because the question an operator asks during
+/// a deploy is "is this instance still taking traffic", which is a state.
+pub static DRAINING: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_draining",
+        "1 while this instance is draining and reporting itself not ready"
+    )
+    .expect("metric registration")
+});
+
+/// The configuration generation currently in force. Increments on every
+/// accepted `SIGHUP`; a reload that was refused leaves it unchanged, which is
+/// what makes "did my config actually apply" answerable from a dashboard.
+pub static CONFIG_GENERATION: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_config_generation",
+        "Generation of the configuration currently in force"
+    )
+    .expect("metric registration")
+});
+
+/// 1 per healthy upstream, 0 per unhealthy one. Labelled by the configured
+/// address, which is config-derived like every other label in this file.
+pub static UPSTREAM_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "harmost_upstream_healthy",
+        "1 when a backend is passing its health check, 0 when it is not",
+        &["upstream"]
+    )
+    .expect("metric registration")
+});
+
 /// Touch every metric family so a fresh scrape shows zeros rather than absent
 /// series. A dashboard that renders "no data" during an incident is worse than
 /// one that renders zero.
@@ -200,9 +272,15 @@ pub fn preregister() {
     LazyLock::force(&SPOOL);
     LazyLock::force(&SPOOL_BYTES);
     LazyLock::force(&CACHE_BYTES);
+    LazyLock::force(&CACHE_MAX_BYTES);
+    LazyLock::force(&SPOOL_MAX_BYTES);
     LazyLock::force(&CACHE_ENTRIES);
     LazyLock::force(&UPGRADES);
     LazyLock::force(&UPGRADES_ACTIVE);
+    LazyLock::force(&SPANS);
+    LazyLock::force(&DRAINING);
+    LazyLock::force(&CONFIG_GENERATION);
+    LazyLock::force(&UPSTREAM_HEALTHY);
 }
 
 #[cfg(test)]
@@ -221,7 +299,7 @@ mod tests {
         // Guards the rule in this module's docs. `upstream` and `limiter` are
         // config-derived, like `route`.
         let allowed = [
-            "route", "class", "status", "reason", "decision", "upstream", "limiter",
+            "route", "class", "status", "reason", "decision", "upstream", "limiter", "outcome",
         ];
         preregister();
         for family in prometheus::gather() {

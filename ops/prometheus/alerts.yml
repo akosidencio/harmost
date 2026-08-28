@@ -1,0 +1,224 @@
+# Prometheus alerting rules for Harmost.
+#
+# Two things shape this file.
+#
+# First, Harmost is the component that is supposed to stay up while the origin
+# struggles. So the alerts are mostly about the *origin's* health as Harmost
+# observes it, and only secondarily about Harmost itself — a page saying
+# "Harmost is shedding" is really saying "your origin cannot keep up", and the
+# annotation says so rather than leaving the reader to work it out at 3am.
+#
+# Second, every threshold here is a starting point, not a recommendation. The
+# right value for `for:` depends on your deploy cadence and the right shed rate
+# depends on how much load shedding you consider normal. They are written as
+# obvious knobs rather than tuned numbers pretending to be universal.
+#
+# `job` and `instance` come from your scrape config. Every other label used
+# below is config-derived on Harmost's side — route ids, upstream addresses,
+# limiter names — and never client-controlled, so none of these rules can be
+# made expensive by traffic.
+
+groups:
+  - name: harmost-availability
+    rules:
+      - alert: HarmostDown
+        expr: up{job="harmost"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Harmost instance {{ $labels.instance }} is not being scraped"
+          description: >-
+            The metrics endpoint has been unreachable for two minutes. Check
+            whether the process is alive at all: /health/live on the admin
+            listener answers 200 whenever it is running, including while it is
+            draining.
+
+      # A drain is normal during a deploy and abnormal an hour later. An
+      # instance stuck here is serving correctly and reporting itself
+      # not-ready, so a load balancer has withdrawn it and nothing is watching.
+      - alert: HarmostDrainingTooLong
+        expr: harmost_draining == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} has been draining for 15 minutes"
+          description: >-
+            Draining means readiness answers 503 while the process keeps
+            serving. Expected during a restart; after 15 minutes it usually
+            means a deploy stalled, or a SIGUSR1 was sent and never followed
+            by a SIGTERM. /status reports why it entered the state.
+
+      - alert: HarmostNoHealthyUpstream
+        expr: max by (job, instance) (harmost_upstream_healthy) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No healthy origin behind {{ $labels.instance }}"
+          description: >-
+            Every backend is failing its health check. Harmost keeps serving
+            anyway — refusing to pick would turn a degraded origin into a
+            guaranteed outage — so what users see now depends on
+            stale_if_error and on whatever the origin still manages. This is
+            an origin problem, not a Harmost problem.
+
+  - name: harmost-origin-load
+    rules:
+      # The signal that Harmost is doing its job *and* that users are seeing
+      # 503s for it. Both halves belong in the annotation.
+      - alert: HarmostSheddingLoad
+        expr: |
+          sum by (job, instance, route) (rate(harmost_admission_total{decision=~"shed_.*"}[5m]))
+            /
+          clamp_min(sum by (job, instance, route) (rate(harmost_admission_total[5m])), 0.001)
+            > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} is shedding >5% of route {{ $labels.route }}"
+          description: >-
+            The origin concurrency ceiling is being hit and requests are being
+            refused to protect it. This is the mechanism working, and it is
+            also users receiving 503. Look at harmost_origin_latency_seconds
+            before raising the ceiling: a higher ceiling against a slower
+            origin makes the origin slower still.
+
+      - alert: HarmostOriginSaturated
+        expr: |
+          sum by (job, instance, limiter) (harmost_origin_in_flight)
+            >=
+          sum by (job, instance, limiter) (harmost_concurrency_limit)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Limiter {{ $labels.limiter }} on {{ $labels.instance }} is at its ceiling"
+          description: >-
+            Every origin permit has been held continuously for ten minutes.
+            Either the origin got slower or traffic grew. Check the queue
+            depth alongside this: a full ceiling with an empty queue is a
+            system running exactly at capacity, and a full ceiling with a
+            growing queue is one that is about to start shedding.
+
+      - alert: HarmostQueueDepthGrowing
+        expr: sum by (job, instance, limiter) (harmost_queue_depth) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Requests have been queueing on {{ $labels.limiter }} for 15 minutes"
+          description: >-
+            A queue that never empties is latency added to every request
+            rather than capacity being smoothed. Either the ceiling is too low
+            for sustained traffic, or the origin's per-request time has grown.
+
+      - alert: HarmostOriginLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (job, instance, route, le) (rate(harmost_origin_latency_seconds_bucket[5m]))
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 origin render on {{ $labels.route }} is above 5s"
+          description: >-
+            Measured from Harmost's side, so it includes the origin's own
+            queueing. With a response spool this is genuinely the render time;
+            without one a slow client can inflate it, and the access log's
+            permit_released field distinguishes the two.
+
+  - name: harmost-resources
+    rules:
+      # A cache pinned at its budget is only a problem when the hit ratio is
+      # also poor: that combination means eviction is destroying entries
+      # before they are reused, which is worse than not caching at all.
+      - alert: HarmostCacheThrashing
+        expr: |
+          (
+            sum by (job, instance) (harmost_cache_bytes)
+              /
+            clamp_min(sum by (job, instance) (harmost_cache_max_bytes), 1)
+          ) > 0.95
+          and
+          (
+            sum by (job, instance) (rate(harmost_cache_total{status="hit"}[10m]))
+              /
+            clamp_min(sum by (job, instance) (rate(harmost_reuse_eligible_requests_total[10m])), 0.001)
+          ) < 0.2
+        for: 20m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache on {{ $labels.instance }} is full with a hit ratio below 20%"
+          description: >-
+            The working set does not fit in cache.max_memory and entries are
+            being evicted before they are reused. Either raise the budget, or
+            shorten the TTL and narrow the cache key so fewer, hotter entries
+            are kept.
+
+      - alert: HarmostSpoolBudgetExhausted
+        expr: sum by (job, instance) (rate(harmost_spool_total{reason="budget_exhausted"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Responses on {{ $labels.instance }} are exceeding the spool budget"
+          description: >-
+            Those responses degrade to the old behaviour: an origin permit is
+            held until the client finishes reading, bounded by
+            timeouts.downstream_write. Correct, but it is the coupling the
+            spool exists to remove. Raise spool.max_memory if it is sustained.
+
+      # Costs traces, never requests. Included because it is easy to miss and
+      # the fix is one number.
+      - alert: HarmostDroppingSpans
+        expr: sum by (job, instance) (rate(harmost_spans_total{outcome="dropped"}[10m])) > 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.instance }} is dropping spans"
+          description: >-
+            The tracing queue is full for the traffic level. Spans are dropped
+            rather than buffered, deliberately — a telemetry queue that grows
+            under load is a memory-exhaustion bug that fires during the
+            incident you wanted the traces for. Raise
+            telemetry.tracing.otlp.max_queue, or sample less.
+
+      - alert: HarmostSpanExportFailing
+        expr: |
+          sum by (job, instance) (rate(harmost_spans_total{outcome="export_failed"}[10m]))
+            /
+          clamp_min(sum by (job, instance) (rate(harmost_spans_total{outcome=~"exported|export_failed"}[10m])), 0.001)
+            > 0.5
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.instance }} cannot reach its OTLP collector"
+          description: >-
+            Traffic is unaffected — export failure is counted and logged, never
+            propagated to a request. Check the collector.
+
+  - name: harmost-configuration
+    rules:
+      # Replicas of one deployment should agree on their configuration. They
+      # do not when a reload was refused on some of them, which is a silent
+      # partial rollout.
+      - alert: HarmostConfigGenerationDiverged
+        expr: count by (job) (count by (job, harmost_config_generation) (harmost_config_generation)) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Harmost replicas in {{ $labels.job }} are running different configurations"
+          description: >-
+            An invalid config is refused and the running one kept, so a reload
+            that failed on some replicas leaves them behind without failing
+            anything. Check each instance's logs for "reload refused"; the
+            message names the reason.

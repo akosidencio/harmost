@@ -46,12 +46,32 @@ classification, cache-key and shareability rules, and bounded origin admission.
 ## Project maturity and expectations
 
 **Harmost has not been run in production, by anyone, ever.** It has no
-production users, no soak testing and no third-party security review. There is
-now a [threat model](./docs/THREAT-MODEL.md) and a
+production users and no third-party security review. There is now a
+[threat model](./docs/THREAT-MODEL.md) and a
 [twenty-second adversarial suite](./bench/adversarial.sh) in CI, which is a
 smoke test rather than a campaign — and the threat model is the author's own
 analysis, which is exactly the thing a threat model is least able to check about
 itself.
+
+There is also now a [soak](./bench/soak.sh), a
+[memory-pressure test](./bench/memory.sh), a [restart test](./bench/upgrade.sh)
+and a [chaos test](./bench/chaos.sh), all of which assert rather than report.
+They are synthetic load against a local fixture origin. They can find a leak, a
+permit that is never returned, a budget that is not a budget and a restart that
+drops requests — and they have found several. They cannot tell you how this
+behaves against real traffic on a real network, and no amount of them will.
+
+Reference documentation:
+
+| | |
+|---|---|
+| [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | Running it: readiness, drain, restart, systemd, Kubernetes, what to alert on |
+| [`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md) | Schema versioning, what may change without a bump, migration notes |
+| [`docs/BUILDING.md`](./docs/BUILDING.md) | Building, verifying a release, reproducible builds — and what is *not* reproducible |
+| [`docs/RELEASE-GATES.md`](./docs/RELEASE-GATES.md) | What has to pass before a tag, and what is deliberately not gated |
+| [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) | What is protected, from whom, and what is not defended |
+| [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) | A brief for the independent review that has not yet happened |
+| [`ops/`](./ops) | Example Prometheus alerts and a Grafana dashboard |
 
 Everything described below as a benefit is a **design goal supported by local
 tests**, not an outcome observed under real traffic. The focused benchmarks use
@@ -85,6 +105,7 @@ so behind something you can fail back to, and read
 - [Project status](#project-status)
 - [Roadmap](#roadmap)
 - [Design principles](#design-principles)
+- [Operating Harmost](#operating-harmost)
 - [Slow readers and render capacity](#slow-readers-and-render-capacity)
 - [Request coalescing and microcache architecture](#request-coalescing-and-microcache-architecture)
 - [Next.js caching and cache-key design](#nextjs-caching-and-cache-key-design)
@@ -872,18 +893,27 @@ not completed production hardening or operational validation.
 | HTTP/2 downstream (h2c and ALPN) and upstream | done, tested ([`bench/http2.sh`](./bench/http2.sh)) |
 | `HEAD`, `Range`, conditional requests, disconnects, malformed bodies | done, tested ([`bench/protocol.sh`](./bench/protocol.sh)) |
 | `Upgrade`/WebSocket proxying, bounded separately from renders | done, tested, off by default ([`bench/websocket.sh`](./bench/websocket.sh)) |
-| Native TLS, downstream and upstream (`--features tls`) | done, tested ([`bench/tls.sh`](./bench/tls.sh)) |
+| Native TLS, downstream and upstream (`--features tls`) | done, tested ([`bench/tls.sh`](./bench/tls.sh)); [Pingora labels its rustls backend experimental](https://github.com/cloudflare/pingora#feature-highlights), so external TLS termination remains recommended |
 | Trusted proxies, forwarded scheme and client IP | done, tested ([`bench/forwarded.sh`](./bench/forwarded.sh)) |
 | Bounded response spool | done, tested ([`bench/spool.sh`](./bench/spool.sh)) |
 | Threat model | [written](./docs/THREAT-MODEL.md); **not independently reviewed** |
 | Independent review of cache keys and shareability | **not obtained**; brief prepared at [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) |
 | Sustained adversarial testing | 20s in CI ([`bench/adversarial.sh`](./bench/adversarial.sh)); a smoke test, not a campaign |
+| Readiness, liveness and status endpoints | done, tested ([`bench/admin.sh`](./bench/admin.sh)) |
+| Drain state, `SIGUSR1`, graceful restart | done, tested ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
+| Pingora zero-downtime socket handover | done, tested — **Linux only**; `--upgrade` is refused elsewhere ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
+| W3C trace-context correlation | done, tested; unconditional ([`bench/tracing.sh`](./bench/tracing.sh)) |
+| OpenTelemetry span export | done, tested — OTLP/HTTP JSON, **plaintext only** ([`bench/tracing.sh`](./bench/tracing.sh)) |
+| Config schema version and migration notes | done ([`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md)) |
+| Soak, memory-pressure, restart and chaos tests | done ([`soak.sh`](./bench/soak.sh), [`memory.sh`](./bench/memory.sh), [`upgrade.sh`](./bench/upgrade.sh), [`chaos.sh`](./bench/chaos.sh)); CI-sized on every push, full size before a tag ([gates](./docs/RELEASE-GATES.md)) |
+| Example Prometheus alerts and Grafana dashboard | done ([`ops/`](./ops)) |
+| Release binaries, checksums, SBOM, reproducible builds | workflow written ([`docs/BUILDING.md`](./docs/BUILDING.md)); **no release has been cut yet**, so the reproducibility claim is untested by anyone but its author |
 | Circuit breaking, least-loaded balancing | not started ([roadmap](#roadmap)) |
-| Cache purge API, OpenTelemetry | not started ([roadmap](#roadmap)) |
+| Cache purge API | not started ([roadmap](#roadmap)) |
 
 The security- and correctness-sensitive parts — cache-key construction, response
 shareability, and bounded admission — remain isolated as testable logic beneath
-the Pingora proxy layer. The full workspace test suite (216 tests, including
+the Pingora proxy layer. The full workspace test suite (276 tests, including
 property tests over generated inputs) runs without external network services.
 
 "done, tested" means unit-tested and, where a `bench/` script exists, verified
@@ -1027,21 +1057,93 @@ reads the per-peer CA store — its `connect` path carries an explicit `TODO` an
 CA, a proxy verifying against the system roots, and no way to tell from outside.
 Use `SSL_CERT_FILE` / `SSL_CERT_DIR`, which the platform store does honour.
 
-### 2. Become operable as a service
+### 2. Become operable as a service — done, with two items outstanding
 
-- Ship versioned release binaries and an OCI image with checksums, an SBOM and
-  reproducible build instructions.
-- Add readiness and administrative status endpoints that expose configuration
-  generation, backend state, cache usage and drain state without exposing
-  client-controlled cardinality.
-- Add OpenTelemetry spans and request correlation alongside the existing
-  Prometheus metrics and structured access logs.
-- Expose and test Pingora's complete zero-downtime upgrade workflow; document
-  systemd and Kubernetes drain procedures.
-- Version the configuration schema and provide migration notes before the
-  pre-1.0 format becomes an operational dependency.
-- Add soak, memory-pressure, restart and chaos tests with explicit release
-  gates, plus example Prometheus alerts and dashboards.
+- **Release artifacts.** The release workflow builds versioned binaries for
+  Linux and macOS, publishes a `SHA256SUMS` covering every archive, generates a
+  CycloneDX SBOM, and pushes an OCI image with provenance and its own SBOM
+  attached as attestations. [`docs/BUILDING.md`](./docs/BUILDING.md) documents
+  how to reproduce a Linux binary from a tag — and is equally explicit about
+  what is *not* reproducible and why: the `.tar.gz` archives (gzip stores an
+  mtime), the image digest, and the macOS builds.
+- **Readiness and status endpoints.** `telemetry.admin` serves
+  `/health/live`, `/health/ready` and `/status` on a listener of their own,
+  reporting configuration generation, per-backend health, cache and spool
+  occupancy, admission limits and drain state. Nothing on that surface is
+  parameterised: there is no path, query or header a client can vary to change
+  what is computed, which is the same rule the metrics labels follow. Startup
+  refuses to share the address with the traffic or metrics listener.
+- **OpenTelemetry and correlation.** Correlation is unconditional — every
+  request gets a W3C trace id and span id, both go on every access log line,
+  and the id Harmost concluded is what reaches the origin as `traceparent`.
+  Span export is configuration: two spans per sampled request, a server span
+  and a nested origin-fetch span, over OTLP/HTTP.
+- **Zero-downtime upgrade and drain.** `--upgrade` performs Pingora's socket
+  handover; `--test` is the pre-flight that proves a new binary can start
+  before the old one is signalled; `SIGUSR1` drains without exiting, for a
+  Kubernetes `preStop` hook. [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) has
+  working systemd and Kubernetes definitions with the timeout arithmetic
+  spelled out.
+- **Configuration schema versioning.** `version:` is checked against a
+  constant and a file naming an unknown version is refused with both numbers
+  in the message. [`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md) states
+  what may change without a bump, what may not, and the migration notes.
+- **Soak, memory-pressure, restart and chaos tests.**
+  [`soak.sh`](./bench/soak.sh) watches for leaks, held permits and a cache that
+  outgrows its budget; [`memory.sh`](./bench/memory.sh) drives every configured
+  budget past its limit and measures RSS; [`upgrade.sh`](./bench/upgrade.sh)
+  covers both restart mechanisms; [`chaos.sh`](./bench/chaos.sh) removes every
+  backend under load. All four run CI-sized on every push and full-size before
+  a tag — [`docs/RELEASE-GATES.md`](./docs/RELEASE-GATES.md). Example alerts
+  and a dashboard are in [`ops/`](./ops).
+
+**Two things are outstanding, and neither can be closed by writing more code.**
+
+First, **no release has actually been cut**. The workflow exists and its steps
+are individually exercised, but "the artifacts verify" is a claim nobody has
+tested end to end, including the author. Until a tag has been pushed and a
+downloaded binary reproduced from source, treat
+[`docs/BUILDING.md`](./docs/BUILDING.md) as a specification rather than a
+report.
+
+Second, **the socket handover is Linux-only, and that is a property of the
+dependency**. Pingora passes listening descriptors with `SCM_RIGHTS`; its
+non-Linux `get_fds_from` is a stub that returns `ECONNREFUSED`. Harmost refuses
+`--upgrade` off Linux rather than letting that surface as a connection error
+that reads like a missing peer, and [`bench/upgrade.sh`](./bench/upgrade.sh)
+asserts the drain-based restart there instead — but it does not claim zero
+dropped requests on a platform that cannot deliver it.
+
+Three non-obvious findings from this phase, all measured rather than assumed:
+
+- **`shutdown_timeout` is a floor, not a ceiling.** Pingora ends a shutdown
+  with `Runtime::shutdown_timeout`, and its listener tasks are parked in
+  `accept` rather than watching for the signal, so the wait runs to completion
+  **whether or not anything is in flight**. A `SIGTERM` costs about
+  `drain_period + shutdown_timeout` on a completely idle process. The former
+  30-second default therefore made every restart take 35 seconds and put the
+  process past Kubernetes' default 30-second termination grace period — where
+  it is `SIGKILL`ed mid-drain, dropping exactly the requests the drain existed
+  to protect. The defaults are now 5s + 10s, `harmost check` prints the sum,
+  and `bench/upgrade.sh` asserts it from both sides.
+- **Route limiters were created lazily, on a route's first request.** So
+  `/status` reported no route limits at all until traffic arrived — the first
+  thing an operator checks after a deploy said the policy they had just
+  shipped was not there. They are now built at startup, as reload already did.
+- **The benchmark fixture minted colliding session ids.** `user-{seq}` was a
+  per-process counter, so two backends — or one restarted mid-test — produce
+  the same ids, and a benchmark counting distinct sessions reads a fixture
+  collision as a shared response. Wrong in the dangerous direction: it can
+  manufacture a failure, or mask a real one by making the count noisy enough
+  to be given slack. Ids now carry a per-process instance identifier.
+
+And one dependency limitation refused rather than papered over: **the OTLP
+exporter is plaintext-only, and an `https://` endpoint is rejected at
+startup.** The exporter is hand-written — the alternative was a gRPC or
+`reqwest` stack larger than the rest of this binary — so it does not implement
+TLS. Accepting an `https` URL and speaking cleartext to it would be the same
+class of failure as a config naming a CA that is never read. Run a collector
+as a sidecar.
 
 ### 3. Improve origin resilience
 
@@ -1089,6 +1191,20 @@ Use `SSL_CERT_FILE` / `SSL_CERT_DIR`, which the platform store does honour.
   is no purge API, so an entry that turns out to be wrong can only be waited out.
 - **There is no rate limiting of any kind.** Harmost bounds origin *work*, not
   bytes, connections per source, or requests per second. Keep an edge in front.
+- **The zero-downtime socket handover only works on Linux.** Pingora's fd
+  transfer is Linux-only; `--upgrade` is refused elsewhere with an explanation.
+  The drain-based restart in [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) works
+  everywhere but relies on a load balancer to cover the gap between the old
+  process exiting and the new one binding.
+- **A `SIGTERM` costs `drain_period + shutdown_timeout` even when nothing is in
+  flight**, because Pingora's shutdown waits out its timeout rather than
+  finishing early. Size your supervisor's stop timeout above that sum.
+- **The OTLP exporter is plaintext-only.** It is hand-written to avoid a gRPC
+  or HTTP-client dependency tree larger than the rest of the binary, and an
+  `https://` endpoint is refused at startup rather than silently downgraded.
+  Run an OpenTelemetry Collector as a sidecar.
+- **No release has been cut yet.** The release workflow, checksums, SBOM and
+  reproducible-build instructions are written but unexercised end to end.
 - `origin.tls.ca` is rejected: Pingora 0.8's rustls connector does not read a
   per-peer CA store. Use `SSL_CERT_FILE` / `SSL_CERT_DIR`.
 - Several settings are startup-bound and a SIGHUP reload **refuses** rather than
@@ -1119,6 +1235,108 @@ running.
 **A permit models observable origin work.** Origin capacity is returned only
 when Pingora observes upstream end-of-stream. A `Content-Length` is not proof
 that generation has finished, so headers alone never release capacity.
+
+## Operating Harmost
+
+Full procedures — systemd and Kubernetes definitions, the restart sequences,
+the timeout arithmetic — are in [`docs/OPERATIONS.md`](./docs/OPERATIONS.md).
+The short version:
+
+### Is this instance healthy?
+
+```yaml
+telemetry:
+  admin:
+    listen: "127.0.0.1:9091"
+```
+
+| Endpoint | Answers |
+|---|---|
+| `GET /health/live` | `200` while the process is running. Never anything else. |
+| `GET /health/ready` | `200` when this instance should receive traffic, `503` while draining. |
+| `GET /status` | Configuration generation, per-backend health, cache and spool occupancy, admission limits, drain state, compiled features. |
+
+Bind it privately. `/status` publishes your backend health and configuration
+generation, and startup refuses to put it on the traffic listener's address.
+
+**Liveness is not readiness.** A draining instance answers `200` on
+`/health/live` and `503` on `/health/ready`; pointing a liveness probe at the
+readiness endpoint makes an orchestrator kill the process mid-drain.
+
+### Restarting without dropping requests
+
+```bash
+# Prove the new binary and config can start, before touching the running one.
+harmost run --config /etc/harmost/harmost.yaml --test
+
+# Linux: hand the listening sockets over, then let the old process drain.
+harmost run --config /etc/harmost/harmost.yaml --upgrade &
+kill -QUIT "$(cat /run/harmost/harmost.pid)"
+
+# Anywhere: drain first so the balancer withdraws this instance, then stop.
+kill -USR1 "$(cat /run/harmost/harmost.pid)"   # readiness fails; still serving
+sleep 15                                        # let the balancer notice
+kill -TERM "$(cat /run/harmost/harmost.pid)"
+```
+
+`SIGUSR1` drains **without exiting** — that is the point, and it is what a
+Kubernetes `preStop` hook should send.
+
+**Budget `drain_period + shutdown_timeout` for every stop.** Pingora's shutdown
+waits out its timeout whether or not anything is in flight, so with the
+defaults a `SIGTERM` takes about fifteen seconds on an idle process.
+`harmost check` prints the number and warns when it exceeds Kubernetes'
+default grace period.
+
+### Following a request through
+
+Correlation costs nothing and is always on. Every access log line carries a
+`trace_id` and `span_id`, and the id Harmost concluded is the one it forwards
+to the origin as `traceparent` — so a Harmost log line and an origin log line
+for the same request join, even when the origin has never heard of Harmost.
+
+```json
+{"method":"GET","path":"/products/iphone","route":"product-pages","class":"public_document",
+ "cache":"hit","upstream":"next-1:3000","client":"203.0.113.7","scheme":"https",
+ "permit_released":"origin_end","spool":"complete",
+ "trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7",
+ "status":200,"shed":false,"origin_ms":0,"total_ms":3,
+ "trace_continued":true,"generation":3}
+```
+
+Exporting spans is separate configuration, and sampled — two spans per request,
+a server span and a nested origin-fetch span, so an origin-latency number has
+something to hang off:
+
+```yaml
+telemetry:
+  tracing:
+    sample: { mode: parent_or_ratio, one_in: 20 }
+    otlp:
+      endpoint: "http://127.0.0.1:4318/v1/traces"
+```
+
+An inbound `traceparent` is treated exactly like `X-Forwarded-For`: believed
+from a peer in `server.trusted_proxies`, ignored from anyone else. Ignoring one
+never costs the request — Harmost simply starts a fresh trace.
+
+**Telemetry is never load-bearing.** The span queue is bounded and full means
+drop; recording is a non-blocking `try_send`; an export failure is counted and
+logged. [`bench/tracing.sh`](./bench/tracing.sh) kills the collector and then
+asserts that fifteen requests still complete promptly.
+
+### Alerts and dashboards
+
+[`ops/prometheus/alerts.yml`](./ops/prometheus/alerts.yml) and
+[`ops/grafana/dashboard.json`](./ops/grafana/dashboard.json). The four signals
+worth understanding before an incident:
+
+| Signal | Means |
+|---|---|
+| `harmost_admission_total{decision=~"shed_.*"}` rising | The ceiling is being hit. Harmost working, and users seeing `503`. Look at origin latency before raising it. |
+| `harmost_origin_in_flight` at `harmost_concurrency_limit` | Saturated. |
+| `harmost_upstream_healthy == 0` | No backend is passing. Harmost still serves, on `stale_if_error`. |
+| `harmost_draining == 1` for longer than a deploy | An instance drained and was never replaced. |
 
 ## Slow readers and render capacity
 

@@ -7,9 +7,26 @@ harmost — origin workload governor for server-rendered applications
 
 USAGE:
     harmost check --config <FILE>   Validate a config file and exit
-    harmost version                 Print the version
+    harmost version                 Print the version and build features
 
-    harmost run --config <FILE>     Start the proxy
+    harmost run --config <FILE> [OPTIONS]
+
+RUN OPTIONS:
+    --upgrade    Take the listening sockets over from a running Harmost.
+                 The old process keeps serving what it already accepted and
+                 exits when those finish; no connection is refused in between.
+                 Both processes must agree on server.graceful.upgrade_socket.
+    --daemon     Fork into the background and write server.graceful.pid_file.
+    --test       Bind everything, prove the process can start, and exit 0.
+                 Run this before --upgrade: it turns \"the new binary cannot
+                 start\" from an outage into a non-zero exit code.
+
+SIGNALS:
+    SIGHUP     reload the config; a bad one is refused and the running one kept
+    SIGUSR1    start draining — readiness fails, traffic keeps being served
+    SIGQUIT    graceful upgrade: hand the listeners to a process started with --upgrade
+    SIGTERM    graceful shutdown
+    SIGINT     fast shutdown
 ";
 
 fn main() -> ExitCode {
@@ -18,7 +35,16 @@ fn main() -> ExitCode {
 
     match cmd {
         Some("version") => {
-            println!("harmost {}", env!("CARGO_PKG_VERSION"));
+            // Features are part of the version because a binary that rejects
+            // `server.tls` and one that terminates it are the same version
+            // number otherwise, and "which build is this" is the first
+            // question during an incident.
+            println!(
+                "harmost {} (config schema v{}, features: {})",
+                env!("CARGO_PKG_VERSION"),
+                harmost::config::SCHEMA_VERSION,
+                if cfg!(feature = "tls") { "tls" } else { "none" }
+            );
             ExitCode::SUCCESS
         }
         Some("check") => match config_path(&args) {
@@ -29,7 +55,18 @@ fn main() -> ExitCode {
             }
         },
         Some("run") => match config_path(&args) {
-            Some(path) => run(&path),
+            Some(path) => {
+                let flags = RunFlags {
+                    upgrade: has_flag(&args, "--upgrade"),
+                    daemon: has_flag(&args, "--daemon"),
+                    test: has_flag(&args, "--test"),
+                };
+                if let Some(unknown) = unknown_run_flag(&args) {
+                    eprintln!("harmost run: unknown option `{unknown}`\n\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                run(&path, flags)
+            }
             None => {
                 eprintln!("harmost run: --config <FILE> is required");
                 ExitCode::from(2)
@@ -51,7 +88,45 @@ fn config_path(args: &[String]) -> Option<String> {
     args.get(i + 1).cloned()
 }
 
-fn run(path: &str) -> ExitCode {
+/// What `run` was asked to do beyond starting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RunFlags {
+    upgrade: bool,
+    daemon: bool,
+    test: bool,
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+/// An unrecognised `--flag`, if there is one.
+///
+/// The same rule the config file follows: an option that is accepted and then
+/// ignored lets someone believe a process is daemonised, or upgrading, when it
+/// is not. A typo has to be an error, not a silent default.
+fn unknown_run_flag(args: &[String]) -> Option<&str> {
+    let known = ["--upgrade", "--daemon", "--test", "--config", "-c", "run"];
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--config" || arg == "-c" {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') && !known.contains(&arg.as_str()) {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+fn run(path: &str, flags: RunFlags) -> ExitCode {
+    use harmost::admin::Admin;
+    use harmost::admin::drain::{DrainState, DrainWatcher};
     use harmost::admission::AdmissionController;
     use harmost::policy::PolicySnapshot;
     use harmost::policy::reload::Reloader;
@@ -81,7 +156,45 @@ fn run(path: &str) -> ExitCode {
     let h2c = cfg.server.h2c;
     let tls = cfg.server.tls.clone();
     let prometheus_listen = cfg.telemetry.prometheus.as_ref().map(|p| p.listen.clone());
+    let admin_cfg = cfg.telemetry.admin.clone();
+    let graceful = cfg.server.graceful.clone();
     let concurrency = cfg.origin.concurrency.clone();
+
+    // Span export, if it is configured. Built before the server so a bad
+    // endpoint is a startup failure rather than a background service that
+    // logs once and never works — the same reason every other unusable
+    // setting in this project is refused at boot.
+    let tracing_cfg = cfg.telemetry.tracing.clone();
+    let deployment_id = cfg.deployment.id.clone();
+    let spans = match tracing_cfg.otlp.as_ref() {
+        Some(otlp) => {
+            let mut resource = vec![
+                (
+                    "service.name".to_string(),
+                    tracing_cfg
+                        .service_name
+                        .clone()
+                        .unwrap_or_else(|| "harmost".to_string()),
+                ),
+                (
+                    "service.version".to_string(),
+                    env!("CARGO_PKG_VERSION").to_string(),
+                ),
+            ];
+            if let Some(id) = &deployment_id {
+                resource.push(("deployment.id".to_string(), id.clone()));
+            }
+            match harmost::telemetry::otlp::build(otlp, resource) {
+                Ok(pair) => Some(pair),
+                Err(error) => {
+                    eprintln!("error: telemetry.tracing.otlp: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+
     let policy = match PolicySnapshot::build(cfg, 1) {
         Ok(p) => p,
         Err(e) => {
@@ -97,14 +210,97 @@ fn run(path: &str) -> ExitCode {
         concurrency.queue.max,
         concurrency.queue.timeout.as_duration(),
     ));
+    // Create every configured route limiter now rather than on the route's
+    // first request. Reload already does this, and without it the admin
+    // status document reports no route limits at all until traffic arrives —
+    // so the first thing an operator checks after a deploy says the policy
+    // they just shipped is not there.
+    {
+        let snapshot = policy.load();
+        let route_limits: Vec<(String, usize, usize, std::time::Duration)> = snapshot
+            .config
+            .routes
+            .iter()
+            .filter_map(|r| {
+                r.concurrency.as_ref().map(|c| {
+                    (
+                        r.id.clone(),
+                        c.max,
+                        c.queue.max,
+                        c.queue.timeout.as_duration(),
+                    )
+                })
+            })
+            .collect();
+        admission.apply_limits(
+            concurrency.max,
+            concurrency.queue.max,
+            concurrency.queue.timeout.as_duration(),
+            &route_limits,
+        );
+    }
 
-    let mut server = match pingora_core::server::Server::new(None) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: could not start server: {e}");
-            return ExitCode::FAILURE;
-        }
+    harmost::telemetry::metrics::CONFIG_GENERATION.set(1);
+    // The ceilings the occupancy gauges are measured against. Published from
+    // config rather than left for a dashboard to hardcode, so an alert cannot
+    // go stale the first time somebody edits the budget.
+    {
+        let snapshot = policy.load();
+        harmost::telemetry::metrics::CACHE_MAX_BYTES
+            .set(i64::try_from(snapshot.config.cache.max_memory.get()).unwrap_or(i64::MAX));
+        harmost::telemetry::metrics::SPOOL_MAX_BYTES
+            .set(i64::try_from(snapshot.config.spool.max_memory.get()).unwrap_or(i64::MAX));
+    }
+
+    // Pingora's own server configuration, built from ours rather than from a
+    // second file. The three fields that matter are the ones the zero-downtime
+    // upgrade runs on: both processes have to agree on `upgrade_sock`, the pid
+    // file is what every `kill -QUIT` in the documentation reads, and the two
+    // grace periods bound how long the *old* process may keep serving after it
+    // has handed its listeners over.
+    let mut pingora_conf = pingora_core::server::configuration::ServerConf {
+        pid_file: graceful.pid_file.clone(),
+        upgrade_sock: graceful.upgrade_socket.clone(),
+        daemon: flags.daemon,
+        graceful_shutdown_timeout_seconds: Some(graceful.shutdown_timeout.as_duration().as_secs()),
+        ..Default::default()
     };
+    // Pingora waits this long after broadcasting shutdown before it begins the
+    // final step, which is precisely the drain window — so the two are the
+    // same number rather than two that have to be kept in agreement. Adding
+    // the shutdown timeout on top would make every `SIGTERM` take the sum of
+    // both before the process could exit, and an orchestrator that gave up
+    // waiting would `SIGKILL` mid-drain.
+    pingora_conf.grace_period_seconds = Some(graceful.drain_period.as_duration().as_secs());
+    // Pingora's socket handover is Linux-only: on every other platform
+    // `get_fds_from` logs "Upgrade is not currently supported" and returns
+    // `ECONNREFUSED`, which reads exactly like "no old process is listening"
+    // and sends an operator looking for a problem that is not there. Refuse
+    // up front and name the real reason, and point at the drain-based restart
+    // that does work everywhere.
+    if flags.upgrade && !cfg!(target_os = "linux") {
+        eprintln!(
+            "error: --upgrade is not supported on this platform. Pingora can only pass \n\
+             listening sockets between processes on Linux.\n\n\
+             Use the drain-based restart instead: SIGUSR1 to this process, wait for your \n\
+             load balancer to withdraw it (telemetry.admin /health/ready answers 503 \n\
+             immediately), then SIGTERM and start the new process.\n\
+             See docs/OPERATIONS.md."
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let opt = pingora_core::server::configuration::Opt {
+        upgrade: flags.upgrade,
+        daemon: flags.daemon,
+        test: flags.test,
+        nocapture: false,
+        conf: None,
+    };
+    let mut server = pingora_core::server::Server::new_with_opt_and_conf(opt, pingora_conf);
+    // Under `--upgrade` this is where the listening sockets are taken over
+    // from the running process, and under `--test` it exits zero once it has
+    // proved the process can start.
     server.bootstrap();
 
     // One pool, shared by the proxy and the health checker, so a probe result
@@ -129,6 +325,28 @@ fn run(path: &str) -> ExitCode {
     ));
     eprintln!("  reload config with: kill -HUP <pid>");
 
+    // Drain state is shared: the admin endpoints read it, and the watcher
+    // sets it from Pingora's shutdown broadcast or from SIGUSR1.
+    let drain = Arc::new(DrainState::new());
+    server.add_service(pingora_core::services::background::background_service(
+        "drain",
+        DrainWatcher::new(drain.clone(), graceful.drain_period.as_duration()),
+    ));
+    eprintln!(
+        "  drain without exiting with: kill -USR1 <pid>  (drain window {:?})",
+        graceful.drain_period.as_duration()
+    );
+
+    let span_sink = match spans {
+        Some((sink, exporter)) => {
+            server.add_service(pingora_core::services::background::background_service(
+                "otlp", exporter,
+            ));
+            Some(sink)
+        }
+        None => None,
+    };
+
     if let Some(health) = health_cfg {
         eprintln!(
             "  health checks: {} every {:?}",
@@ -141,13 +359,34 @@ fn run(path: &str) -> ExitCode {
         ));
     }
 
-    let harmost = match Harmost::new(policy, admission, upstreams) {
+    let harmost = match Harmost::new(
+        policy.clone(),
+        admission.clone(),
+        upstreams.clone(),
+        span_sink,
+    ) {
         Ok(harmost) => harmost,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
     };
+    // Taken before the proxy is moved into its service. These are handles to
+    // the same live state the request path uses, not copies: a status document
+    // assembled from a startup snapshot would report zeros forever.
+    let admin_listen = admin_cfg.as_ref().map(|a| a.listen.clone());
+    let admin = admin_cfg.map(|admin_cfg| Admin {
+        started: std::time::Instant::now(),
+        config_path: path.to_string(),
+        policy: policy.clone(),
+        admission: admission.clone(),
+        upstreams: upstreams.clone(),
+        store: harmost.store(),
+        spool: harmost.spool_budget(),
+        upgrades: harmost.upgrade_limiter(),
+        drain: drain.clone(),
+        require_healthy_upstream: admin_cfg.require_healthy_upstream,
+    });
     let mut service = pingora_proxy::http_proxy_service(&server.configuration, harmost);
 
     // HTTP/2 over cleartext. Pingora peeks for the connection preface, so this
@@ -201,6 +440,16 @@ fn run(path: &str) -> ExitCode {
         metrics.add_tcp(addr);
         server.add_service(metrics);
         eprintln!("harmost metrics on {addr}/metrics");
+    }
+
+    if let (Some(admin), Some(addr)) = (admin, admin_listen) {
+        let mut service = pingora_core::services::listening::Service::new(
+            "admin".to_string(),
+            pingora_core::apps::http_app::HttpServer::new_app(admin),
+        );
+        service.add_tcp(&addr);
+        server.add_service(service);
+        eprintln!("harmost admin on {addr}  (/health/live, /health/ready, /status)");
     }
 
     eprintln!("harmost listening on {listen}");
@@ -261,6 +510,11 @@ fn check(path: &str) -> ExitCode {
             let routes = cfg.routes.len();
             let upstreams = cfg.origin.upstreams.len();
             println!("ok: {path}");
+            println!(
+                "  config schema v{} (harmost {})",
+                cfg.version,
+                env!("CARGO_PKG_VERSION")
+            );
             println!("  {upstreams} upstream(s), {routes} route(s)");
             println!(
                 "  global origin concurrency: {}",
@@ -292,6 +546,80 @@ fn check(path: &str) -> ExitCode {
                 println!(
                     "  WARNING: origin.tls does not verify the origin's certificate; \
                      the connection is encrypted but not authenticated"
+                );
+            }
+            // Operability surface, stated out loud for the same reason the
+            // trust settings are: `check` is the last thing anyone reads
+            // before deploying.
+            match &cfg.telemetry.admin {
+                Some(admin) => {
+                    println!(
+                        "  admin endpoints on {} (/health/live, /health/ready, /status)",
+                        admin.listen
+                    );
+                    if admin.require_healthy_upstream {
+                        println!(
+                            "    readiness FAILS when no upstream is healthy; make sure something \
+                             upstream of Harmost can route around this instance, or a degraded \
+                             origin takes every replica out of rotation at once"
+                        );
+                    }
+                    if admin
+                        .listen
+                        .parse::<std::net::SocketAddr>()
+                        .is_ok_and(|a| a.ip().is_unspecified())
+                    {
+                        println!(
+                            "    WARNING: bound to an unspecified address, so it is reachable on \
+                             every interface. It publishes backend health, cache occupancy and \
+                             the config generation; bind it to loopback or a private address"
+                        );
+                    }
+                }
+                None => println!(
+                    "  no telemetry.admin: there is no readiness endpoint, so a load balancer \
+                     cannot tell when this instance is draining"
+                ),
+            }
+            match &cfg.telemetry.tracing.otlp {
+                Some(otlp) => println!(
+                    "  exporting spans to {} ({:?} batches of up to {})",
+                    otlp.endpoint,
+                    otlp.interval.as_duration(),
+                    otlp.max_batch
+                ),
+                None => println!(
+                    "  no telemetry.tracing.otlp: trace ids are still generated, logged and \
+                     forwarded to the origin, but no spans leave this process"
+                ),
+            }
+            let stop_budget = cfg
+                .server
+                .graceful
+                .drain_period
+                .as_duration()
+                .saturating_add(cfg.server.graceful.shutdown_timeout.as_duration());
+            println!(
+                "  graceful restart: pid {}, socket {}",
+                cfg.server.graceful.pid_file, cfg.server.graceful.upgrade_socket,
+            );
+            // Stated as one number because that is the number a supervisor is
+            // configured with, and because `shutdown_timeout` is a floor
+            // rather than a ceiling — a SIGTERM costs the full sum even on an
+            // idle process. See the note on `Graceful` in the schema.
+            println!(
+                "    a SIGTERM takes about {}s ({}s drain + {}s shutdown), on an idle process too",
+                stop_budget.as_secs(),
+                cfg.server.graceful.drain_period.as_duration().as_secs(),
+                cfg.server.graceful.shutdown_timeout.as_duration().as_secs(),
+            );
+            if stop_budget > std::time::Duration::from_secs(30) {
+                println!(
+                    "    WARNING: that exceeds Kubernetes' default \
+                     terminationGracePeriodSeconds of 30, so the pod will be SIGKILLed \
+                     part-way through the drain. Raise the supervisor's timeout to at \
+                     least {}s or lower these two",
+                    stop_budget.as_secs() + 5
                 );
             }
             if cfg.upgrade.enabled {

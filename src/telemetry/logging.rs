@@ -6,7 +6,16 @@
 //! query string. The query string is the subtle one: it routinely carries
 //! session tokens, password-reset codes and signed URLs, and an access log is
 //! the single most-copied artifact in an incident. The path alone is logged.
+//!
+//! # Correlation
+//!
+//! `trace_id` and `span_id` are on every line, whether or not spans are
+//! exported anywhere. They are what joins this line to the origin's own logs
+//! for the same request, and — because the id Harmost concluded is the one it
+//! forwarded in `traceparent` — the join works even when the origin has no
+//! idea Harmost exists.
 
+use super::json::{escape_into, field_str};
 use std::fmt::Write as _;
 
 /// One access log line.
@@ -40,6 +49,18 @@ pub struct AccessLog<'a> {
     /// What the response spool did: `complete`, `body_too_large`,
     /// `budget_exhausted`, or `-` when this request was not spooled.
     pub spool: &'a str,
+    /// W3C trace id, 32 lowercase hex characters. Always present: correlation
+    /// does not depend on whether anything is exporting spans.
+    pub trace_id: &'a str,
+    /// Harmost's own server span for this request.
+    pub span_id: &'a str,
+    /// Whether this request joined a trace the caller had already started, or
+    /// began one. Useful for finding the hop where propagation broke.
+    pub trace_continued: bool,
+    /// The configuration generation that served this request. A reload
+    /// mid-incident otherwise makes two lines incomparable with no way to see
+    /// it in the log.
+    pub generation: u64,
 }
 
 impl AccessLog<'_> {
@@ -56,10 +77,18 @@ impl AccessLog<'_> {
         write_str(&mut s, "scheme", self.scheme);
         write_str(&mut s, "permit_released", self.permit_released_at);
         write_str(&mut s, "spool", self.spool);
+        write_str(&mut s, "trace_id", self.trace_id);
+        write_str(&mut s, "span_id", self.span_id);
         let _ = write!(
             s,
-            "\"status\":{},\"shed\":{},\"origin_ms\":{},\"total_ms\":{}}}",
-            self.status, self.shed, self.origin_ms, self.total_ms
+            "\"status\":{},\"shed\":{},\"origin_ms\":{},\"total_ms\":{},\
+             \"trace_continued\":{},\"generation\":{}}}",
+            self.status,
+            self.shed,
+            self.origin_ms,
+            self.total_ms,
+            self.trace_continued,
+            self.generation
         );
         s
     }
@@ -77,6 +106,8 @@ impl AccessLog<'_> {
             ("scheme", self.scheme),
             ("permit_released", self.permit_released_at),
             ("spool", self.spool),
+            ("trace_id", self.trace_id),
+            ("span_id", self.span_id),
         ] {
             if !s.is_empty() {
                 s.push(' ');
@@ -88,40 +119,22 @@ impl AccessLog<'_> {
         }
         let _ = write!(
             s,
-            " status={} shed={} origin_ms={} total_ms={}",
-            self.status, self.shed, self.origin_ms, self.total_ms
+            " status={} shed={} origin_ms={} total_ms={} trace_continued={} generation={}",
+            self.status,
+            self.shed,
+            self.origin_ms,
+            self.total_ms,
+            self.trace_continued,
+            self.generation
         );
         s
     }
 }
 
+/// One `"key":"value",` field. Delegates to [`super::json`] so the access log
+/// and the OTLP payload cannot drift apart on escaping.
 fn write_str(out: &mut String, key: &str, value: &str) {
-    out.push('"');
-    out.push_str(key);
-    out.push_str("\":\"");
-    escape_into(out, value);
-    out.push_str("\",");
-}
-
-/// Escape per RFC 8259.
-///
-/// A path is attacker-controlled: `/a"b` would otherwise close the string and
-/// produce a line that breaks every downstream JSON parser, or worse, lets a
-/// crafted request forge extra fields in the log.
-fn escape_into(out: &mut String, value: &str) {
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
+    field_str(out, key, value);
 }
 
 #[cfg(test)]
@@ -144,6 +157,10 @@ mod tests {
             total_ms: 3,
             permit_released_at: "origin_end",
             spool: "complete",
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736",
+            span_id: "00f067aa0ba902b7",
+            trace_continued: true,
+            generation: 3,
         }
         .to_json()
     }
@@ -162,7 +179,7 @@ mod tests {
         assert!(out.contains(r#""path":"/a\"b""#), "{out}");
         assert_eq!(
             out.matches(r#"","#).count(),
-            10,
+            12,
             "field count changed: {out}"
         );
     }
@@ -209,9 +226,27 @@ mod tests {
             total_ms: 1,
             permit_released_at: "-",
             spool: "-",
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736",
+            span_id: "00f067aa0ba902b7",
+            trace_continued: false,
+            generation: 1,
         }
         .to_json();
         assert!(out.contains(r#""upstream":"-""#));
+    }
+
+    #[test]
+    fn every_line_carries_correlation_ids() {
+        // The join key between this log and the origin's own. Absent, the
+        // whole point of forwarding `traceparent` is lost.
+        let out = log("/products/iphone");
+        assert!(
+            out.contains(r#""trace_id":"4bf92f3577b34da6a3ce929d0e0e4736""#),
+            "{out}"
+        );
+        assert!(out.contains(r#""span_id":"00f067aa0ba902b7""#), "{out}");
+        assert!(out.contains(r#""trace_continued":true"#), "{out}");
+        assert!(out.contains(r#""generation":3"#), "{out}");
     }
 
     #[test]
@@ -233,6 +268,10 @@ mod tests {
             total_ms: 2,
             permit_released_at: "body_end",
             spool: "-",
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736",
+            span_id: "00f067aa0ba902b7",
+            trace_continued: false,
+            generation: 1,
         };
         out = entry.to_text();
         assert!(!out.contains('\n'));

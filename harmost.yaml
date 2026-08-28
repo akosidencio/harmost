@@ -24,6 +24,28 @@ server:
     # client_ip: x_forwarded   # x_forwarded | forwarded | none
     # scheme: x_forwarded
 
+  # Process lifecycle: what a zero-downtime restart coordinates on.
+  #
+  # Set pid_file and upgrade_socket per instance. Two Harmosts on one host
+  # with the /tmp defaults will hand each other their listening sockets.
+  #
+  # The two windows do different jobs. drain_period is for the *load
+  # balancer*: readiness starts failing immediately and Harmost keeps serving
+  # normally for this long, so the balancer has time to withdraw the instance
+  # before anything stops. shutdown_timeout is what in-flight requests get
+  # once the shutdown proper begins.
+  #
+  # shutdown_timeout is a FLOOR, not a ceiling — Pingora's listener tasks are
+  # parked in accept() rather than watching for the signal, so a SIGTERM costs
+  # about drain_period + shutdown_timeout even on an idle process. Your
+  # supervisor's stop timeout must exceed that sum, or it SIGKILLs Harmost
+  # mid-drain. These defaults total 15s, inside Kubernetes' default 30s.
+  graceful:
+    pid_file: "/run/harmost/harmost.pid"
+    upgrade_socket: "/run/harmost/upgrade.sock"
+    drain_period: 5s
+    shutdown_timeout: 10s
+
 origin:
   upstreams:
     - "next-1:3000"
@@ -154,5 +176,55 @@ routes:
 telemetry:
   prometheus:
     listen: "127.0.0.1:9090"
+
+  # Readiness, liveness and status, on a listener of their own.
+  #
+  # An address rather than a path, for two reasons: /status is a perfectly
+  # ordinary application route so a path would collide silently with the
+  # origin's URL space, and it publishes backend health, cache occupancy and
+  # the config generation to anyone who can reach the site. Bind it to
+  # loopback or a private address.
+  #
+  #   GET /health/live    200 while the process is running
+  #   GET /health/ready   503 while draining — this is what a load balancer polls
+  #   GET /status         generation, backend state, cache and spool usage
+  #
+  # Without this block there is no readiness endpoint, so nothing can tell
+  # when an instance is draining and a rolling restart drops requests.
+  admin:
+    listen: "127.0.0.1:9091"
+    # Report not-ready when no upstream is healthy. Off by default, and the
+    # default is the careful one: Harmost still serves a fully unhealthy pool,
+    # so turning this on without something above Harmost that can route around
+    # this instance converts a degraded origin into a total edge outage.
+    require_healthy_upstream: false
+
+  # OpenTelemetry.
+  #
+  # Correlation is unconditional and free: every request gets a trace id and a
+  # span id, both appear on every access log line, and the id Harmost
+  # concluded is forwarded to the origin as `traceparent`. This block only
+  # decides whether spans are also *exported*.
+  tracing:
+    service_name: harmost
+    sample:
+      # parent_or_ratio follows an inbound sampling decision when there is one
+      # and falls back to the ratio otherwise — so a trace sampled at the edge
+      # does not have a hole exactly where the origin governor sits.
+      mode: parent_or_ratio    # parent_or_ratio | ratio | always | never
+      one_in: 20
+    # Whose traceparent to believe. Treated exactly like X-Forwarded-For:
+    # believed from a peer in server.trusted_proxies, ignored otherwise.
+    trust_incoming: from_trusted_proxies   # from_trusted_proxies | always | never
+    # Span export. OTLP over HTTP with the JSON encoding, plaintext only —
+    # an https:// endpoint is refused at startup rather than quietly
+    # downgraded. Run a collector as a sidecar and let it handle transport.
+    # otlp:
+    #   endpoint: "http://127.0.0.1:4318/v1/traces"
+    #   timeout: 5s
+    #   interval: 2s
+    #   max_queue: 2048   # full means DROP; a telemetry queue must not grow
+    #   max_batch: 256
+
   logging:
     format: json

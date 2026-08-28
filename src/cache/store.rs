@@ -129,6 +129,13 @@ impl BoundedStore {
         *self.used.lock()
     }
 
+    /// The configured byte budget. Published in the admin status document
+    /// next to `bytes_used`, because occupancy without its ceiling is a number
+    /// nobody can act on.
+    pub fn limit(&self) -> usize {
+        self.max_bytes
+    }
+
     pub fn entries(&self) -> usize {
         self.cached.read().len()
     }

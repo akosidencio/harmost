@@ -8,6 +8,18 @@ pub use schema::*;
 pub use units::{Bytes, Dur};
 pub use validation::ValidationError;
 
+/// The configuration schema version this binary understands.
+///
+/// `version:` is required in every config file and checked against this. It is
+/// not decoration: the format is pre-1.0, and the alternative to a version
+/// field is a future release silently reinterpreting a key that used to mean
+/// something else. A file naming a version this build does not know is
+/// **refused**, with both numbers in the message — the same rule as every
+/// other unimplemented key here.
+///
+/// Compatibility rules and the migration notes live in `docs/CONFIG-SCHEMA.md`.
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error("reading {path}")]

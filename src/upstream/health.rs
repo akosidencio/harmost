@@ -126,6 +126,13 @@ impl BackgroundService for HealthChecker {
                         log::warn!("upstream {} marked unhealthy", backend.address);
                     }
                 }
+                // Republished every round rather than only on a flip. A gauge
+                // that is only written on transitions reads as absent for the
+                // whole first interval, and "no data" during an incident is
+                // worse than a stale zero.
+                crate::telemetry::metrics::UPSTREAM_HEALTHY
+                    .with_label_values(&[&backend.address])
+                    .set(i64::from(self.pool.is_healthy(backend.id)));
             }
         }
     }

@@ -133,6 +133,35 @@ impl Reloader {
                     .to_string(),
             );
         }
+        if cfg.server.graceful != current.config.server.graceful {
+            return Err(
+                "server.graceful changed; the pid file, upgrade socket and shutdown windows are \
+                 read once when the process starts and are what a graceful upgrade coordinates \
+                 on, so a reload would report success while the old paths stayed in force; that \
+                 needs a restart"
+                    .to_string(),
+            );
+        }
+        if cfg.telemetry.admin != current.config.telemetry.admin {
+            return Err(
+                "telemetry.admin changed; the admin listener is bound at startup and that needs \
+                 a restart"
+                    .to_string(),
+            );
+        }
+        if cfg.telemetry.tracing.otlp != current.config.telemetry.tracing.otlp
+            || cfg.telemetry.tracing.service_name != current.config.telemetry.tracing.service_name
+        {
+            // Sampling and inbound trust *do* reload — they are read per
+            // request from the snapshot. The exporter is not: its queue,
+            // endpoint and resource attributes are bound once.
+            return Err(
+                "telemetry.tracing.otlp or service_name changed; the span exporter is built once \
+                 at startup and that needs a restart. telemetry.tracing.sample and \
+                 trust_incoming do reload"
+                    .to_string(),
+            );
+        }
         if cfg.upgrade.max_concurrent != current.config.upgrade.max_concurrent {
             return Err(
                 "upgrade.max_concurrent changed; the upgrade limiter is sized once at startup and \
@@ -171,6 +200,12 @@ impl Reloader {
             &route_limits,
         );
         self.policy.store(snapshot);
+        // Published only after the swap succeeded, so the gauge answers "which
+        // config is actually serving" rather than "which one was attempted".
+        // A refused reload leaves it untouched, which is what makes it usable
+        // as the check after a deploy.
+        crate::telemetry::metrics::CONFIG_GENERATION
+            .set(i64::try_from(generation).unwrap_or(i64::MAX));
 
         Ok(generation)
     }
@@ -340,6 +375,17 @@ routes:
             ),
             format!("{BASE}spool:\n  max_memory: 16MiB\n"),
             format!("{BASE}upgrade:\n  max_concurrent: 7\n"),
+            // The upgrade socket is what two processes coordinate a
+            // zero-downtime handoff on. A reload that reported success while
+            // the old path stayed in force would break the next restart.
+            BASE.replace(
+                "  listen: \"127.0.0.1:8080\"",
+                "  listen: \"127.0.0.1:8080\"\n  graceful:\n    upgrade_socket: /tmp/other.sock",
+            ),
+            format!("{BASE}telemetry:\n  admin:\n    listen: \"127.0.0.1:9091\"\n"),
+            format!(
+                "{BASE}telemetry:\n  tracing:\n    otlp:\n      endpoint: \"http://127.0.0.1:4318/v1/traces\"\n"
+            ),
         ] {
             let (path, reloader, policy) = setup(BASE);
             std::fs::write(&path.0, &changed).unwrap();
@@ -347,6 +393,23 @@ routes:
             assert!(err.contains("restart"), "config:\n{changed}\nerror: {err}");
             assert_eq!(policy.load().generation, 1);
         }
+    }
+
+    #[test]
+    fn sampling_and_trace_trust_do_reload() {
+        // The counterpart to the refusals above. These are read per request
+        // from the snapshot, so refusing them would be the opposite failure:
+        // an operator unable to turn sampling down during an incident.
+        let (path, reloader, policy) = setup(BASE);
+        std::fs::write(
+            &path.0,
+            format!(
+                "{BASE}telemetry:\n  tracing:\n    sample:\n      mode: ratio\n      one_in: 50\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(reloader.reload().unwrap(), 2);
+        assert_eq!(policy.load().config.telemetry.tracing.sample.one_in, 50);
     }
 
     #[test]
