@@ -28,8 +28,12 @@ timeouts:
   downstream_write: 60s
 debug_headers: true
 routes:
+  # Deliberately declared as an ordinary public route. Protocol classification
+  # must still win: this label may not enable upgrades when they are disabled
+  # or move them outside upgrade.max_concurrent when they are enabled.
   - id: sockets
     match: "/ws/**"
+    class: public_ssr
 
   - id: pages
     match: "/**"

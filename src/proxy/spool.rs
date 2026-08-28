@@ -251,7 +251,12 @@ impl Spool {
         if needed <= self.reserved {
             return true;
         }
-        let step = (needed - self.reserved).next_multiple_of(RESERVE_STEP);
+        let unreserved = needed - self.reserved;
+        let rounded = unreserved.saturating_add(RESERVE_STEP - 1) / RESERVE_STEP * RESERVE_STEP;
+        // A configured body ceiling smaller than RESERVE_STEP is valid. Do
+        // not ask the global budget for 64 KiB when this response can retain
+        // at most (for example) 1 KiB.
+        let step = rounded.min(self.max_body.saturating_sub(self.reserved));
         if !self.budget.reserve(step) {
             return false;
         }
@@ -387,6 +392,20 @@ mod tests {
         let mut spool = Spool::new(budget, 1000);
         assert_eq!(spool.offer(chunk(1000), false), None);
         assert_eq!(spool.offer(None, true).map(|b| b.len()), Some(1000));
+        assert_eq!(spool.outcome(), Some(SpoolOutcome::Complete));
+    }
+
+    #[test]
+    fn a_budget_smaller_than_the_reservation_step_still_spools() {
+        let budget = SpoolBudget::new(1024);
+        let mut spool = Spool::new(budget.clone(), 1024);
+
+        assert_eq!(spool.offer(chunk(512), false), None);
+        assert_eq!(budget.used(), 1024);
+        assert_eq!(
+            spool.offer(chunk(512), true).map(|bytes| bytes.len()),
+            Some(1024)
+        );
         assert_eq!(spool.outcome(), Some(SpoolOutcome::Complete));
     }
 

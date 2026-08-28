@@ -299,14 +299,13 @@ impl ProxyHttp for Harmost {
         let policy = ctx.policy.clone();
         let route = policy.resolve(&host, &path, &method);
 
-        // A route's declared class outranks what the classifier inferred —
-        // the operator knows things about their own routes that headers do not
-        // reveal. It cannot make a private thing public: validation refuses
-        // that combination at startup.
-        ctx.class = route
-            .and_then(|r| r.declared_class())
-            .or(hints.class)
-            .unwrap_or(RequestClass::Unknown);
+        // A route's declared class normally outranks what the classifier
+        // inferred: the operator knows things about their own routes that
+        // headers do not reveal. Protocol upgrades are the exception. They
+        // leave HTTP behind, so no route label may turn one back into a
+        // cacheable, render-limited, or admission-exempt HTTP request.
+        ctx.class =
+            resolved_request_class(&meta, route.and_then(|r| r.declared_class()), hints.class);
         ctx.route_id = route.map(|r| r.id.clone());
 
         ctx.route_cache = route.and_then(|r| r.config.cache.clone());
@@ -1005,6 +1004,22 @@ fn resolved_key_headers(framework: &[&str], route: Option<&RouteCache>) -> Vec<S
     headers
 }
 
+/// Resolve the request class without allowing route policy to erase protocol
+/// facts. A route declaration can improve framework-specific knowledge for an
+/// ordinary HTTP request, but an Upgrade header means the request is asking to
+/// become a tunnel regardless of which path matched.
+fn resolved_request_class(
+    req: &RequestMetadata<'_>,
+    declared: Option<RequestClass>,
+    inferred: Option<RequestClass>,
+) -> RequestClass {
+    if req.is_upgrade() {
+        RequestClass::Upgrade
+    } else {
+        declared.or(inferred).unwrap_or(RequestClass::Unknown)
+    }
+}
+
 fn check_origin_deadline(ctx: &Ctx) -> Result<()> {
     let timeout = ctx.policy.config.timeouts.origin.as_duration();
     if !timeout.is_zero()
@@ -1125,6 +1140,34 @@ mod tests {
             joined_header_values(&headers, http::header::CACHE_CONTROL).as_deref(),
             Some("public, max-age=60,private")
         );
+    }
+
+    #[test]
+    fn a_route_class_cannot_erase_an_upgrade() {
+        let method = http::Method::GET;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        let req = RequestMetadata {
+            method: &method,
+            host: "shop.example.com",
+            path: "/socket",
+            query: None,
+            headers: &headers,
+        };
+
+        for declared in [
+            RequestClass::Static,
+            RequestClass::PublicDocument,
+            RequestClass::PublicDynamic,
+            RequestClass::PrivateDynamic,
+            RequestClass::Streaming,
+        ] {
+            assert_eq!(
+                resolved_request_class(&req, Some(declared), Some(RequestClass::Upgrade)),
+                RequestClass::Upgrade,
+                "{declared:?} route bypassed the upgrade policy"
+            );
+        }
     }
 
     #[test]

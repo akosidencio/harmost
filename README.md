@@ -872,7 +872,7 @@ not completed production hardening or operational validation.
 | HTTP/2 downstream (h2c and ALPN) and upstream | done, tested ([`bench/http2.sh`](./bench/http2.sh)) |
 | `HEAD`, `Range`, conditional requests, disconnects, malformed bodies | done, tested ([`bench/protocol.sh`](./bench/protocol.sh)) |
 | `Upgrade`/WebSocket proxying, bounded separately from renders | done, tested, off by default ([`bench/websocket.sh`](./bench/websocket.sh)) |
-| Native TLS, downstream and upstream (`--features tls`) | done, tested ([`bench/tls.sh`](./bench/tls.sh)) |
+| Native TLS, downstream and upstream (`--features tls`) | done, tested ([`bench/tls.sh`](./bench/tls.sh)); [Pingora labels its rustls backend experimental](https://github.com/cloudflare/pingora#feature-highlights), so external TLS termination remains recommended |
 | Trusted proxies, forwarded scheme and client IP | done, tested ([`bench/forwarded.sh`](./bench/forwarded.sh)) |
 | Bounded response spool | done, tested ([`bench/spool.sh`](./bench/spool.sh)) |
 | Threat model | [written](./docs/THREAT-MODEL.md); **not independently reviewed** |

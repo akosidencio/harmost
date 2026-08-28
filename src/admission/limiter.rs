@@ -7,6 +7,7 @@
 //! the config change most likely to be made during an incident, which is
 //! raising a limit.
 
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -61,13 +62,23 @@ impl Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        if let Some(permit) = self.inner.take()
-            && self.limiter.claim_debt()
-        {
-            // Absorb this returned permit directly. Returning it to the
-            // semaphore first lets an already-queued waiter steal it before
-            // a downward resize can collect its debt.
-            permit.forget();
+        if let Some(permit) = self.inner.take() {
+            // Resize and return form one semaphore transaction. Without this
+            // guard, a shrink can forget the currently available permits, a
+            // group of in-flight permits can return, and only then can the
+            // shrink record its debt. Queued requests can steal every permit
+            // returned in that window and keep concurrency near the old
+            // ceiling for another generation of work.
+            let _resize = self.limiter.resize_lock.lock();
+            if self.limiter.claim_debt() {
+                // Absorb this returned permit directly. Returning it to the
+                // semaphore first lets an already-queued waiter steal it.
+                permit.forget();
+            } else {
+                // Make the permit visible while the guard is still held. A
+                // following resize therefore observes and collects it.
+                drop(permit);
+            }
         }
     }
 }
@@ -82,6 +93,9 @@ pub struct Limiter {
     /// Permits a shrink still owes but could not take, because they were
     /// out with in-flight requests at the time.
     debt: AtomicUsize,
+    /// Serialises ceiling changes with permit returns. The critical sections
+    /// contain no await and only semaphore/atomic operations.
+    resize_lock: Mutex<()>,
     queue_depth: AtomicUsize,
     queue_max: AtomicUsize,
     /// Milliseconds, not a `Duration`, because it has to live in an atomic.
@@ -107,6 +121,7 @@ impl Limiter {
             sem: Arc::new(Semaphore::new(limit)),
             limit: AtomicUsize::new(limit),
             debt: AtomicUsize::new(0),
+            resize_lock: Mutex::new(()),
             queue_depth: AtomicUsize::new(0),
             queue_max: AtomicUsize::new(queue_max),
             queue_timeout_ms: AtomicU64::new(millis(queue_timeout)),
@@ -134,20 +149,18 @@ impl Limiter {
 
     /// Move the ceiling without disturbing in-flight work.
     ///
-    /// Callers are expected to be serialised — `apply_limits` drives this from
-    /// the single reload path. Two `resize` calls racing each other would
-    /// interleave their reads of `debt`, and the ceiling they settle on is
-    /// whichever wrote `limit` last rather than whichever was asked for.
+    /// Resizes are serialised with each other and with permit returns so a
+    /// downward change has no interval in which returned permits can escape
+    /// its debt accounting.
     pub fn resize(self: &Arc<Self>, new_limit: usize) {
+        let _resize = self.resize_lock.lock();
         let old = self.limit.swap(new_limit, Ordering::SeqCst);
         if new_limit > old {
             // Growing also cancels any outstanding shrink.
             let grant = new_limit - old;
-            // One read-modify-write, not a swap-then-restore. Zeroing the debt
-            // and adding the remainder back leaves a window where a permit
-            // returning through `claim_debt` sees no debt to absorb and
-            // releases itself to the semaphore instead — admitting past the
-            // ceiling the shrink was still collecting for.
+            // One read-modify-write keeps the debt transition explicit. The
+            // resize lock also prevents a return from observing a partial
+            // grow while the matching permits are added.
             let cancelled = self
                 .debt
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |debt| {
@@ -161,17 +174,9 @@ impl Limiter {
             }
         } else if new_limit < old {
             let owed = old - new_limit;
-            // Forgetting first and recording the remainder second leaves the
-            // mirror-image window: a permit returning in between is neither
-            // forgotten nor owed, so it goes back to the semaphore and the
-            // limiter overshoots by one until the next return settles it.
-            //
-            // Recording the debt first would close that window and open a
-            // worse one — the debt would be over-recorded while
-            // `forget_permits` runs, and concurrent returns could drive it to
-            // zero before the correction, so the correcting subtraction would
-            // underflow. The overshoot is bounded by one permit and
-            // self-correcting; the alternative is not.
+            // Permit returns cannot interleave these two operations because
+            // they take the same guard. Whatever cannot be forgotten here is
+            // therefore genuinely in flight and becomes exact shrink debt.
             let forgotten = self.sem.forget_permits(owed);
             if forgotten < owed {
                 // The rest are out with in-flight requests; collect them as

@@ -35,6 +35,7 @@ pub fn validate(cfg: &Config) -> Result<()> {
             "origin.concurrency.max is 0, which admits nothing; omit the key to take the default",
         ));
     }
+    check_concurrency_max(cfg.origin.concurrency.max, "origin.concurrency.max")?;
     if cfg.cache.max_memory.get() == 0 {
         return Err(err("cache.max_memory must be greater than zero"));
     }
@@ -165,7 +166,38 @@ fn validate_server_tls(cfg: &Config) -> Result<()> {
             return Err(err(format!("server.tls.{label} `{path}` does not exist")));
         }
     }
+    #[cfg(feature = "tls")]
+    validate_server_tls_material(&tls.cert, &tls.key)?;
     Ok(())
+}
+
+#[cfg(feature = "tls")]
+fn validate_server_tls_material(cert_path: &str, key_path: &str) -> Result<()> {
+    pingora_core::tls::install_default_crypto_provider();
+    let material =
+        pingora_core::tls::load_certs_and_key_files(cert_path, key_path).map_err(|error| {
+            err(format!(
+                "could not read server TLS certificate or key: {error}"
+            ))
+        })?;
+    let Some((certs, key)) = material else {
+        return Err(err(
+            "server TLS files contain no usable certificate/private-key pair",
+        ));
+    };
+
+    // Mirror Pingora's rustls listener construction here. Pingora 0.8 builds
+    // this later through an infallible API that panics on malformed or
+    // incompatible material; validation turns that startup panic into a
+    // normal `harmost check` error.
+    pingora_core::tls::ServerConfig::builder_with_protocol_versions(&[
+        &pingora_core::tls::version::TLS12,
+        &pingora_core::tls::version::TLS13,
+    ])
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map(|_| ())
+    .map_err(|error| err(format!("server TLS certificate/key are invalid: {error}")))
 }
 
 /// A trust list that cannot be parsed is a trust list that does not protect
@@ -270,6 +302,7 @@ fn validate_spool(cfg: &Config) -> Result<()> {
 }
 
 fn validate_upgrade(cfg: &Config) -> Result<()> {
+    check_concurrency_max(cfg.upgrade.max_concurrent, "upgrade.max_concurrent")?;
     if cfg.upgrade.enabled && cfg.upgrade.max_concurrent == 0 {
         return Err(err(
             "upgrade.enabled is true but upgrade.max_concurrent is 0, which admits nothing; set a \
@@ -333,6 +366,16 @@ fn check_coalesce_wait(cfg: &Config) -> Result<()> {
 /// of the range where `Instant::now() + timeout` stops being representable.
 const MAX_QUEUE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+fn check_concurrency_max(value: usize, path: &str) -> Result<()> {
+    if value > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(err(format!(
+            "{path} is {value}, greater than Tokio's semaphore maximum of {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        )));
+    }
+    Ok(())
+}
+
 fn check_queue(c: &Concurrency, path: &str) -> Result<()> {
     if c.queue.max > 0 && c.queue.timeout == super::units::Dur::ZERO {
         return Err(err(format!(
@@ -362,6 +405,7 @@ fn check_route(route: &Route) -> Result<()> {
                 "route `{id}`: concurrency.max is 0, which admits nothing"
             )));
         }
+        check_concurrency_max(c.max, &format!("route `{id}`.concurrency.max"))?;
         check_queue(c, &format!("route `{id}`.concurrency"))?;
     }
 
@@ -594,6 +638,31 @@ server:
         }
     }
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn rejects_existing_but_invalid_server_tls_files() {
+        let base = std::env::temp_dir().join(format!("harmost-invalid-tls-{}", std::process::id()));
+        let cert = base.with_extension("cert.pem");
+        let key = base.with_extension("key.pem");
+        std::fs::write(&cert, b"this is not a certificate").unwrap();
+        std::fs::write(&key, b"this is not a private key").unwrap();
+
+        let cfg = parse(&format!(
+            "{BASE}\nserver:\n  tls:\n    listen: \"0.0.0.0:8443\"\n    cert: {}\n    key: {}\n",
+            cert.display(),
+            key.display()
+        ));
+        let error = validate(&cfg).unwrap_err().to_string();
+
+        let _ = std::fs::remove_file(cert);
+        let _ = std::fs::remove_file(key);
+        assert!(
+            error.contains("no usable certificate/private-key pair")
+                || error.contains("could not read server TLS"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn rejects_an_origin_ca_that_the_connector_would_ignore() {
         // The greengate rule: a key that is accepted and then ignored lets
@@ -679,6 +748,33 @@ upgrade:
         ));
         let e = validate(&cfg).unwrap_err().to_string();
         assert!(e.contains("admits nothing"), "{e}");
+    }
+
+    #[test]
+    fn rejects_concurrency_values_above_tokios_semaphore_maximum() {
+        let too_many = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        for (yaml, path) in [
+            (
+                format!(
+                    "version: 1\norigin:\n  upstreams: [\"next-1:3000\"]\n  concurrency:\n    max: {too_many}\n"
+                ),
+                "origin.concurrency.max",
+            ),
+            (
+                format!("{BASE}upgrade:\n  max_concurrent: {too_many}\n"),
+                "upgrade.max_concurrent",
+            ),
+            (
+                format!(
+                    "{BASE}routes:\n  - id: large\n    match: /large\n    concurrency:\n      max: {too_many}\n"
+                ),
+                "route `large`.concurrency.max",
+            ),
+        ] {
+            let error = validate(&parse(&yaml)).unwrap_err().to_string();
+            assert!(error.contains(path), "expected {path} in: {error}");
+            assert!(error.contains("semaphore maximum"), "{error}");
+        }
     }
 
     #[test]
