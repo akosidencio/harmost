@@ -67,6 +67,24 @@ run http2.sh
 run spool.sh "${SPOOL_MIB:-8}" "${SPOOL_RATE:-32k}"
 run adversarial.sh "${ADVERSARIAL_SECONDS:-20}"
 
+# Phase 2: operability. The readiness and status surface, restarting without
+# dropping requests, and the three failure classes that only appear with time
+# or with something breaking underneath.
+#
+# The parameters here are CI-sized. The release gate runs the same scripts far
+# longer — an hour of soak, forty rounds of memory pressure — because a leak of
+# a few kilobytes per thousand requests is invisible in a minute. See
+# docs/RELEASE-GATES.md.
+run admin.sh
+run upgrade.sh "${UPGRADE_SECONDS:-6}"
+run tracing.sh
+run soak.sh "${SOAK_SECONDS:-45}" "${SOAK_WORKERS:-10}"
+run memory.sh "${MEMORY_ROUNDS:-6}" "${MEMORY_SLOW_READERS:-12}"
+run chaos.sh "${CHAOS_ROUNDS:-2}"
+
+# bench/tracing.sh also needs python3 (for the OTLP collector it asserts
+# against) and skips itself with a message when it is missing.
+#
 # WebSockets need a Python interpreter for the client. Skipped loudly, on the
 # same reasoning as the Docker block below.
 if command -v python3 >/dev/null; then

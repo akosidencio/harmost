@@ -28,6 +28,11 @@ arc-swap = "1"
 async-trait = "0.1"
 bytes = "1"
 log = "0.4"
+# Trace and span ids. Chosen over `rand` because it is the OS entropy syscall
+# and nothing else — no PRNG, no distributions, no generic machinery — and
+# because it is already in this tree transitively, so making it direct costs
+# no new code at all.
+getrandom = "0.3"
 
 [features]
 # Exposes the internal parsers the fuzz targets drive. Not part of the public

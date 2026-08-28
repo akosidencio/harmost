@@ -19,10 +19,17 @@ fn err(msg: impl Into<String>) -> ValidationError {
 }
 
 pub fn validate(cfg: &Config) -> Result<()> {
-    if cfg.version != 1 {
+    if cfg.version != super::SCHEMA_VERSION {
+        // Refused, never coerced. The format is pre-1.0 and a future version
+        // may reinterpret a key that exists today, so a binary that guessed
+        // would be applying a policy nobody wrote. Both numbers are in the
+        // message because the useful next question is "which binary is this".
         return Err(err(format!(
-            "config version {} is not supported; this build understands version 1",
-            cfg.version
+            "config schema version {} is not supported; this build of harmost understands \
+             version {}. See docs/CONFIG-SCHEMA.md for the compatibility rules and the \
+             migration notes",
+            cfg.version,
+            super::SCHEMA_VERSION
         )));
     }
     if cfg.origin.upstreams.is_empty() {
@@ -76,6 +83,9 @@ pub fn validate(cfg: &Config) -> Result<()> {
     if let Some(prometheus) = &cfg.telemetry.prometheus {
         validate_listen(&prometheus.listen, "telemetry.prometheus.listen")?;
     }
+    validate_graceful(cfg)?;
+    validate_admin(cfg)?;
+    validate_tracing(cfg)?;
     for upstream in &cfg.origin.upstreams {
         validate_upstream(upstream)?;
     }
@@ -312,6 +322,109 @@ fn validate_upgrade(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// The zero-downtime upgrade runs on these three paths agreeing between two
+/// processes, so a nonsense value here is only discovered during the restart
+/// it was supposed to make safe.
+fn validate_graceful(cfg: &Config) -> Result<()> {
+    let g = &cfg.server.graceful;
+    if g.pid_file.trim().is_empty() {
+        return Err(err(
+            "server.graceful.pid_file is empty; omit the key to take the default",
+        ));
+    }
+    if g.upgrade_socket.trim().is_empty() {
+        return Err(err(
+            "server.graceful.upgrade_socket is empty; omit the key to take the default",
+        ));
+    }
+    if g.pid_file == g.upgrade_socket {
+        return Err(err(
+            "server.graceful.pid_file and server.graceful.upgrade_socket are the same path",
+        ));
+    }
+    if g.shutdown_timeout == super::units::Dur::ZERO {
+        return Err(err(
+            "server.graceful.shutdown_timeout is 0, which cuts off every in-flight request \
+             the moment a shutdown starts; that is the outage a graceful shutdown exists to \
+             avoid",
+        ));
+    }
+    Ok(())
+}
+
+/// The admin surface publishes backend health, cache occupancy and the config
+/// generation. It must not share a listener with anything that serves the
+/// public, and it must not be reachable at a path the origin also owns — which
+/// is why it is an address rather than a route.
+fn validate_admin(cfg: &Config) -> Result<()> {
+    let Some(admin) = &cfg.telemetry.admin else {
+        return Ok(());
+    };
+    validate_listen(&admin.listen, "telemetry.admin.listen")?;
+
+    // Compared as parsed addresses, not as strings, so `127.0.0.1:9090` and
+    // `127.000.000.001:9090` cannot slip past as "different".
+    let admin_addr = admin.listen.parse::<std::net::SocketAddr>().ok();
+    let mut taken: Vec<(&str, &str)> = vec![("server.listen", cfg.server.listen.as_str())];
+    if let Some(tls) = &cfg.server.tls {
+        taken.push(("server.tls.listen", tls.listen.as_str()));
+    }
+    if let Some(p) = &cfg.telemetry.prometheus {
+        taken.push(("telemetry.prometheus.listen", p.listen.as_str()));
+    }
+    for (name, address) in taken {
+        if address.parse::<std::net::SocketAddr>().ok() == admin_addr {
+            return Err(err(format!(
+                "telemetry.admin.listen `{}` is the same address as {name}; the admin \
+                 endpoints publish backend health, cache occupancy and the configuration \
+                 generation, and must not share a listener with traffic",
+                admin.listen
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tracing(cfg: &Config) -> Result<()> {
+    let t = &cfg.telemetry.tracing;
+    if t.service_name.as_ref().is_some_and(|n| n.trim().is_empty()) {
+        return Err(err(
+            "telemetry.tracing.service_name is empty; omit the key to take `harmost`",
+        ));
+    }
+    if t.sample.one_in == 0 {
+        // Ambiguous between "everything" and "nothing", and the two readings
+        // differ by the entire contents of a tracing backend.
+        return Err(err(
+            "telemetry.tracing.sample.one_in is 0, which is ambiguous; use `one_in: 1` for \
+             every request or `mode: never` for none",
+        ));
+    }
+    let Some(otlp) = &t.otlp else {
+        return Ok(());
+    };
+    crate::telemetry::otlp::parse_endpoint(&otlp.endpoint)
+        .map_err(|why| err(format!("telemetry.tracing.otlp.endpoint: {why}")))?;
+    if otlp.max_queue == 0 || otlp.max_batch == 0 {
+        return Err(err(
+            "telemetry.tracing.otlp.max_queue and max_batch must be greater than zero",
+        ));
+    }
+    if otlp.max_batch > otlp.max_queue {
+        return Err(err(format!(
+            "telemetry.tracing.otlp.max_batch ({}) exceeds max_queue ({}); a batch can never \
+             fill",
+            otlp.max_batch, otlp.max_queue
+        )));
+    }
+    if otlp.timeout == super::units::Dur::ZERO || otlp.interval == super::units::Dur::ZERO {
+        return Err(err(
+            "telemetry.tracing.otlp.timeout and interval must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_listen(address: &str, path: &str) -> Result<()> {
     address
         .parse::<std::net::SocketAddr>()
@@ -518,6 +631,122 @@ origin:
     #[test]
     fn accepts_a_minimal_config() {
         validate(&parse(BASE)).unwrap();
+    }
+
+    // ------------------------------------------------- schema versioning
+
+    #[test]
+    fn an_unknown_schema_version_is_refused_and_names_both_numbers() {
+        // Coercing a future version would mean applying a policy nobody
+        // wrote, because a later release may reinterpret a key that exists
+        // today.
+        let e = validate(&parse(BASE.replace("version: 1", "version: 2").as_str())).unwrap_err();
+        assert!(e.0.contains('2') && e.0.contains("version 1"), "{e}");
+        assert!(e.0.contains("CONFIG-SCHEMA"), "{e}");
+        assert!(validate(&parse(BASE.replace("version: 1", "version: 0").as_str())).is_err());
+    }
+
+    // ------------------------------------------------- admin endpoints
+
+    #[test]
+    fn the_admin_listener_is_accepted_on_its_own_address() {
+        validate(&parse(&format!(
+            "{BASE}telemetry:\n  admin:\n    listen: \"127.0.0.1:9091\"\n"
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn the_admin_listener_may_not_share_an_address_with_traffic() {
+        // It publishes backend health, cache occupancy and the config
+        // generation. Sharing the traffic listener would publish all three to
+        // anyone who can reach the site.
+        let e = validate(&parse(&format!(
+            "{BASE}server:\n  listen: \"127.0.0.1:8080\"\ntelemetry:\n  admin:\n    listen: \"127.0.0.1:8080\"\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("server.listen"), "{e}");
+    }
+
+    #[test]
+    fn the_admin_listener_may_not_share_an_address_with_metrics() {
+        let e = validate(&parse(&format!(
+            "{BASE}telemetry:\n  prometheus:\n    listen: \"127.0.0.1:9090\"\n  admin:\n    listen: \"127.0.0.1:9090\"\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("telemetry.prometheus.listen"), "{e}");
+    }
+
+    #[test]
+    fn a_malformed_admin_address_is_refused() {
+        assert!(
+            validate(&parse(&format!(
+                "{BASE}telemetry:\n  admin:\n    listen: \"not-an-address\"\n"
+            )))
+            .is_err()
+        );
+    }
+
+    // ------------------------------------------------- tracing
+
+    #[test]
+    fn a_tracing_block_without_export_is_accepted() {
+        // Correlation is unconditional; export is the optional half.
+        validate(&parse(&format!(
+            "{BASE}telemetry:\n  tracing:\n    sample:\n      mode: ratio\n      one_in: 20\n"
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn an_https_otlp_endpoint_is_refused_rather_than_downgraded() {
+        let e = validate(&parse(&format!(
+            "{BASE}telemetry:\n  tracing:\n    otlp:\n      endpoint: \"https://collector:4318/v1/traces\"\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("http://"), "{e}");
+    }
+
+    #[test]
+    fn an_ambiguous_sample_ratio_is_refused() {
+        // `one_in: 0` reads equally as "everything" and "nothing", and the two
+        // differ by the entire contents of a tracing backend.
+        let e = validate(&parse(&format!(
+            "{BASE}telemetry:\n  tracing:\n    sample:\n      one_in: 0\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("mode: never"), "{e}");
+    }
+
+    #[test]
+    fn a_batch_larger_than_the_queue_is_refused() {
+        let e = validate(&parse(&format!(
+            "{BASE}telemetry:\n  tracing:\n    otlp:\n      endpoint: \"http://c:4318/v1/traces\"\n      max_queue: 10\n      max_batch: 100\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("can never"), "{e}");
+    }
+
+    // ------------------------------------------------- graceful upgrade
+
+    #[test]
+    fn a_zero_shutdown_timeout_is_refused() {
+        // It would cut off every in-flight request the instant a shutdown
+        // begins, which is the outage graceful shutdown exists to avoid.
+        let e = validate(&parse(&format!(
+            "{BASE}server:\n  graceful:\n    shutdown_timeout: 0s\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("shutdown_timeout"), "{e}");
+    }
+
+    #[test]
+    fn the_pid_file_and_upgrade_socket_may_not_be_the_same_path() {
+        let e = validate(&parse(&format!(
+            "{BASE}server:\n  graceful:\n    pid_file: /run/h\n    upgrade_socket: /run/h\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("same path"), "{e}");
     }
 
     #[test]

@@ -245,6 +245,38 @@ bench_start_harmost() { # name, config, listen_port [, metrics_port]
   return 0
 }
 
+# ------------------------------------------------------------- observation
+
+# Resident set size of a pid, in KiB. `ps -o rss=` reports KiB on both Linux
+# and macOS, which is the only reason this is one line rather than two
+# platform branches.
+#
+# RSS is the honest number for "did this process stay inside its budget": it
+# counts what is actually resident, which is what an OOM killer and a container
+# limit both look at. Heap-allocator statistics would flatter a leak that the
+# allocator has not returned to the OS.
+bench_rss_kb() { # pid
+  ps -o rss= -p "$1" 2>/dev/null | tr -d ' '
+}
+
+# One Prometheus metric value, by exact series name. The `^` anchor matters:
+# without it `harmost_cache_bytes` also matches nothing useful but
+# `harmost_spool_bytes` would match a HELP line.
+bench_metric() { # port, series
+  curl -s --max-time 5 "http://127.0.0.1:$1/metrics" \
+    | sed -n "s/^$2 \([0-9.e+-]*\)$/\1/p" | head -1
+}
+
+# Did the process log anything that means it fell over? A soak that ends with
+# the proxy alive but its log full of panics is not a passing soak.
+bench_assert_no_panics() { # name
+  local log
+  log=$(bench_log "$1")
+  if grep -qE "panicked at|attempt to (add|subtract|multiply) with overflow" "$log"; then
+    bench_fail "$1 panicked: $(grep -m1 -E "panicked at|overflow" "$log")"
+  fi
+}
+
 # ------------------------------------------------------- parameters/results
 
 bench_param() {

@@ -15,6 +15,7 @@
 //!
 //! The Pingora proxy layer sits on top of these pure policy components.
 
+pub mod admin;
 pub mod admission;
 pub mod cache;
 pub mod classifier;

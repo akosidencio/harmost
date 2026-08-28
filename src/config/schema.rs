@@ -61,6 +61,10 @@ pub struct Server {
     /// Who is allowed to tell Harmost about the client.
     #[serde(default)]
     pub trusted_proxies: TrustedProxies,
+    /// Process lifecycle: pid file, upgrade socket, drain and shutdown
+    /// windows. These are what make the zero-downtime upgrade reachable.
+    #[serde(default)]
+    pub graceful: Graceful,
 }
 
 impl Default for Server {
@@ -70,8 +74,87 @@ impl Default for Server {
             h2c: false,
             tls: None,
             trusted_proxies: TrustedProxies::default(),
+            graceful: Graceful::default(),
         }
     }
+}
+
+/// Zero-downtime upgrade and drain.
+///
+/// Pingora's `SIGQUIT` handoff passes the listening file descriptors to a new
+/// process over `upgrade_socket`, so the old process keeps serving what it
+/// already accepted while the new one takes every new connection. Both
+/// processes must agree on the socket path, which is why it is configuration
+/// rather than a constant: two Harmosts on one host with the same default
+/// would hand each other their listeners.
+///
+/// `drain_period` is separate from `shutdown_timeout` and does different work.
+/// Draining is for the *load balancer*: readiness starts failing immediately,
+/// and Harmost keeps serving normally for this long so the balancer has time
+/// to notice and stop sending new work. Only then does the shutdown itself
+/// begin, bounded by `shutdown_timeout`. Skipping the first window is the
+/// usual cause of "we did a graceful restart and still dropped requests".
+///
+/// # `shutdown_timeout` is a floor, not a ceiling
+///
+/// This is the surprising one, and it is measured rather than assumed — see
+/// `bench/upgrade.sh`. Pingora ends a shutdown with `Runtime::shutdown_timeout`
+/// on each service's runtime, and its listener tasks are parked in `accept`
+/// rather than watching for the signal, so the wait runs to completion whether
+/// or not anything is still in flight. **A `SIGTERM` therefore takes about
+/// `drain_period + shutdown_timeout` every time, even on a completely idle
+/// process.**
+///
+/// Two things follow, and both are ways deployments actually break:
+///
+/// * The defaults add up to 15 seconds, which fits inside Kubernetes'
+///   default `terminationGracePeriodSeconds: 30` and systemd's default
+///   `TimeoutStopSec=90`. Raise these two and you must raise those, or the
+///   supervisor `SIGKILL`s Harmost part-way through the drain — dropping
+///   exactly the requests the drain existed to protect.
+/// * There is no point setting `shutdown_timeout` far above the longest
+///   response you actually serve. It buys nothing and every restart pays it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Graceful {
+    /// Written when the process starts. `harmost run --upgrade` and every
+    /// `kill -QUIT $(cat …)` in the documentation read it.
+    #[serde(default = "default_pid_file")]
+    pub pid_file: String,
+    /// Unix socket the old and new processes use to pass listening fds.
+    #[serde(default = "default_upgrade_socket")]
+    pub upgrade_socket: String,
+    /// How long Harmost keeps serving after readiness starts failing, before
+    /// the shutdown proper begins. Gives a load balancer time to take this
+    /// instance out of rotation.
+    #[serde(default = "d_5s")]
+    pub drain_period: Dur,
+    /// How long in-flight requests get once the shutdown proper begins.
+    ///
+    /// Ten seconds rather than thirty: see the note above on this being a
+    /// floor. A thirty-second value makes every ordinary restart take
+    /// thirty-five seconds and puts the process past Kubernetes' default
+    /// termination grace period, where it is `SIGKILL`ed mid-drain.
+    #[serde(default = "d_10s")]
+    pub shutdown_timeout: Dur,
+}
+
+impl Default for Graceful {
+    fn default() -> Self {
+        Graceful {
+            pid_file: default_pid_file(),
+            upgrade_socket: default_upgrade_socket(),
+            drain_period: d_5s(),
+            shutdown_timeout: d_10s(),
+        }
+    }
+}
+
+fn default_pid_file() -> String {
+    "/tmp/harmost.pid".into()
+}
+fn default_upgrade_socket() -> String {
+    "/tmp/harmost-upgrade.sock".into()
 }
 
 fn default_listen() -> String {
@@ -391,6 +474,9 @@ fn d_500ms() -> Dur {
 fn d_5s() -> Dur {
     Dur(std::time::Duration::from_secs(5))
 }
+fn d_10s() -> Dur {
+    Dur(std::time::Duration::from_secs(10))
+}
 fn d_30s() -> Dur {
     Dur(std::time::Duration::from_secs(30))
 }
@@ -640,6 +726,14 @@ pub struct RouteCoalesce {
 pub struct Telemetry {
     #[serde(default)]
     pub prometheus: Option<Prometheus>,
+    /// Readiness and status endpoints. Off unless configured, and never on
+    /// the traffic listener — see [`Admin`].
+    #[serde(default)]
+    pub admin: Option<Admin>,
+    /// Distributed tracing. Correlation ids are always produced; this block
+    /// only decides whether spans are exported anywhere.
+    #[serde(default)]
+    pub tracing: Tracing,
     #[serde(default)]
     pub logging: Logging,
 }
@@ -648,6 +742,161 @@ pub struct Telemetry {
 #[serde(deny_unknown_fields)]
 pub struct Prometheus {
     pub listen: String,
+}
+
+/// The operator-facing listener: readiness, liveness and status.
+///
+/// It gets its own address rather than a path on the traffic listener for two
+/// reasons. A path would collide with the origin's URL space — `/status` is a
+/// perfectly ordinary application route — and it would publish the origin's
+/// backend states, cache occupancy and config generation to anyone who can
+/// reach the site. Bind it to a loopback or private address.
+///
+/// Nothing it serves is parameterised. There is no path, host, query or header
+/// a client can vary to change the response, which is the same rule the
+/// metrics labels follow: an operator surface must not be a way to make the
+/// process do unbounded work.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Admin {
+    pub listen: String,
+    /// Report not-ready while every upstream is failing its health check.
+    ///
+    /// Off by default, and the default is the careful one: Harmost still
+    /// serves a fully unhealthy pool (stale-if-error exists for that window),
+    /// so taking every replica out of rotation because the *origin* is down
+    /// converts a degraded origin into a total outage at the edge as well.
+    /// Turn it on when something upstream of Harmost can route around it.
+    #[serde(default)]
+    pub require_healthy_upstream: bool,
+}
+
+/// OpenTelemetry.
+///
+/// Request correlation — a trace id and span id on every request, in the
+/// access log, and forwarded to the origin as `traceparent` — is unconditional
+/// and costs nothing. This block is only about *export*: whether those spans
+/// are also shipped to a collector.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tracing {
+    /// `service.name` on every exported span.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// Where spans go. Absent means spans are still built and correlated, but
+    /// never leave the process.
+    #[serde(default)]
+    pub otlp: Option<Otlp>,
+    #[serde(default)]
+    pub sample: Sample,
+    /// Whose `traceparent` Harmost will join.
+    #[serde(default)]
+    pub trust_incoming: TrustIncoming,
+}
+
+/// OTLP over HTTP, JSON encoding.
+///
+/// JSON rather than protobuf, and a hand-written client rather than a gRPC
+/// stack: the OTLP/HTTP JSON encoding is specified, every collector accepts
+/// it, and the alternative is adding a transitive dependency tree larger than
+/// the rest of this binary to a process whose whole argument is that it is
+/// small enough to audit.
+///
+/// The endpoint must be `http://`. Refusing `https://` is deliberate: a
+/// hand-written exporter that quietly spoke cleartext to an endpoint written
+/// as `https` would be the silent downgrade this project rejects everywhere
+/// else. Run a collector as a local sidecar and let it do the transport.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Otlp {
+    /// Full URL of the traces endpoint, e.g.
+    /// `http://127.0.0.1:4318/v1/traces`.
+    pub endpoint: String,
+    /// Ceiling on one export attempt, connect to last byte.
+    #[serde(default = "d_5s")]
+    pub timeout: Dur,
+    /// Spans buffered between exports. Bounded, and full means *drop*: a
+    /// telemetry queue that grows under load is a memory-exhaustion bug that
+    /// only fires during the incident you wanted the traces for.
+    #[serde(default = "default_span_queue")]
+    pub max_queue: usize,
+    /// Spans per export request.
+    #[serde(default = "default_span_batch")]
+    pub max_batch: usize,
+    /// How often a partial batch is flushed.
+    #[serde(default = "d_2s")]
+    pub interval: Dur,
+}
+
+fn default_span_queue() -> usize {
+    2048
+}
+fn default_span_batch() -> usize {
+    256
+}
+fn d_2s() -> Dur {
+    Dur(std::time::Duration::from_secs(2))
+}
+
+/// Head sampling, as an integer ratio.
+///
+/// `one_in` rather than a fraction: `0.1` invites a float in a config file
+/// that has no other float in it, and "one request in ten" is what an operator
+/// actually says out loud.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sample {
+    #[serde(default)]
+    pub mode: SampleMode,
+    /// Sample one request in this many. Only read when `mode: ratio`.
+    #[serde(default = "one_usize")]
+    pub one_in: usize,
+}
+
+impl Default for Sample {
+    fn default() -> Self {
+        Sample {
+            mode: SampleMode::default(),
+            one_in: one_usize(),
+        }
+    }
+}
+
+fn one_usize() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleMode {
+    /// Follow the sampled flag on an inbound `traceparent` when there is one,
+    /// and fall back to `ratio` when there is not. The default, because a
+    /// trace that is sampled at the edge and unsampled here has a hole in it
+    /// exactly where the origin governor sits.
+    #[default]
+    ParentOrRatio,
+    /// Sample one request in `one_in`, ignoring what the caller decided.
+    Ratio,
+    /// Record everything.
+    Always,
+    /// Record nothing. Correlation ids are still produced and logged.
+    Never,
+}
+
+/// Whether an inbound `traceparent` is believed.
+///
+/// A trace id chosen by the client is not a security hole on its own, but it
+/// does let anyone on the internet write into your tracing backend under a
+/// trace of their choosing, and join their requests to someone else's trace.
+/// The default treats it exactly like `X-Forwarded-For`: believed from a
+/// trusted proxy, ignored from anyone else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustIncoming {
+    #[default]
+    FromTrustedProxies,
+    Always,
+    Never,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

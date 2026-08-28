@@ -69,8 +69,9 @@ impl Drop for Permit {
             // shrink record its debt. Queued requests can steal every permit
             // returned in that window and keep concurrency near the old
             // ceiling for another generation of work.
-            let _resize = self.limiter.resize_lock.lock();
-            if self.limiter.claim_debt() {
+            let mut debt = self.limiter.debt.lock();
+            if *debt > 0 {
+                *debt -= 1;
                 // Absorb this returned permit directly. Returning it to the
                 // semaphore first lets an already-queued waiter steal it.
                 permit.forget();
@@ -92,10 +93,9 @@ pub struct Limiter {
     limit: AtomicUsize,
     /// Permits a shrink still owes but could not take, because they were
     /// out with in-flight requests at the time.
-    debt: AtomicUsize,
-    /// Serialises ceiling changes with permit returns. The critical sections
-    /// contain no await and only semaphore/atomic operations.
-    resize_lock: Mutex<()>,
+    /// Also serialises ceiling changes with permit returns. The critical
+    /// sections contain no await and only semaphore/integer operations.
+    debt: Mutex<usize>,
     queue_depth: AtomicUsize,
     queue_max: AtomicUsize,
     /// Milliseconds, not a `Duration`, because it has to live in an atomic.
@@ -120,8 +120,7 @@ impl Limiter {
             name: name.into(),
             sem: Arc::new(Semaphore::new(limit)),
             limit: AtomicUsize::new(limit),
-            debt: AtomicUsize::new(0),
-            resize_lock: Mutex::new(()),
+            debt: Mutex::new(0),
             queue_depth: AtomicUsize::new(0),
             queue_max: AtomicUsize::new(queue_max),
             queue_timeout_ms: AtomicU64::new(millis(queue_timeout)),
@@ -153,7 +152,7 @@ impl Limiter {
     /// downward change has no interval in which returned permits can escape
     /// its debt accounting.
     pub fn resize(self: &Arc<Self>, new_limit: usize) {
-        let _resize = self.resize_lock.lock();
+        let mut debt = self.debt.lock();
         let old = self.limit.swap(new_limit, Ordering::SeqCst);
         if new_limit > old {
             // Growing also cancels any outstanding shrink.
@@ -161,13 +160,8 @@ impl Limiter {
             // One read-modify-write keeps the debt transition explicit. The
             // resize lock also prevents a return from observing a partial
             // grow while the matching permits are added.
-            let cancelled = self
-                .debt
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |debt| {
-                    Some(debt.saturating_sub(grant))
-                })
-                // The closure never returns `None`, so this never fails.
-                .map_or(0, |before| before.min(grant));
+            let cancelled = (*debt).min(grant);
+            *debt -= cancelled;
             let grant = grant - cancelled;
             if grant > 0 {
                 self.sem.add_permits(grant);
@@ -181,23 +175,21 @@ impl Limiter {
             if forgotten < owed {
                 // The rest are out with in-flight requests; collect them as
                 // they come back rather than over-admitting in the meantime.
-                self.debt.fetch_add(owed - forgotten, Ordering::SeqCst);
+                *debt += owed - forgotten;
             }
         }
-    }
-
-    fn claim_debt(&self) -> bool {
-        self.debt
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |debt| {
-                debt.checked_sub(1)
-            })
-            .is_ok()
     }
 
     pub fn set_queue(&self, max: usize, timeout: Duration) {
         self.queue_max.store(max, Ordering::Relaxed);
         self.queue_timeout_ms
             .store(millis(timeout), Ordering::Relaxed);
+    }
+
+    /// The configured queue bound. Zero means no queue at all: a request that
+    /// cannot be admitted immediately is shed.
+    pub fn queue_max(&self) -> usize {
+        self.queue_max.load(Ordering::Relaxed)
     }
 
     pub fn queue_timeout(&self) -> Duration {

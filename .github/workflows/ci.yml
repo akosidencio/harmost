@@ -63,6 +63,19 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc --locked
 
+      # The operator artifacts are shipped for people to import, so they have
+      # to at least parse. A dashboard that fails to import, or a rules file
+      # Prometheus refuses to load, is discovered by whoever needed it during
+      # an incident otherwise.
+      - name: Check the operator artifacts
+        run: |
+          python3 -c "import json; json.load(open('ops/grafana/dashboard.json'))"
+          python3 -c "import yaml; yaml.safe_load(open('ops/prometheus/alerts.yml'))"
+          curl -fsSL -o /tmp/prom.tar.gz \
+            https://github.com/prometheus/prometheus/releases/download/v2.53.2/prometheus-2.53.2.linux-amd64.tar.gz
+          tar -xzf /tmp/prom.tar.gz -C /tmp
+          /tmp/prometheus-2.53.2.linux-amd64/promtool check rules ops/prometheus/alerts.yml
+
   # A dependency advisory is a finding about code this binary runs at full
   # privilege, so it gates like any other. Ignores live in `.cargo/audit.toml`
   # and each one carries a reason and a way out.
@@ -109,8 +122,9 @@ jobs:
     name: end-to-end benchmarks (linux)
     runs-on: ubuntu-latest
     # Longer than the unit-test job: bench/tls.sh compiles a second binary with
-    # the TLS stack, and bench/adversarial.sh runs for a fixed wall-clock span.
-    timeout-minutes: 45
+    # the TLS stack, and adversarial.sh, soak.sh, upgrade.sh and chaos.sh each
+    # run for a fixed wall-clock span.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -155,6 +169,18 @@ jobs:
           SPOOL_MIB: "8"
           SPOOL_RATE: "24k"
           ADVERSARIAL_SECONDS: "20"
+          # Phase-2 operability scripts, at CI size. These are smoke-sized on
+          # purpose: they prove the mechanisms and the assertions still work.
+          # The numbers that actually gate a release are far larger and run
+          # before a tag — see docs/RELEASE-GATES.md. A one-minute soak cannot
+          # find a leak of a few kilobytes per thousand requests, and this
+          # workflow does not claim it can.
+          UPGRADE_SECONDS: "6"
+          SOAK_SECONDS: "45"
+          SOAK_WORKERS: "8"
+          MEMORY_ROUNDS: "6"
+          MEMORY_SLOW_READERS: "12"
+          CHAOS_ROUNDS: "2"
         run: ./bench/all.sh
 
       - name: Publish results with the parameters that produced them

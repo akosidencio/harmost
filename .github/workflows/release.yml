@@ -24,6 +24,133 @@ jobs:
   test:
     uses: ./.github/workflows/ci.yml
 
+  # Versioned release binaries.
+  #
+  # Built from the tagged tree with the toolchain pinned in
+  # rust-toolchain.toml and `--locked`, which together are what make the Linux
+  # artifacts reproducible from a clean checkout — see docs/BUILDING.md. The
+  # path-remapping rustflags in .cargo/config.toml are the third piece, and
+  # they live in the repository rather than here so that a local build produces
+  # the same bytes as this one.
+  binaries:
+    name: binary (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The reference platform, and the only one the reproducibility claim
+          # in docs/BUILDING.md covers.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            features: tls
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            features: tls
+          - target: x86_64-apple-darwin
+            os: macos-13
+            features: tls
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install build dependencies (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          # Not consumed by rustc directly; recorded so a rebuild has the same
+          # inputs available and so the value is visible in the build log.
+          SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
+        run: |
+          cargo build --release --locked --bin harmost \
+            --target ${{ matrix.target }} \
+            --features "${{ matrix.features }}"
+
+      # It has to actually run. A binary that builds and then dies on a missing
+      # shared library is a release nobody can use, discovered by users.
+      - name: Smoke test
+        run: |
+          bin="target/${{ matrix.target }}/release/harmost"
+          "$bin" version
+          "$bin" check --config harmost.yaml
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          name="harmost-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/harmost" "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          # The checksum of the *binary* as well as of the archive: gzip records
+          # a modification time, so an archive is not byte-reproducible while
+          # the binary inside it is. Verifying a rebuild means comparing the
+          # inner one. docs/BUILDING.md says so; this is what makes it possible.
+          ( cd "dist/$name" && shasum -a 256 harmost > "../$name.binary.sha256" )
+          ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  # A CycloneDX SBOM of the resolved dependency tree.
+  #
+  # Resolved, not linked: the lockfile contains crates belonging to optional
+  # features and other platforms that are never compiled into a given artifact.
+  # It over-reports rather than under-reports, which is the safe direction, and
+  # docs/BUILDING.md says so rather than letting the file be read as an exact
+  # inventory of what runs.
+  sbom:
+    name: sbom
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate
+        run: |
+          version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          # --all-features so the SBOM covers the TLS build too, which is what
+          # the published binaries and the image are compiled with.
+          cargo cyclonedx --format json --all-features --spec-version 1.5
+          find . -name '*.cdx.json' -not -path './target/*' -print
+          mkdir -p dist
+          cp harmost.cdx.json "dist/harmost-${version}.cdx.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/*.cdx.json
+          if-no-files-found: error
+
   image:
     name: build + push image
     needs: test
@@ -114,3 +241,78 @@ jobs:
             echo
             echo "Digest: \`${{ steps.push.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Attach everything to the GitHub release, with one SHA256SUMS covering every
+  # archive.
+  publish:
+    name: publish release artifacts
+    needs: [binaries, sbom, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      - name: Collect and checksum
+        id: collect
+        run: |
+          version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          mkdir -p dist
+          find staging -name '*.tar.gz' -exec cp {} dist/ \;
+          find staging -name '*.cdx.json' -exec cp {} dist/ \;
+          find staging -name '*.binary.sha256' -exec cp {} dist/ \;
+          ( cd dist && sha256sum ./*.tar.gz ./*.cdx.json | sed 's| \./| |' > SHA256SUMS )
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          ls -la dist
+          cat dist/SHA256SUMS
+
+      # A release with no archives in it is a green build and a broken
+      # download page, and nothing else in this workflow would have noticed.
+      - name: Refuse to publish an empty release
+        run: |
+          count=$(find dist -name '*.tar.gz' | wc -l)
+          echo "archives: $count"
+          [ "$count" -ge 1 ] || { echo "::error::no archives to publish"; exit 1; }
+          [ -s dist/SHA256SUMS ] || { echo "::error::SHA256SUMS is empty"; exit 1; }
+
+      - name: Upload to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.cdx.json
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          body: |
+            ## Verifying this release
+
+            ```bash
+            sha256sum --ignore-missing -c SHA256SUMS
+            ```
+
+            The container image carries build provenance and its own SBOM as
+            attestations:
+
+            ```bash
+            gh attestation verify \
+              "oci://ghcr.io/${{ github.repository }}:${{ steps.collect.outputs.version }}" \
+              --repo ${{ github.repository }}
+            ```
+
+            `harmost-${{ steps.collect.outputs.version }}.cdx.json` is a
+            CycloneDX SBOM of the resolved Rust dependency tree. It lists what
+            Cargo resolved, which is a superset of what is linked into any one
+            artifact.
+
+            Reproducing a Linux binary from this tag, and the limits of that
+            claim, are documented in
+            [docs/BUILDING.md](https://github.com/${{ github.repository }}/blob/${{ inputs.tag || github.ref_name }}/docs/BUILDING.md).

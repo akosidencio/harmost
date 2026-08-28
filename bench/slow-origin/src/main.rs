@@ -54,9 +54,23 @@ async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("slow-origin on 127.0.0.1:{port}, {render_ms}ms per render");
 
+    // Identifies *this* process, so that ids minted here cannot collide with
+    // ids minted by a second backend or by this one after a restart. The
+    // clock is in it because a pid is reused and the port is not unique
+    // across a run that restarts a backend on the same one.
+    let instance = format!(
+        "{port}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+
     loop {
         let (mut sock, _) = listener.accept().await?;
         let stats = stats.clone();
+        let instance = instance.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 8192];
             // One request per connection keeps the fixture honest and simple.
@@ -179,12 +193,19 @@ async fn main() -> std::io::Result<()> {
             // different one upstream would look correct in its own access log
             // and be wrong everywhere the origin uses the value.
             if path.starts_with("/echo-headers") {
+                // `traceparent` and `tracestate` are echoed for the same
+                // reason the forwarded headers are: what the origin *received*
+                // is the only trustworthy witness to what the proxy sent, and
+                // reading the proxy's own log would be asking the component
+                // under test to grade itself.
                 let body = format!(
-                    "{{\"x_forwarded_for\":\"{}\",\"x_forwarded_proto\":\"{}\",\"forwarded\":\"{}\",\"host\":\"{}\"}}",
+                    "{{\"x_forwarded_for\":\"{}\",\"x_forwarded_proto\":\"{}\",\"forwarded\":\"{}\",\"host\":\"{}\",\"traceparent\":\"{}\",\"tracestate\":\"{}\"}}",
                     header_value(&head, "x-forwarded-for").unwrap_or_default(),
                     header_value(&head, "x-forwarded-proto").unwrap_or_default(),
                     header_value(&head, "forwarded").unwrap_or_default(),
                     header_value(&head, "host").unwrap_or_default(),
+                    header_value(&head, "traceparent").unwrap_or_default(),
+                    header_value(&head, "tracestate").unwrap_or_default(),
                 );
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\n\
@@ -277,8 +298,16 @@ async fn main() -> std::io::Result<()> {
             // /private/* sets a session cookie. Nothing that does this may
             // ever be shared between requests, no matter what the route
             // configuration claims.
+            // The session id is unique across processes, not just within one.
+            //
+            // `user-{seq}` alone was a per-process counter, so two backends —
+            // or one backend restarted mid-test — mint the same ids and a
+            // benchmark counting distinct sessions reads a fixture collision
+            // as a shared response. Wrong in the dangerous direction: it can
+            // only ever manufacture a failure or, worse, mask a real one by
+            // making the count noisy enough to be given slack.
             let set_cookie = if path.starts_with("/private") {
-                format!("Set-Cookie: session=user-{seq}; Path=/\r\n")
+                format!("Set-Cookie: session=user-{instance}-{seq}; Path=/\r\n")
             } else {
                 String::new()
             };
@@ -288,11 +317,7 @@ async fn main() -> std::io::Result<()> {
             // large enough to exceed the socket buffers between origin and
             // client and actually block the downstream write.
             let body = if path.starts_with("/big") {
-                let mib: usize = path
-                    .rsplit('/')
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1);
+                let mib: usize = tail_number(&path).unwrap_or(1);
                 let filler = "x".repeat(mib * 1024 * 1024);
                 format!("<html><body>rendered {path}{filler}</body></html>")
             } else {
@@ -357,8 +382,20 @@ fn control_response(path: &str, stats: &Stats) -> Option<String> {
 // ---------------------------------------------------------------- protocols
 
 /// The trailing `/<number>` of a path, if there is one.
+/// The trailing path segment as a number, ignoring any query string.
+///
+/// The query has to be stripped here. Benchmarks vary the *cache key* with a
+/// query while keeping the path — and therefore the response size — fixed, so
+/// without this `/big/4?u=1` silently parses as "no number" and serves 1MiB
+/// instead of 4. The failure is a wrong-sized body, not an error, which is the
+/// worst way for a fixture to be wrong: the test still passes, against a
+/// workload it was not running.
 fn tail_number(path: &str) -> Option<usize> {
-    path.rsplit('/').next().and_then(|s| s.parse().ok())
+    path.split(['?', '#'])
+        .next()?
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
 }
 
 /// One request header's value, matched case-insensitively.

@@ -47,6 +47,8 @@ use crate::policy::PolicySnapshot;
 use crate::proxy::spool::{Spool, SpoolBudget, SpoolOutcome};
 use crate::telemetry::logging::AccessLog;
 use crate::telemetry::metrics;
+use crate::telemetry::otlp::{Attr, SpanKind, SpanRecord, SpanSink, unix_nanos};
+use crate::telemetry::trace::{RequestTrace, SpanId, TRACEPARENT, TRACESTATE, believe_inbound};
 use crate::upstream::UpstreamPool;
 
 /// Per-request state.
@@ -99,10 +101,23 @@ pub struct Ctx {
     pub spool: Option<Spool>,
     /// Recorded before the spool is dropped, for the access log.
     pub spool_outcome: Option<SpoolOutcome>,
+
+    /// Correlation for this request: trace id, this request's span, and the
+    /// child span the origin fetch runs under. Present on every request
+    /// whether or not anything is exporting spans — the ids are what join
+    /// Harmost's access log to the origin's own.
+    pub trace: RequestTrace,
+    /// Wall clock at request start, kept only so a span can carry a real
+    /// timestamp. `started` is a monotonic `Instant` and cannot be turned
+    /// into one after the fact.
+    pub wall_started: std::time::SystemTime,
+    /// The same, for the origin fetch span.
+    pub origin_wall_started: Option<std::time::SystemTime>,
 }
 
 impl Ctx {
     fn new(policy: Arc<PolicySnapshot>) -> Self {
+        let sample = policy.config.telemetry.tracing.sample.clone();
         Ctx {
             policy,
             started: Instant::now(),
@@ -129,6 +144,13 @@ impl Ctx {
             spool_enabled: false,
             spool: None,
             spool_outcome: None,
+            // Replaced in `early_request_filter` once the peer's trust status
+            // is known. Built here rather than left as an `Option` so that
+            // every path out of the proxy — including the ones that never
+            // reach a filter — still has a correlation id to log.
+            trace: RequestTrace::begin(None, None, &sample),
+            wall_started: std::time::SystemTime::now(),
+            origin_wall_started: None,
         }
     }
 }
@@ -152,6 +174,10 @@ pub struct Harmost {
     /// tunnel is held for minutes, a render for milliseconds, and letting the
     /// two share a budget means a handful of sockets can starve every page.
     upgrades: Arc<Limiter>,
+    /// Where finished spans go, when export is configured. `None` means spans
+    /// are never built — correlation ids still are, because they cost nothing
+    /// and the access log carries them regardless.
+    spans: Option<SpanSink>,
 }
 
 impl Harmost {
@@ -159,6 +185,7 @@ impl Harmost {
         policy: Arc<ArcSwap<PolicySnapshot>>,
         admission: Arc<AdmissionController>,
         upstreams: Arc<UpstreamPool>,
+        spans: Option<SpanSink>,
     ) -> std::result::Result<Self, String> {
         let initial = policy.load();
         // `Storage` takes `&'static self` throughout, so the store and the
@@ -190,7 +217,110 @@ impl Harmost {
             trust,
             spool_budget,
             upgrades,
+            spans,
         })
+    }
+
+    /// The response cache, for the admin status document. Shared, not copied:
+    /// occupancy read from a snapshot would be a number from startup.
+    pub fn store(&self) -> &'static BoundedStore {
+        self.store
+    }
+
+    /// The process-wide spool budget, for the same reason.
+    pub fn spool_budget(&self) -> Arc<SpoolBudget> {
+        self.spool_budget.clone()
+    }
+
+    /// The upgrade limiter, for the same reason.
+    pub fn upgrade_limiter(&self) -> Arc<Limiter> {
+        self.upgrades.clone()
+    }
+
+    /// Build and enqueue this request's spans.
+    ///
+    /// Two of them when the request reached an origin: the server span for
+    /// what Harmost did, and a client span for the origin fetch nested under
+    /// it. The nesting is what makes an origin-latency number attributable —
+    /// a single flat span cannot distinguish "the origin was slow" from "we
+    /// queued for two seconds before asking it".
+    ///
+    /// Enqueueing is `try_send` and nothing else. This runs on the request
+    /// path, so it must not block, allocate unboundedly, or fail in a way the
+    /// caller has to handle.
+    fn record_spans(
+        &self,
+        sink: &SpanSink,
+        session: &Session,
+        ctx: &Ctx,
+        access: &AccessLog<'_>,
+        status: u16,
+    ) {
+        let ended = std::time::SystemTime::now();
+        let route = access.route;
+        // Low cardinality by construction: a validated method and a route id
+        // from the config file. Never the path — that is an attribute, where
+        // an unbounded value costs storage rather than breaking grouping.
+        let name = format!("{} {route}", access.method);
+        let error = status >= 500 || ctx.shed;
+
+        if let (Some(origin_span), Some(origin_started)) =
+            (ctx.trace.origin_span_id, ctx.origin_wall_started)
+        {
+            let origin_ended = origin_started
+                .checked_add(std::time::Duration::from_millis(
+                    u64::try_from(access.origin_ms).unwrap_or(u64::MAX),
+                ))
+                .unwrap_or(ended);
+            sink.record(SpanRecord {
+                trace_id: ctx.trace.trace_id,
+                span_id: origin_span,
+                parent_span_id: Some(ctx.trace.span_id),
+                name: format!("{name} origin"),
+                kind: SpanKind::Client,
+                start_unix_nano: unix_nanos(origin_started),
+                end_unix_nano: unix_nanos(origin_ended),
+                error,
+                attributes: vec![
+                    Attr::str("http.request.method", access.method),
+                    Attr::str("server.address", access.upstream.unwrap_or("-")),
+                    Attr::str("harmost.route", route),
+                    Attr::int("http.response.status_code", i64::from(status)),
+                ],
+            });
+        }
+
+        sink.record(SpanRecord {
+            trace_id: ctx.trace.trace_id,
+            span_id: ctx.trace.span_id,
+            parent_span_id: ctx.trace.parent_span_id,
+            name,
+            kind: SpanKind::Server,
+            start_unix_nano: unix_nanos(ctx.wall_started),
+            end_unix_nano: unix_nanos(ended),
+            error,
+            attributes: vec![
+                Attr::str("http.request.method", access.method),
+                // Path, never the query string — the same rule the access log
+                // follows, and for the same reason: a query string routinely
+                // carries session tokens and signed URLs.
+                Attr::str("url.path", access.path),
+                Attr::str("url.scheme", access.scheme),
+                Attr::str("server.address", request_host(session.req_header())),
+                Attr::str("client.address", access.client),
+                Attr::int("http.response.status_code", i64::from(status)),
+                Attr::str("harmost.route", route),
+                Attr::str("harmost.class", access.class),
+                Attr::str("harmost.cache", access.cache),
+                Attr::bool("harmost.shed", ctx.shed),
+                Attr::str("harmost.permit_released", access.permit_released_at),
+                Attr::str("harmost.spool", access.spool),
+                Attr::int(
+                    "harmost.config_generation",
+                    i64::try_from(ctx.policy.generation).unwrap_or(i64::MAX),
+                ),
+            ],
+        });
     }
 
     /// Route limiter for this request, created on first use.
@@ -276,6 +406,20 @@ impl ProxyHttp for Harmost {
                 .map(|address| address.ip()),
             &session.req_header().headers,
             listener_scheme(session),
+        );
+
+        // An inbound `traceparent` is a claim, exactly like `X-Forwarded-For`,
+        // so it is gated on the same trust decision — which is why this runs
+        // *after* `trust.resolve` and not before. Believing an untrusted one
+        // would let anyone on the internet write into the tracing backend
+        // under a trace of their choosing.
+        let tracing = &ctx.policy.config.telemetry.tracing;
+        let believe = believe_inbound(tracing.trust_incoming, ctx.client.peer_trusted);
+        let headers = &session.req_header().headers;
+        ctx.trace = RequestTrace::begin(
+            believe.then(|| header_str(headers, TRACEPARENT)).flatten(),
+            believe.then(|| header_str(headers, TRACESTATE)).flatten(),
+            &tracing.sample,
         );
         Ok(())
     }
@@ -668,6 +812,13 @@ impl ProxyHttp for Harmost {
             .ok_or_else(|| Error::explain(ErrorType::InternalError, "no upstream configured"))?;
         ctx.upstream = Some(backend.address.clone());
         ctx.origin_started = Some(Instant::now());
+        ctx.origin_wall_started = Some(std::time::SystemTime::now());
+        // The origin fetch gets its own span id, minted here so that the
+        // `traceparent` sent upstream names *it* as the parent. Without this
+        // the origin's spans would sit beside Harmost's rather than under the
+        // fetch, and the origin latency Harmost measures would have nothing
+        // to hang off.
+        ctx.trace.origin_span_id = Some(SpanId::random());
         metrics::ORIGIN_REQUESTS
             .with_label_values(&[ctx.route_id.as_deref().unwrap_or("-"), &backend.address])
             .inc();
@@ -722,6 +873,23 @@ impl ProxyHttp for Harmost {
             }
         }
         upstream.insert_header("X-Forwarded-Proto", ctx.client.scheme)?;
+
+        // Propagate the context Harmost concluded, never the one that
+        // arrived. `insert_header` for the same reason as `X-Forwarded-For`:
+        // an appended second `traceparent` is ambiguous, and every runtime
+        // resolves the ambiguity differently.
+        //
+        // The value names the *origin fetch* span, so whatever the origin
+        // records nests under the fetch rather than beside it.
+        upstream.insert_header(TRACEPARENT, ctx.trace.outbound_traceparent())?;
+        match &ctx.trace.tracestate {
+            Some(state) => upstream.insert_header(TRACESTATE, state.as_str())?,
+            // Nothing believed, so nothing forwarded — and an inbound value
+            // that was ignored must not survive into the origin's view.
+            None => {
+                upstream.remove_header(TRACESTATE);
+            }
+        }
         // Same reasoning. Harmost does not emit RFC 7239 `Forwarded` itself,
         // so anything arriving under that name is a claim nobody vouched for.
         upstream.remove_header("Forwarded");
@@ -859,6 +1027,8 @@ impl ProxyHttp for Harmost {
             .client_ip
             .map(|address| address.to_string())
             .unwrap_or_else(|| "-".to_string());
+        let trace_id = ctx.trace.trace_id.to_hex();
+        let span_id = ctx.trace.span_id.to_hex();
         let access = AccessLog {
             method: session.req_header().method.as_str(),
             // Path only — the query string routinely carries tokens.
@@ -875,12 +1045,24 @@ impl ProxyHttp for Harmost {
             total_ms: ctx.started.elapsed().as_millis(),
             permit_released_at: ctx.permit_released_at.unwrap_or("-"),
             spool: ctx.spool_outcome.map(SpoolOutcome::as_str).unwrap_or("-"),
+            trace_id: &trace_id,
+            span_id: &span_id,
+            trace_continued: ctx.trace.continued,
+            generation: ctx.policy.generation,
         };
         let line = match ctx.policy.config.telemetry.logging.format {
             LogFormat::Json => access.to_json(),
             LogFormat::Text => access.to_text(),
         };
         log::info!("{line}");
+
+        // Spans are built only when someone is listening and the trace was
+        // sampled. Everything above happens on every request; this is the one
+        // part that is allowed to be conditional, because it is the one part
+        // that costs allocation.
+        if let Some(sink) = self.spans.as_ref().filter(|_| ctx.trace.sampled) {
+            self.record_spans(sink, session, ctx, &access, status);
+        }
 
         // Normally already released at upstream end-of-stream; this covers
         // the paths that never got there (shed, cache hit, upstream error,
@@ -927,6 +1109,20 @@ impl ProxyHttp for Harmost {
                 .set(l.queue_depth() as i64);
         }
     }
+}
+
+/// A header value as text, or `None`.
+///
+/// `HeaderValue::to_str` refuses obs-text (`0x80..=0xff`) that `HeaderValue`
+/// itself accepts, and elsewhere in this crate dropping the value on that
+/// failure was a real bug — a single non-ASCII byte hid an entire `Cookie`
+/// header. It is the correct behaviour *here* and nowhere else: the only
+/// callers are `traceparent` and `tracestate`, both of which are specified as
+/// printable ASCII, so a value that is not readable as UTF-8 is a value that
+/// could never have parsed. Treating it as absent starts a fresh trace, which
+/// is the same thing a malformed value does.
+fn header_str<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
 }
 
 /// The authority this request names, over either protocol version.

@@ -74,10 +74,24 @@ impl UpstreamPool {
         }
     }
 
-    fn is_healthy(&self, id: usize) -> bool {
+    /// Is this backend currently passing its health check?
+    ///
+    /// Public because the admin status document publishes per-backend state,
+    /// which is the first thing anyone asks during an origin incident.
+    pub fn is_healthy(&self, id: usize) -> bool {
         self.healthy
             .get(id)
             .is_some_and(|h| h.load(Ordering::Relaxed))
+    }
+
+    /// How many backends are passing. Zero does not stop Harmost serving —
+    /// see `select` — but it is what an operator wants readiness to be able
+    /// to report.
+    pub fn healthy_count(&self) -> usize {
+        self.backends
+            .iter()
+            .filter(|b| self.is_healthy(b.id))
+            .count()
     }
 
     /// Pick a backend for this path.
