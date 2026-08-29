@@ -45,21 +45,13 @@ classification, cache-key and shareability rules, and bounded origin admission.
 
 ## Project maturity and expectations
 
-**Harmost has not been run in production, by anyone, ever.** It has no
-production users and no third-party security review. There is now a
-[threat model](./docs/THREAT-MODEL.md) and a
-[twenty-second adversarial suite](./bench/adversarial.sh) in CI, which is a
-smoke test rather than a campaign — and the threat model is the author's own
-analysis, which is exactly the thing a threat model is least able to check about
-itself.
-
-There is also now a [soak](./bench/soak.sh), a
-[memory-pressure test](./bench/memory.sh), a [restart test](./bench/upgrade.sh)
-and a [chaos test](./bench/chaos.sh), all of which assert rather than report.
-They are synthetic load against a local fixture origin. They can find a leak, a
-permit that is never returned, a budget that is not a budget and a restart that
-drops requests — and they have found several. They cannot tell you how this
-behaves against real traffic on a real network, and no amount of them will.
+** Treat it as a working prototype with a serious test suite: there is a
+[threat model](./docs/THREAT-MODEL.md), an
+[adversarial suite](./bench/adversarial.sh) in CI, and a
+[soak](./bench/soak.sh), [memory-pressure](./bench/memory.sh),
+[restart](./bench/upgrade.sh) and [chaos](./bench/chaos.sh) test that assert
+rather than report — and have found real bugs. All of it is synthetic load
+against a local fixture origin.
 
 Reference documentation:
 
@@ -74,14 +66,8 @@ Reference documentation:
 | [`CHANGELOG.md`](./CHANGELOG.md) | What changed in each release, and what to do when upgrading |
 
 Everything described below as a benefit is a **design goal supported by local
-tests**, not an outcome observed under real traffic. The focused benchmarks use
-a deterministic origin that `sleep`s instead of rendering; a separate Docker
-scenario runs one Harmost process against three real Next.js standalone
-origins. Together they demonstrate the mechanisms and framework protocol
-handling, but they do not predict production traffic, networks or attackers.
-
-Treat it as a working prototype with a serious test suite. If you deploy it, do
-so behind something you can fail back to, and read
+tests**, not an outcome observed under real traffic. If you deploy it, do so
+behind something you can fail back to, and read
 [Slow readers and render capacity](#slow-readers-and-render-capacity) and
 [Roadmap](#roadmap) for the parts that are known to be incomplete.
 
@@ -223,7 +209,7 @@ is what makes running fewer pods a considered decision rather than a gamble.
 The cost side deserves the same scrutiny. Harmost is another process in your
 request path, another configuration to maintain and another failure mode to
 understand, and today it is
-[unproven software](#project-maturity-and-expectations). For a small
+unproven software. For a small
 deployment, adding a pod or putting a CDN in front is sometimes simply the
 better trade.
 
@@ -479,8 +465,7 @@ origins, and makes machine-checked assertions across their combined traffic.
 behaviours a curl-written request cannot reach are the ones Next's own client
 constructs: a router prefetch carrying a real `Next-Router-State-Tree`, and a
 Server Action POST carrying an action id the build assigned. Neither setup
-predicts behaviour under real traffic — see
-[Project maturity](#project-maturity-and-expectations).
+predicts behaviour under real traffic.
 
 ## Installation
 
