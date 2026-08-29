@@ -45,6 +45,10 @@ jobs:
     env:
       TARGET: x86_64-unknown-linux-gnu
       FEATURES: tls
+    # Published so `publish` can ask for this artifact by exact name rather
+    # than downloading whatever else the run happens to contain.
+    outputs:
+      artifact: ${{ steps.package.outputs.name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -243,9 +247,24 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: actions/download-artifact@v4
+      # By exact name, both of them. Downloading the whole run instead pulls in
+      # artifacts this job has no use for: `benchmark-results` from the CI
+      # workflow above, and the `.dockerbuild` build record that
+      # docker/build-push-action uploads on its own. The build record is the
+      # one that failed to extract after five retries and took the release
+      # down with it — a record of how the image was built has no place in a
+      # step whose job is to attach archives to a tag.
+      - name: Download the release binary
+        uses: actions/download-artifact@v4
         with:
-          path: staging
+          name: ${{ needs.binaries.outputs.artifact }}
+          path: staging/binary
+
+      - name: Download the SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: staging/sbom
 
       - name: Collect and checksum
         id: collect
