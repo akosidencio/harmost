@@ -28,8 +28,8 @@ jobs:
   #
   # Built from the tagged tree with the toolchain pinned in
   # rust-toolchain.toml and `--locked`, which together are what make the Linux
-  # artifacts reproducible from a clean checkout — see docs/BUILDING.md. The
-  # scripts/reproducible-build.sh derives and remaps the actual checkout and
+  # artifacts reproducible from a clean checkout. scripts/reproducible-build.sh
+  # derives and remaps the actual checkout and
   # Cargo-cache paths, so a local checkout in a different directory can produce
   # the same bytes as CI.
   binaries:
@@ -42,8 +42,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The reference platform, and the only one the reproducibility claim
-          # in docs/BUILDING.md covers.
+          # The reference platform, and the only one the reproducibility
+          # claim covers.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             features: tls
@@ -98,7 +98,7 @@ jobs:
           # The checksum of the *binary* as well as of the archive: gzip records
           # a modification time, so an archive is not byte-reproducible while
           # the binary inside it is. Verifying a rebuild means comparing the
-          # inner one. docs/BUILDING.md says so; this is what makes it possible.
+          # inner one; this is what makes that possible.
           ( cd "dist/$name" && shasum -a 256 harmost > "../$name.binary.sha256" )
           ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -117,8 +117,7 @@ jobs:
   # Resolved, not linked: the lockfile contains crates belonging to optional
   # features and other platforms that are never compiled into a given artifact.
   # It over-reports rather than under-reports, which is the safe direction, and
-  # docs/BUILDING.md says so rather than letting the file be read as an exact
-  # inventory of what runs.
+  # must not be read as an exact inventory of what runs.
   sbom:
     name: sbom
     needs: test
@@ -309,6 +308,7 @@ jobs:
             Cargo resolved, which is a superset of what is linked into any one
             artifact.
 
-            Reproducing a Linux binary from this tag, and the limits of that
-            claim, are documented in
-            [docs/BUILDING.md](https://github.com/${{ github.repository }}/blob/${{ inputs.tag || github.ref_name }}/docs/BUILDING.md).
+            A Linux binary reproduces from a clean checkout of this tag with
+            [scripts/reproducible-build.sh](https://github.com/${{ github.repository }}/blob/${{ inputs.tag || github.ref_name }}/scripts/reproducible-build.sh).
+            The `.tar.gz` archives, the image digest and the macOS builds are
+            not reproducible.

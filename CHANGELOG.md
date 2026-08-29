@@ -103,7 +103,6 @@ as a service.
   provenance and its own SBOM attached as attestations.
 - **Documentation:** [`docs/OPERATIONS.md`](./docs/OPERATIONS.md),
   [`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md),
-  [`docs/BUILDING.md`](./docs/BUILDING.md),
   [`docs/RELEASE-GATES.md`](./docs/RELEASE-GATES.md),
   [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md),
   [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md), and example
@@ -221,9 +220,8 @@ as a service.
 - **No release has actually been cut.** The workflow, checksums, SBOM and
   reproducible-build instructions are written and their steps individually
   exercised, but nobody — including the author — has downloaded a published
-  artifact and reproduced it. Until then, treat
-  [`docs/BUILDING.md`](./docs/BUILDING.md) as a specification rather than a
-  report.
+  artifact and reproduced it. Until then, treat the reproducible-build
+  workflow as a specification rather than a report.
 - **The independent review of cache-key construction and response
   shareability is still not obtained.** It is not something the author can
   complete alone; [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) is

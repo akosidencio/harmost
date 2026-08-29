@@ -75,10 +75,22 @@ bench_cleanup() {
 # — `tls` today. It is a parameter rather than a default because the TLS stack
 # is a two-minute compile that every other benchmark would pay for.
 bench_build() {
-  local flags=()
-  if [ "${BENCH_PROFILE:-debug}" = "release" ]; then flags+=(--release); fi
-  if [ -n "${BENCH_FEATURES:-}" ]; then flags+=(--features "$BENCH_FEATURES"); fi
-  cargo build --workspace "${flags[@]}" -q || bench_fail "workspace build failed"
+  # Bash 3.2 (still shipped by macOS) treats expansion of an empty local array
+  # as an unbound variable under `set -u`. Keep the no-option path scalar so
+  # the same benchmark harness works on both macOS and Linux.
+  if [ "${BENCH_PROFILE:-debug}" = "release" ]; then
+    if [ -n "${BENCH_FEATURES:-}" ]; then
+      cargo build --workspace --release --features "$BENCH_FEATURES" -q \
+        || bench_fail "workspace build failed"
+    else
+      cargo build --workspace --release -q || bench_fail "workspace build failed"
+    fi
+  elif [ -n "${BENCH_FEATURES:-}" ]; then
+    cargo build --workspace --features "$BENCH_FEATURES" -q \
+      || bench_fail "workspace build failed"
+  else
+    cargo build --workspace -q || bench_fail "workspace build failed"
+  fi
 }
 
 bench_bin() {

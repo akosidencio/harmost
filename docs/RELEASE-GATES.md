@@ -106,8 +106,8 @@ is exactly the untrustworthy evidence this project spent a phase removing.
 - The CycloneDX SBOM is attached.
 - The image's provenance attestation verifies:
   `gh attestation verify "oci://ghcr.io/OWNER/harmost:<version>" --repo OWNER/harmost`
-- A Linux release binary reproduces from a clean checkout of the tag — see
-  [BUILDING.md](./BUILDING.md).
+- A Linux release binary reproduces from a clean checkout of the tag —
+  [`scripts/reproducible-build.sh`](../scripts/reproducible-build.sh).
 
 ### 6. Documentation honesty
 

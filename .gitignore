@@ -33,5 +33,4 @@ docs/*
 !docs/CACHE-KEY-REVIEW.md
 !docs/OPERATIONS.md
 !docs/CONFIG-SCHEMA.md
-!docs/BUILDING.md
 !docs/RELEASE-GATES.md
