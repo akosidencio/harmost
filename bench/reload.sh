@@ -65,8 +65,7 @@ signal_and_wait() { # pattern
   local before
   before=$(wc -l < "$(bench_log harmost)")
   kill -HUP "$PID"
-  local attempt
-  for attempt in $(seq 1 100); do
+  for _ in $(seq 1 100); do
     if tail -n "+$((before + 1))" "$(bench_log harmost)" | grep -q "$1"; then return 0; fi
     sleep 0.1
   done

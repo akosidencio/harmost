@@ -207,18 +207,19 @@ groups:
 
   - name: harmost-configuration
     rules:
-      # Replicas of one deployment should agree on their configuration. They
-      # do not when a reload was refused on some of them, which is a silent
-      # partial rollout.
-      - alert: HarmostConfigGenerationDiverged
-        expr: count by (job) (count by (job, harmost_config_generation) (harmost_config_generation)) > 1
+      # Replicas of one deployment should agree on their effective
+      # configuration. Generation is only a per-process reload counter, so
+      # fleet comparison uses the stable fingerprint instead.
+      - alert: HarmostConfigDiverged
+        expr: count by (job) (count_values by (job) ("fingerprint", harmost_config_fingerprint)) > 1
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Harmost replicas in {{ $labels.job }} are running different configurations"
           description: >-
-            An invalid config is refused and the running one kept, so a reload
-            that failed on some replicas leaves them behind without failing
-            anything. Check each instance's logs for "reload refused"; the
-            message names the reason.
+            The stable effective-config fingerprints differ. An invalid config
+            is refused and the running one kept, so a reload that failed on
+            some replicas can leave them behind without stopping traffic.
+            Check each instance's logs for "reload refused"; the message names
+            the reason.

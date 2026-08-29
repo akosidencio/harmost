@@ -1,5 +1,11 @@
 .git
 target
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+bench/browser/node_modules
 fixtures/next-storefront/.next
 fixtures/next-storefront/node_modules
+fixtures/next-storefront/*.tsbuildinfo
+.DS_Store
 *.local.yaml

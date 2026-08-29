@@ -15,10 +15,11 @@
 //!
 //! Anyone can send one, and believing it means anyone on the internet can
 //! write into your tracing backend under a trace id of their choosing, or
-//! attach their requests to someone else's trace. It is treated exactly like
-//! `X-Forwarded-For`: believed from a trusted proxy, ignored from anyone else,
-//! and the default is to trust nobody because
-//! [`crate::config::schema::TrustedProxies`] starts empty.
+//! attach their requests to someone else's trace. The default is to ignore it.
+//! Unlike `X-Forwarded-For`, trace context has no hop chain Harmost can inspect
+//! to distinguish a header a trusted proxy created from one it merely passed
+//! through. `from_trusted_proxies` is therefore safe only when every trusted
+//! proxy strips or replaces client-supplied trace headers.
 //!
 //! Note what that does *not* break. When an inbound context is ignored,
 //! Harmost still traces the request — it simply starts a new trace rather than

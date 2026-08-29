@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared harness for the bench/ scripts. Source it, never execute it.
 #
 # The scripts in this directory are the evidence behind the claims in the
@@ -74,10 +75,10 @@ bench_cleanup() {
 # — `tls` today. It is a parameter rather than a default because the TLS stack
 # is a two-minute compile that every other benchmark would pay for.
 bench_build() {
-  local flags=""
-  if [ "${BENCH_PROFILE:-debug}" = "release" ]; then flags="--release"; fi
-  if [ -n "${BENCH_FEATURES:-}" ]; then flags="$flags --features $BENCH_FEATURES"; fi
-  cargo build --workspace $flags -q || bench_fail "workspace build failed"
+  local flags=()
+  if [ "${BENCH_PROFILE:-debug}" = "release" ]; then flags+=(--release); fi
+  if [ -n "${BENCH_FEATURES:-}" ]; then flags+=(--features "$BENCH_FEATURES"); fi
+  cargo build --workspace "${flags[@]}" -q || bench_fail "workspace build failed"
 }
 
 bench_bin() {
@@ -100,9 +101,9 @@ bench_port_open() {
 # subshell whose variable assignments are discarded — so a variable would hand
 # out the same port twice.
 bench_free_port() {
-  local port attempt ledger="$BENCH_DIR/ports"
+  local port ledger="$BENCH_DIR/ports"
   touch "$ledger"
-  for attempt in $(seq 1 200); do
+  for _ in $(seq 1 200); do
     port=$(( 20000 + RANDOM % 20000 ))
     grep -qx "$port" "$ledger" && continue
     if ! bench_port_open 127.0.0.1 "$port"; then
@@ -141,11 +142,11 @@ bench_alive() {
 
 # Stop one named process politely, then insist.
 bench_stop() {
-  local pid attempt
+  local pid
   pid=$(bench_pid "$1")
   [ -n "$pid" ] || return 0
   kill -TERM "$pid" 2>/dev/null || true
-  for attempt in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     bench_alive "$pid" || { rm -f "$BENCH_DIR/pids/$1"; return 0; }
     sleep 0.1
   done
@@ -166,8 +167,8 @@ bench_stop_all() {
 # --------------------------------------------------------------- readiness
 
 bench_wait_port() {
-  local host=$1 port=$2 label=${3:-"$1:$2"} attempt
-  for attempt in $(seq 1 300); do
+  local host=$1 port=$2 label=${3:-"$1:$2"}
+  for _ in $(seq 1 300); do
     bench_port_open "$host" "$port" && return 0
     sleep 0.1
   done
@@ -175,8 +176,8 @@ bench_wait_port() {
 }
 
 bench_wait_http() {
-  local url=$1 label=${2:-$1} attempt
-  for attempt in $(seq 1 300); do
+  local url=$1 label=${2:-$1}
+  for _ in $(seq 1 300); do
     if curl -fsS -o /dev/null --max-time 2 "$url" 2>/dev/null; then return 0; fi
     sleep 0.1
   done
@@ -187,8 +188,8 @@ bench_wait_http() {
 # observable event is a log line rather than a socket — a config reload, for
 # example, has no port of its own to poll.
 bench_wait_log() {
-  local name=$1 pattern=$2 attempt
-  for attempt in $(seq 1 100); do
+  local name=$1 pattern=$2
+  for _ in $(seq 1 100); do
     grep -q "$pattern" "$(bench_log "$name")" 2>/dev/null && return 0
     sleep 0.1
   done

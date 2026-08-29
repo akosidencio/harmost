@@ -44,8 +44,7 @@ metric_sum() {
 }
 
 wait_until_ready() {
-  local attempt
-  for attempt in $(seq 1 90); do
+  for _ in $(seq 1 90); do
     if curl -fsS -o /dev/null "$PROXY_URL/healthz" \
       && curl -fsS -o /dev/null "$METRICS_URL/metrics"; then
       return 0

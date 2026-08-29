@@ -244,6 +244,17 @@ pub static CONFIG_GENERATION: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("metric registration")
 });
 
+/// Stable fingerprint of the effective configuration. Unlike generation, this
+/// is comparable across replicas that have restarted or reloaded a different
+/// number of times.
+pub static CONFIG_FINGERPRINT: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_config_fingerprint",
+        "Stable fingerprint of the effective configuration currently in force"
+    )
+    .expect("metric registration")
+});
+
 /// 1 per healthy upstream, 0 per unhealthy one. Labelled by the configured
 /// address, which is config-derived like every other label in this file.
 pub static UPSTREAM_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -280,6 +291,7 @@ pub fn preregister() {
     LazyLock::force(&SPANS);
     LazyLock::force(&DRAINING);
     LazyLock::force(&CONFIG_GENERATION);
+    LazyLock::force(&CONFIG_FINGERPRINT);
     LazyLock::force(&UPSTREAM_HEALTHY);
 }
 

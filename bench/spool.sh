@@ -64,8 +64,8 @@ scenario() { # spool(true|false), max_body, label
   # Wait until the *origin* says it has finished both renders. This is the
   # witness the whole benchmark turns on, and it is the origin's own counter
   # rather than anything the proxy reports about itself.
-  local attempt in_flight total
-  for attempt in $(seq 1 200); do
+  local in_flight total
+  for _ in $(seq 1 200); do
     total=$(bench_origin_stat "$ORIGIN_PORT" total)
     in_flight=$(bench_origin_stat "$ORIGIN_PORT" in_flight)
     if [ "${total:-0}" -ge 2 ] && [ "${in_flight:-9}" -eq 0 ]; then break; fi

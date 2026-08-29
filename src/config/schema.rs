@@ -98,12 +98,11 @@ impl Default for Server {
 /// # `shutdown_timeout` is a floor, not a ceiling
 ///
 /// This is the surprising one, and it is measured rather than assumed — see
-/// `bench/upgrade.sh`. Pingora ends a shutdown with `Runtime::shutdown_timeout`
-/// on each service's runtime, and its listener tasks are parked in `accept`
-/// rather than watching for the signal, so the wait runs to completion whether
-/// or not anything is still in flight. **A `SIGTERM` therefore takes about
-/// `drain_period + shutdown_timeout` every time, even on a completely idle
-/// process.**
+/// `bench/upgrade.sh`. After asking each runtime to shut down, Pingora
+/// deliberately sleeps for `shutdown_timeout`, so the wait runs to completion
+/// whether or not anything is still in flight. **A `SIGTERM` therefore takes
+/// about `drain_period + shutdown_timeout` every time, even on a completely
+/// idle process.**
 ///
 /// Two things follow, and both are ways deployments actually break:
 ///
@@ -117,8 +116,9 @@ impl Default for Server {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Graceful {
-    /// Written when the process starts. `harmost run --upgrade` and every
-    /// `kill -QUIT $(cat …)` in the documentation read it.
+    /// Written by Pingora when `harmost run --daemon` starts. Foreground
+    /// supervisors and containers should signal their tracked main process
+    /// instead; Pingora does not create a pid file in foreground mode.
     #[serde(default = "default_pid_file")]
     pub pid_file: String,
     /// Unix socket the old and new processes use to pass listening fds.
@@ -130,6 +130,7 @@ pub struct Graceful {
     #[serde(default = "d_5s")]
     pub drain_period: Dur,
     /// How long in-flight requests get once the shutdown proper begins.
+    /// Pingora accepts whole seconds, so Harmost rounds upward.
     ///
     /// Ten seconds rather than thirty: see the note above on this being a
     /// floor. A thirty-second value makes every ordinary restart take
@@ -888,14 +889,16 @@ pub enum SampleMode {
 /// A trace id chosen by the client is not a security hole on its own, but it
 /// does let anyone on the internet write into your tracing backend under a
 /// trace of their choosing, and join their requests to someone else's trace.
-/// The default treats it exactly like `X-Forwarded-For`: believed from a
-/// trusted proxy, ignored from anyone else.
+/// The default is `never`. Unlike `X-Forwarded-For`, a trace context has no hop
+/// chain Harmost can walk to distinguish a value created by a trusted edge from
+/// one the edge merely forwarded from an internet client. Opting into proxy
+/// trust is safe only when that proxy strips or replaces inbound trace headers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustIncoming {
-    #[default]
     FromTrustedProxies,
     Always,
+    #[default]
     Never,
 }
 

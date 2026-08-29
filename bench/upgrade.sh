@@ -72,8 +72,8 @@ count_all() { wc -l < "$1" | tr -d ' '; }
 
 admin_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$ADMIN_PORT$1"; }
 wait_for_ready() { # expected code
-  local attempt code
-  for attempt in $(seq 1 150); do
+  local code
+  for _ in $(seq 1 150); do
     code=$(admin_code /health/ready)
     [ "$code" = "$1" ] && { printf '%s' "$code"; return 0; }
     sleep 0.1
@@ -114,6 +114,42 @@ echo "old process pid $OLD_PID on $LISTEN_PORT, admin on $ADMIN_PORT"
 READY=$(wait_for_ready 200)
 bench_assert_eq "$READY" 200 "readiness before anything happens"
 
+# A bare SIGTERM must create an observable drain window before Pingora closes
+# its listeners. This is separate from the explicit SIGUSR1 pre-stop path:
+# without this assertion a normal `docker stop`, systemd stop, or Kubernetes
+# termination can regress to readiness disappearing at the exact instant that
+# traffic disappears.
+echo
+echo "automatic drain on SIGTERM"
+kill -TERM "$OLD_PID"
+READY=$(wait_for_ready 503)
+echo "  readiness while alive $READY"
+bench_assert_eq "$READY" 503 "plain SIGTERM must advertise not-ready before listeners close"
+bench_alive "$OLD_PID" || bench_fail "plain SIGTERM skipped the observable drain window"
+
+AUTO_OK=0
+for _ in $(seq 1 10); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    -H 'Connection: close' "http://127.0.0.1:$LISTEN_PORT/render")" = "200" ] \
+    && AUTO_OK=$((AUTO_OK + 1))
+done
+echo "  requests still served $AUTO_OK/10"
+bench_result sigterm_drain_succeeded "$AUTO_OK"
+bench_assert_eq "$AUTO_OK" 10 "requests served during the automatic SIGTERM drain window"
+
+AUTO_EXITED=0
+for _ in $(seq 1 150); do
+  bench_alive "$OLD_PID" || { AUTO_EXITED=1; break; }
+  sleep 0.1
+done
+bench_assert_eq "$AUTO_EXITED" 1 "the automatic-drain process exited after SIGTERM"
+
+# Start a fresh old process for the platform-specific restart scenario below.
+bench_start_harmost old "$CONFIG" "$LISTEN_PORT" "$ADMIN_PORT"
+OLD_PID=$(bench_pid old)
+READY=$(wait_for_ready 200)
+bench_assert_eq "$READY" 200 "readiness after the automatic-drain regression check"
+
 if [ "$MODE" = "handover" ]; then
   # --------------------------------------------------------- socket handover
   #
@@ -136,7 +172,7 @@ if [ "$MODE" = "handover" ]; then
   kill -QUIT "$OLD_PID"
 
   DRAINED=0
-  for attempt in $(seq 1 400); do
+  for _ in $(seq 1 400); do
     bench_alive "$OLD_PID" || { DRAINED=1; break; }
     sleep 0.1
   done
@@ -190,7 +226,7 @@ else
   STOPPED_AT=$(date +%s)
   kill -TERM "$OLD_PID"
   DRAINED=0
-  for attempt in $(seq 1 400); do
+  for _ in $(seq 1 400); do
     bench_alive "$OLD_PID" || { DRAINED=1; break; }
     sleep 0.1
   done
@@ -198,15 +234,11 @@ else
   echo "  old process exited     $([ $DRAINED = 1 ] && echo "yes after ${GAP}s" || echo 'NO')"
   bench_result shutdown_seconds "$GAP"
   bench_assert_eq "$DRAINED" 1 "the old process exited on SIGTERM"
-  # `shutdown_timeout` is a floor, not a ceiling: Pingora ends a shutdown with
-  # `Runtime::shutdown_timeout`, and its listener tasks are parked in `accept`
-  # rather than watching the signal, so the wait runs to completion even on an
-  # idle process. This config is 1s drain + 3s shutdown, so ~4s is expected
-  # with nothing in flight — and the floor is asserted from *below* as well,
-  # because an exit that were suddenly instant would mean in-flight requests
-  # had stopped getting their window.
-  echo "  (expected ~4s: 1s drain + 3s shutdown, which is spent whether or not"
-  echo "   anything is in flight — see docs/OPERATIONS.md)"
+  # SIGUSR1 began more than one drain period ago, so SIGTERM does not pay that
+  # window twice. Pingora's shutdown timeout still runs to completion on an
+  # idle process; this config therefore takes about three seconds here.
+  echo "  (expected ~3s: the SIGUSR1 drain window already elapsed, leaving only"
+  echo "   Pingora's 3s shutdown timeout — see docs/OPERATIONS.md)"
   bench_assert_le "$GAP" 12 "seconds from SIGTERM to exit"
   bench_assert_gt "$GAP" 2 "seconds from SIGTERM to exit (in-flight requests got no window)"
 

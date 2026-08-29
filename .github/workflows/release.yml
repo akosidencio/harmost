@@ -29,9 +29,9 @@ jobs:
   # Built from the tagged tree with the toolchain pinned in
   # rust-toolchain.toml and `--locked`, which together are what make the Linux
   # artifacts reproducible from a clean checkout — see docs/BUILDING.md. The
-  # path-remapping rustflags in .cargo/config.toml are the third piece, and
-  # they live in the repository rather than here so that a local build produces
-  # the same bytes as this one.
+  # scripts/reproducible-build.sh derives and remaps the actual checkout and
+  # Cargo-cache paths, so a local checkout in a different directory can produce
+  # the same bytes as CI.
   binaries:
     name: binary (${{ matrix.target }})
     needs: test
@@ -72,12 +72,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        env:
-          # Not consumed by rustc directly; recorded so a rebuild has the same
-          # inputs available and so the value is visible in the build log.
-          SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
         run: |
-          cargo build --release --locked --bin harmost \
+          ./scripts/reproducible-build.sh \
             --target ${{ matrix.target }} \
             --features "${{ matrix.features }}"
 
@@ -284,7 +280,7 @@ jobs:
           [ -s dist/SHA256SUMS ] || { echo "::error::SHA256SUMS is empty"; exit 1; }
 
       - name: Upload to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |

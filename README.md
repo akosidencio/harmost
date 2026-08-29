@@ -72,6 +72,7 @@ Reference documentation:
 | [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) | What is protected, from whom, and what is not defended |
 | [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) | A brief for the independent review that has not yet happened |
 | [`ops/`](./ops) | Example Prometheus alerts and a Grafana dashboard |
+| [`CHANGELOG.md`](./CHANGELOG.md) | What changed in each release, and what to do when upgrading |
 
 Everything described below as a benefit is a **design goal supported by local
 tests**, not an outcome observed under real traffic. The focused benchmarks use
@@ -528,10 +529,10 @@ The binary lands at `target/release/harmost`.
 `harmost check` exits non-zero on an invalid or unsafe configuration, so it
 works as a CI gate on a config change.
 
-Signals: `SIGHUP` reloads reloadable policy in place and `SIGTERM` asks Pingora
-for a graceful shutdown. Harmost does not yet expose Pingora's complete
-zero-downtime upgrade workflow, so do not treat `SIGQUIT` alone as an upgrade
-procedure.
+Signals: `SIGHUP` reloads reloadable policy in place; `SIGUSR1` enters drain
+without exiting; and `SIGTERM` automatically advertises not-ready for the
+configured drain window before Pingora stops its listeners. On Linux,
+`--upgrade` plus `SIGQUIT` performs Pingora's socket-handover workflow.
 
 **Listeners are cleartext unless you build with `--features tls` and configure
 `server.tls`.** A binary built without the feature *rejects* a config containing
@@ -1068,8 +1069,8 @@ Use `SSL_CERT_FILE` / `SSL_CERT_DIR`, which the platform store does honour.
   mtime), the image digest, and the macOS builds.
 - **Readiness and status endpoints.** `telemetry.admin` serves
   `/health/live`, `/health/ready` and `/status` on a listener of their own,
-  reporting configuration generation, per-backend health, cache and spool
-  occupancy, admission limits and drain state. Nothing on that surface is
+  reporting configuration generation and a stable fingerprint, per-backend
+  health, cache and spool occupancy, admission limits and drain state. Nothing on that surface is
   parameterised: there is no path, query or header a client can vary to change
   what is computed, which is the same rule the metrics labels follow. Startup
   refuses to share the address with the traffic or metrics listener.
@@ -1117,9 +1118,9 @@ dropped requests on a platform that cannot deliver it.
 Three non-obvious findings from this phase, all measured rather than assumed:
 
 - **`shutdown_timeout` is a floor, not a ceiling.** Pingora ends a shutdown
-  with `Runtime::shutdown_timeout`, and its listener tasks are parked in
-  `accept` rather than watching for the signal, so the wait runs to completion
-  **whether or not anything is in flight**. A `SIGTERM` costs about
+  with `Runtime::shutdown_timeout` and deliberately keeps the final window
+  open, so the wait runs to completion **whether or not anything is in
+  flight**. A `SIGTERM` costs about
   `drain_period + shutdown_timeout` on a completely idle process. The former
   30-second default therefore made every restart take 35 seconds and put the
   process past Kubernetes' default 30-second termination grace period — where
@@ -1254,7 +1255,7 @@ telemetry:
 |---|---|
 | `GET /health/live` | `200` while the process is running. Never anything else. |
 | `GET /health/ready` | `200` when this instance should receive traffic, `503` while draining. |
-| `GET /status` | Configuration generation, per-backend health, cache and spool occupancy, admission limits, drain state, compiled features. |
+| `GET /status` | Configuration generation and stable fingerprint, per-backend health, cache and spool occupancy, admission limits, drain state, compiled features. |
 
 Bind it privately. `/status` publishes your backend health and configuration
 generation, and startup refuses to put it on the traffic listener's address.
@@ -1269,22 +1270,30 @@ readiness endpoint makes an orchestrator kill the process mid-drain.
 # Prove the new binary and config can start, before touching the running one.
 harmost run --config /etc/harmost/harmost.yaml --test
 
+# Set this from your supervisor, a captured `$!`, or the pid file written by
+# `--daemon`. Foreground mode does not write server.graceful.pid_file.
+pid=${HARMOST_PID:?set HARMOST_PID to the running Harmost process}
+
 # Linux: hand the listening sockets over, then let the old process drain.
 harmost run --config /etc/harmost/harmost.yaml --upgrade &
-kill -QUIT "$(cat /run/harmost/harmost.pid)"
+kill -QUIT "$pid"
 
 # Anywhere: drain first so the balancer withdraws this instance, then stop.
-kill -USR1 "$(cat /run/harmost/harmost.pid)"   # readiness fails; still serving
+kill -USR1 "$pid"                              # readiness fails; still serving
 sleep 15                                        # let the balancer notice
-kill -TERM "$(cat /run/harmost/harmost.pid)"
+kill -TERM "$pid"
 ```
 
 `SIGUSR1` drains **without exiting** — that is the point, and it is what a
 Kubernetes `preStop` hook should send.
 
-**Budget `drain_period + shutdown_timeout` for every stop.** Pingora's shutdown
-waits out its timeout whether or not anything is in flight, so with the
-defaults a `SIGTERM` takes about fifteen seconds on an idle process.
+If the pre-stop sleep already covers `drain_period`, the later `SIGTERM` does
+not wait that period again; it waits only any remainder before starting the
+shutdown timeout.
+
+**Budget `drain_period + shutdown_timeout` for a direct stop.** Pingora's
+shutdown waits out its timeout whether or not anything is in flight, so with
+the defaults a direct `SIGTERM` takes about fifteen seconds on an idle process.
 `harmost check` prints the number and warns when it exceeds Kubernetes'
 default grace period.
 
@@ -1316,9 +1325,11 @@ telemetry:
       endpoint: "http://127.0.0.1:4318/v1/traces"
 ```
 
-An inbound `traceparent` is treated exactly like `X-Forwarded-For`: believed
-from a peer in `server.trusted_proxies`, ignored from anyone else. Ignoring one
-never costs the request — Harmost simply starts a fresh trace.
+Inbound `traceparent` is ignored by default. `from_trusted_proxies` is an
+explicit opt-in and is safe only when every trusted proxy strips or replaces
+client-supplied `traceparent` and `tracestate`; unlike `X-Forwarded-For`, trace
+context has no hop chain Harmost can validate. Ignoring one never costs the
+request — Harmost simply starts a fresh trace.
 
 **Telemetry is never load-bearing.** The span queue is bounded and full means
 drop; recording is a non-blocking `try_send`; an export failure is counted and
@@ -1330,6 +1341,37 @@ asserts that fifteen requests still complete promptly.
 [`ops/prometheus/alerts.yml`](./ops/prometheus/alerts.yml) and
 [`ops/grafana/dashboard.json`](./ops/grafana/dashboard.json). The four signals
 worth understanding before an incident:
+
+Run the complete local observability demo with Docker Compose:
+
+```bash
+docker compose -f compose.observability.yaml up --build
+```
+
+It starts three Next.js origins, Harmost, a continuous traffic generator,
+Prometheus, and Grafana. Open <http://127.0.0.1:13000/d/harmost-overview/harmost>
+to use the dashboard; no separate Grafana installation is needed for this demo.
+Prometheus is available at <http://127.0.0.1:19000> and traffic enters Harmost
+at <http://127.0.0.1:18080>.
+
+![Harmost dashboard showing live origin, admission, latency, queue, and cache metrics](./assets/harmost-dashboard.png)
+
+This is a capture of the running stack, not a mockup. To refresh both the
+overview above and the [full dashboard capture](./assets/harmost-dashboard-full.png),
+leave the stack running and execute:
+
+```bash
+npm --prefix bench/browser ci
+npm exec --prefix bench/browser -- playwright install chromium
+node scripts/capture-dashboard.mjs
+```
+
+The first two commands install the pinned Playwright dependency and Chromium;
+subsequent captures only need the `node` command. Stop the demo with:
+
+```bash
+docker compose -f compose.observability.yaml down
+```
 
 | Signal | Means |
 |---|---|

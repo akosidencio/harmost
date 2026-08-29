@@ -107,7 +107,7 @@ grep -q 'trust_incoming' "$CONFIG" \
 rm -f "$CONFIG.bak"
 before=$(wc -l < "$(bench_log harmost)")
 kill -HUP "$PID"
-for attempt in $(seq 1 100); do
+for _ in $(seq 1 100); do
   tail -n "+$((before + 1))" "$(bench_log harmost)" | grep -q "config reloaded" && break
   sleep 0.1
 done
@@ -146,7 +146,7 @@ grep -q '"trace_continued":true' "$LOG" \
 
 echo
 echo "span export"
-for attempt in $(seq 1 60); do
+for _ in $(seq 1 60); do
   [ -s "$SPANS" ] && break
   sleep 0.2
 done
@@ -213,7 +213,7 @@ echo "a dead collector does not affect traffic"
 bench_stop collector
 BEFORE=$(date +%s%N)
 CODES=""
-for i in $(seq 1 15); do
+for _ in $(seq 1 15); do
   CODES="$CODES$(curl -s -o /dev/null -w '%{http_code} ' --max-time 10 \
     "http://127.0.0.1:$LISTEN_PORT/render")"
 done

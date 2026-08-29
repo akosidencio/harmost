@@ -92,8 +92,7 @@ ADMIN_WATCH=$!
 SESSIONS="$BENCH_DIR/sessions"
 : > "$SESSIONS"
 collect_sessions() { # count
-  local i
-  for i in $(seq 1 "$1"); do
+  for _ in $(seq 1 "$1"); do
     curl -s -D - -o /dev/null --max-time 15 "$BASE/private/x" 2>/dev/null \
       | tr -d '\r' | sed -n 's/^[Ss]et-[Cc]ookie: session=\([^;]*\).*/\1/p' >> "$SESSIONS"
   done
