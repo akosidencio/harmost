@@ -98,7 +98,7 @@ as a service.
   `harmost_cache_max_bytes`, `harmost_spool_max_bytes`. The last two exist so a
   dashboard has a denominator for the occupancy gauges rather than a hardcoded
   ceiling that goes stale the first time somebody edits the budget.
-- **Release artifacts:** versioned binaries for Linux and macOS, a
+- **Release artifacts:** a versioned `x86_64-unknown-linux-gnu` binary, a
   `SHA256SUMS` covering every archive, a CycloneDX SBOM, and an OCI image with
   provenance and its own SBOM attached as attestations.
 - **Documentation:** [`docs/OPERATIONS.md`](./docs/OPERATIONS.md),

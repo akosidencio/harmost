@@ -18,8 +18,11 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # Linux is the reference platform: it runs the full gate, including the
-  # end-to-end benchmarks and the containerised Next.js proof.
+  # Linux is the only platform, not merely the reference one: Harmost is
+  # deployed on Linux, the published image is `linux/amd64`, and the release
+  # binary targets `x86_64-unknown-linux-gnu`. Every job here runs the full
+  # gate, including the end-to-end benchmarks and the containerised Next.js
+  # proof.
   test:
     name: fmt + clippy + test (linux)
     runs-on: ubuntu-latest
@@ -91,27 +94,6 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit
         run: cargo audit -D warnings
-
-  # macOS is a supported development platform, not the reference one. It builds
-  # and runs the unit tests so a platform-specific compile error or a test that
-  # assumed Linux is caught; the end-to-end work is not duplicated here, because
-  # the timing-sensitive benchmarks are slower and flakier on macOS runners and
-  # a second copy of them buys no coverage.
-  build-macos:
-    name: build + test (macos)
-    runs-on: macos-latest
-    timeout-minutes: 40
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Test
-        run: cargo test --workspace --lib --locked
 
   # The end-to-end evidence behind the README's claims. Every script asserts its
   # own result and exits non-zero when it fails, so this is a gate rather than a

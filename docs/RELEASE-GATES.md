@@ -24,7 +24,6 @@ must pass before merge.
 | Tests, TLS build | `cargo test --workspace --lib --locked --features tls` | any failure |
 | Doc tests | `cargo test --workspace --doc --locked` | any failure |
 | Dependency advisories | `cargo audit -D warnings` | any advisory not listed in `.cargo/audit.toml` with a reason |
-| macOS build | `cargo test --workspace --lib --locked` | any failure |
 | End-to-end suite | `./bench/all.sh` | any script's own assertions |
 | Next.js proof | `./bench/nextjs.sh`, `./bench/nextjs-browser.sh` | any assertion |
 | Fuzz targets | `cargo +nightly fuzz build`, then 60s per target | a crash, or a target that no longer builds |
@@ -134,11 +133,11 @@ exclusions reads as more coverage than it has.
   absolute numbers are not a baseline anybody else's hardware should be held
   to, and a performance gate on shared runners fails for reasons unrelated to
   the change.
-- **The macOS end-to-end suite.** macOS builds and runs unit tests. The
-  timing-sensitive benchmarks are slower and flakier there and a second copy
-  buys no coverage — but note that `bench/upgrade.sh` genuinely cannot test the
-  socket handover off Linux, so that specific claim is only ever proven on
-  Linux.
+- **Every platform except Linux.** Harmost is deployed on Linux, the image is
+  `linux/amd64` and the only release binary is `x86_64-unknown-linux-gnu`, so
+  nothing is built or tested anywhere else. Harmost still *compiles* on macOS
+  and is usable for local development, but that is unverified by CI and no
+  artifact is published for it.
 - **Multi-replica behaviour.** Cache, coalescing and admission state are
   process-local. Nothing here tests what several replicas do together, and the
   README says so under its limitations rather than a benchmark implying

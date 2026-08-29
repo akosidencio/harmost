@@ -45,7 +45,7 @@ classification, cache-key and shareability rules, and bounded origin admission.
 
 ## Project maturity and expectations
 
-** Treat it as a working prototype with a serious test suite: there is a
+**Treat it as a working prototype with a serious test suite.** There is a
 [threat model](./docs/THREAT-MODEL.md), an
 [adversarial suite](./bench/adversarial.sh) in CI, and a
 [soak](./bench/soak.sh), [memory-pressure](./bench/memory.sh),
@@ -469,12 +469,21 @@ predicts behaviour under real traffic.
 
 ## Installation
 
-Harmost is not on crates.io and there are no standalone release binaries.
+Harmost is not on crates.io. It targets Linux: the published image is
+`linux/amd64` and the release binary is `x86_64-unknown-linux-gnu`. There are
+no macOS or Windows artifacts.
 
 Tagged releases publish a `linux/amd64` container image to GitHub Packages at
 `ghcr.io/akosidencio/harmost`, built from the repository
 [`Dockerfile`](./Dockerfile). The same Dockerfile builds a local image for
-testing and as a base for deployment work.
+testing and as a base for deployment work. The image is the recommended way to
+run Harmost, and the one every topology below assumes unless it says otherwise.
+
+A release also attaches a single `x86_64-unknown-linux-gnu` binary, with a
+checksum for both the archive and the binary inside it. That exists for the one
+topology a container does not serve — the systemd unit in
+[`docs/OPERATIONS.md`](./docs/OPERATIONS.md), which runs
+`/usr/local/bin/harmost` directly.
 
 ```bash
 docker pull ghcr.io/akosidencio/harmost:<version>
@@ -1293,7 +1302,7 @@ local test origin — never production-validated; see
 | Config schema version and migration notes | done ([`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md)) |
 | Soak, memory-pressure, restart and chaos tests | done ([`soak.sh`](./bench/soak.sh), [`memory.sh`](./bench/memory.sh), [`upgrade.sh`](./bench/upgrade.sh), [`chaos.sh`](./bench/chaos.sh)); CI-sized on every push, full size before a tag ([gates](./docs/RELEASE-GATES.md)) |
 | Example Prometheus alerts and Grafana dashboard | done ([`ops/`](./ops)) |
-| Release binaries, checksums, SBOM, reproducible builds | workflow written ([`scripts/reproducible-build.sh`](./scripts/reproducible-build.sh)); **no release has been cut yet**, so the reproducibility claim is untested by anyone but its author |
+| Release binary, checksums, SBOM, reproducible builds | workflow written ([`scripts/reproducible-build.sh`](./scripts/reproducible-build.sh)); **no release has been cut yet**, so the reproducibility claim is untested by anyone but its author |
 | Circuit breaking, least-loaded balancing | not started ([roadmap](#roadmap)) |
 | Cache purge API | not started ([roadmap](#roadmap)) |
 
