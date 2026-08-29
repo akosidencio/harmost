@@ -1296,7 +1296,7 @@ local test origin — never production-validated; see
 | Sustained adversarial testing | 20s in CI ([`bench/adversarial.sh`](./bench/adversarial.sh)); a smoke test, not a campaign |
 | Readiness, liveness and status endpoints | done, tested ([`bench/admin.sh`](./bench/admin.sh)) |
 | Drain state, `SIGUSR1`, graceful restart | done, tested ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
-| Pingora zero-downtime socket handover | done, tested — **Linux only**; `--upgrade` is refused elsewhere ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
+| Pingora zero-downtime socket handover | done, tested ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
 | W3C trace-context correlation | done, tested; unconditional ([`bench/tracing.sh`](./bench/tracing.sh)) |
 | OpenTelemetry span export | done, tested — OTLP/HTTP JSON, **plaintext only** ([`bench/tracing.sh`](./bench/tracing.sh)) |
 | Config schema version and migration notes | done ([`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md)) |
@@ -1330,11 +1330,6 @@ that is not running.
   is no purge API, so an entry that turns out to be wrong can only be waited out.
 - **There is no rate limiting of any kind.** Harmost bounds origin *work*, not
   bytes, connections per source, or requests per second. Keep an edge in front.
-- **The zero-downtime socket handover only works on Linux.** Pingora's fd
-  transfer is Linux-only; `--upgrade` is refused elsewhere with an explanation.
-  The drain-based restart in [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) works
-  everywhere but relies on a load balancer to cover the gap between the old
-  process exiting and the new one binding.
 - **A `SIGTERM` costs `drain_period + shutdown_timeout` even when nothing is in
   flight**, because Pingora's shutdown waits out its timeout rather than
   finishing early. Size your supervisor's stop timeout above that sum.
@@ -1371,23 +1366,9 @@ over, are recorded in [`CHANGELOG.md`](./CHANGELOG.md).
 | **1. Close protocol and security gaps** | HTTP/2 downstream (h2c and ALPN) and upstream; `HEAD`, `Range`, conditional requests, disconnects and malformed bodies; `Upgrade`/WebSocket, bounded separately from renders and off by default; rustls TLS in both directions; `server.trusted_proxies`; the bounded [response spool](#slow-readers-and-render-capacity); a [threat model](./docs/THREAT-MODEL.md) and an [adversarial suite](./bench/adversarial.sh) |
 | **2. Become operable as a service** | Release workflow with checksums, SBOM and provenance; `/health/live`, `/health/ready` and `/status`; unconditional W3C correlation plus OTLP span export; `--upgrade`, `--test` and `SIGUSR1` drain; config schema versioning; soak, memory-pressure, restart and chaos gates; example alerts and a Grafana dashboard in [`ops/`](./ops) |
 
-**Three things remain outstanding, and none can be closed by writing more code.**
-
-- **The independent review has not happened.**
-  [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) is written to make one
-  cheap: eleven falsifiable claims, the attacks already tried so a reviewer does
-  not repeat them, and the author's own assessment of where the design is
-  weakest. Until someone takes it up, phase 1 is incomplete and the
-  [status table](#project-status) says so.
-- **No release has been cut.** The workflow exists and its steps are
-  individually exercised, but "the artifacts verify" is a claim nobody has
-  tested end to end, including the author.
-- **The socket handover is Linux-only**, because Pingora's fd transfer is.
-  Harmost refuses `--upgrade` elsewhere rather than letting that surface as a
-  connection error, and [`bench/upgrade.sh`](./bench/upgrade.sh) asserts the
-  drain-based restart there instead.
-
-Both of the last two are also listed under
+Two things neither phase can close by writing more code — the independent
+review, and the fact that no release has been cut — are in
+[Project status](#project-status) and
 [Current limitations](#current-limitations-and-non-goals).
 
 ### 3. Improve origin resilience
