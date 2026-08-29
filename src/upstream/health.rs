@@ -113,10 +113,9 @@ impl HealthChecker {
 impl BackgroundService for HealthChecker {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         loop {
-            tokio::select! {
-                _ = shutdown.changed() => return,
-                _ = tokio::time::sleep(self.interval) => {}
-            }
+            // Probe immediately at startup. Strict readiness intentionally
+            // begins unknown; making it wait one full interval before it can
+            // become ready would add avoidable rollout latency.
             for backend in self.pool.backends() {
                 let ok = self.probe(&backend.address).await;
                 if let Some(state) = self.record(backend.id, ok) {
@@ -133,6 +132,10 @@ impl BackgroundService for HealthChecker {
                 crate::telemetry::metrics::UPSTREAM_HEALTHY
                     .with_label_values(&[&backend.address])
                     .set(i64::from(self.pool.is_healthy(backend.id)));
+            }
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = tokio::time::sleep(self.interval) => {}
             }
         }
     }

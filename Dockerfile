@@ -29,7 +29,8 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --no-create-home harmost
+    && useradd --system --uid 10001 --no-create-home harmost \
+    && install -d -o harmost -g harmost -m 0750 /run/harmost /etc/harmost
 
 COPY --from=builder /tmp/harmost /usr/local/bin/harmost
 

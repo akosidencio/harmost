@@ -26,8 +26,10 @@ server:
 
   # Process lifecycle: what a zero-downtime restart coordinates on.
   #
-  # Set pid_file and upgrade_socket per instance. Two Harmosts on one host
-  # with the /tmp defaults will hand each other their listening sockets.
+  # Set pid_file and upgrade_socket per instance. pid_file is written only in
+  # --daemon mode; foreground supervisors and containers should signal the PID
+  # they already track. Two Harmosts on one host with the /tmp defaults will
+  # hand each other their listening sockets.
   #
   # The two windows do different jobs. drain_period is for the *load
   # balancer*: readiness starts failing immediately and Harmost keeps serving
@@ -35,9 +37,9 @@ server:
   # before anything stops. shutdown_timeout is what in-flight requests get
   # once the shutdown proper begins.
   #
-  # shutdown_timeout is a FLOOR, not a ceiling — Pingora's listener tasks are
-  # parked in accept() rather than watching for the signal, so a SIGTERM costs
-  # about drain_period + shutdown_timeout even on an idle process. Your
+  # shutdown_timeout is a FLOOR, not a ceiling — Pingora deliberately keeps the
+  # runtime shutdown window open, so a SIGTERM costs about drain_period +
+  # shutdown_timeout even on an idle process. Your
   # supervisor's stop timeout must exceed that sum, or it SIGKILLs Harmost
   # mid-drain. These defaults total 15s, inside Kubernetes' default 30s.
   graceful:
@@ -197,6 +199,9 @@ telemetry:
     # default is the careful one: Harmost still serves a fully unhealthy pool,
     # so turning this on without something above Harmost that can route around
     # this instance converts a degraded origin into a total edge outage.
+    # Requires the health block above. Readiness stays 503 until a backend
+    # completes its healthy_after success streak; unprobed is not silently
+    # treated as healthy.
     require_healthy_upstream: false
 
   # OpenTelemetry.
@@ -213,9 +218,11 @@ telemetry:
       # does not have a hole exactly where the origin governor sits.
       mode: parent_or_ratio    # parent_or_ratio | ratio | always | never
       one_in: 20
-    # Whose traceparent to believe. Treated exactly like X-Forwarded-For:
-    # believed from a peer in server.trusted_proxies, ignored otherwise.
-    trust_incoming: from_trusted_proxies   # from_trusted_proxies | always | never
+    # Whose traceparent to believe. `never` is the safe default: a trusted load
+    # balancer may merely forward a client-supplied header. Use
+    # from_trusted_proxies only when every trusted proxy strips or replaces
+    # traceparent and tracestate at the edge.
+    trust_incoming: never   # never | from_trusted_proxies | always
     # Span export. OTLP over HTTP with the JSON encoding, plaintext only —
     # an https:// endpoint is refused at startup rather than quietly
     # downgraded. Run a collector as a sidecar and let it handle transport.

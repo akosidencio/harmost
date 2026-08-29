@@ -69,10 +69,13 @@ echo
 echo "status content"
 BODY=$(admin_body /status)
 GEN=$(json_field "$BODY" generation)
+FINGERPRINT=$(json_field "$BODY" fingerprint)
 SCHEMA=$(json_field "$BODY" schema_version)
 echo "  config generation      $GEN"
+echo "  config fingerprint     $FINGERPRINT"
 echo "  config schema version  $SCHEMA"
 bench_assert_eq "$GEN" 1 "config generation before any reload"
+[ -n "$FINGERPRINT" ] || bench_fail "the status document has no config fingerprint: $BODY"
 bench_assert_eq "$SCHEMA" 1 "config schema version"
 case "$BODY" in
   *'"address":"127.0.0.1:'"$ORIGIN_PORT"'"'*) ;;
@@ -89,21 +92,25 @@ echo
 echo "generation tracks a reload"
 sed -i.bak "s/max: 4/max: 6/" "$CONFIG" && rm -f "$CONFIG.bak"
 kill -HUP "$PID"
-for attempt in $(seq 1 100); do
+for _ in $(seq 1 100); do
   GEN=$(json_field "$(admin_body /status)" generation)
   [ "$GEN" = "2" ] && break
   sleep 0.1
 done
 echo "  config generation      $GEN"
+FINGERPRINT_AFTER=$(json_field "$(admin_body /status)" fingerprint)
+echo "  config fingerprint     $FINGERPRINT_AFTER"
 bench_result generation_after_reload "$GEN"
 bench_assert_eq "$GEN" 2 "config generation after a SIGHUP"
+[ "$FINGERPRINT_AFTER" != "$FINGERPRINT" ] \
+  || bench_fail "the config fingerprint did not change when the effective config changed"
 
 # --------------------------------------------------------------- draining
 
 echo
 echo "drain (SIGUSR1)"
 kill -USR1 "$PID"
-for attempt in $(seq 1 100); do
+for _ in $(seq 1 100); do
   READY=$(admin_code /health/ready)
   [ "$READY" = "503" ] && break
   sleep 0.1
@@ -146,14 +153,19 @@ DRAINING=$(curl -s --max-time 5 "http://127.0.0.1:$METRICS_PORT/metrics" \
   | sed -n 's/^harmost_draining \([0-9]*\)$/\1/p')
 GEN_METRIC=$(curl -s --max-time 5 "http://127.0.0.1:$METRICS_PORT/metrics" \
   | sed -n 's/^harmost_config_generation \([0-9]*\)$/\1/p')
+FINGERPRINT_METRIC=$(curl -s --max-time 5 "http://127.0.0.1:$METRICS_PORT/metrics" \
+  | sed -n 's/^harmost_config_fingerprint \([0-9]*\)$/\1/p')
 echo "  harmost_draining          $DRAINING"
 echo "  harmost_config_generation $GEN_METRIC"
+echo "  config fingerprint        $FINGERPRINT_METRIC"
 # A dashboard and an endpoint that disagree send an operator down the wrong
 # path at the worst possible moment.
 bench_assert_eq "${DRAINING:-x}" 1 "harmost_draining while draining"
 bench_assert_eq "${GEN_METRIC:-x}" 2 "harmost_config_generation after a reload"
+bench_assert_eq "${FINGERPRINT_METRIC:-x}" "$FINGERPRINT_AFTER" \
+  "harmost_config_fingerprint after a reload"
 
 echo
 bench_print_params
 echo
-bench_pass "readiness failed on drain while all 20 requests still succeeded, and generation, drain state and metrics all agreed"
+bench_pass "readiness failed on drain while all 20 requests still succeeded, and generation, fingerprint, drain state and metrics all agreed"

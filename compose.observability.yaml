@@ -1,0 +1,89 @@
+name: harmost-observability-demo
+
+x-next-origin: &next-origin
+  build:
+    context: ./fixtures/next-storefront
+  expose:
+    - "3000"
+  healthcheck:
+    test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/healthz"]
+    interval: 2s
+    timeout: 1s
+    retries: 30
+
+services:
+  next-1:
+    <<: *next-origin
+    environment:
+      INSTANCE_ID: next-1
+      RENDER_DELAY_MS: "350"
+
+  next-2:
+    <<: *next-origin
+    environment:
+      INSTANCE_ID: next-2
+      RENDER_DELAY_MS: "350"
+
+  next-3:
+    <<: *next-origin
+    environment:
+      INSTANCE_ID: next-3
+      RENDER_DELAY_MS: "350"
+
+  harmost:
+    build:
+      context: .
+    depends_on:
+      next-1:
+        condition: service_healthy
+      next-2:
+        condition: service_healthy
+      next-3:
+        condition: service_healthy
+    volumes:
+      - ./bench/nextjs.yaml:/etc/harmost/harmost.yaml:ro
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:19090:9090"
+    stop_grace_period: 20s
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    depends_on:
+      - harmost
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/rules/harmost-alerts.yml:ro
+    ports:
+      - "127.0.0.1:19000:9090"
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/harmost.json
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./ops/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./ops/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./ops/grafana/dashboard.json:/var/lib/grafana/dashboards/harmost.json:ro
+    ports:
+      - "127.0.0.1:13000:3000"
+
+  traffic:
+    image: alpine:3.21
+    depends_on:
+      - harmost
+    entrypoint: ["/bin/sh", "/demo/traffic.sh"]
+    volumes:
+      - ./ops/demo/traffic.sh:/demo/traffic.sh:ro

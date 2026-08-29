@@ -6,7 +6,7 @@
 # benchmark, each carrying the parameters that produced its numbers — CI does
 # this and publishes the directory as an artifact.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 export BENCH_REPORT_DIR=${BENCH_REPORT_DIR:-}
 FAILED=""

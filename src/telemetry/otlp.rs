@@ -180,7 +180,19 @@ pub struct Endpoint {
 /// operator has every reason to believe a protection is on. Run a collector as
 /// a local sidecar and let it terminate TLS on the way out.
 pub fn parse_endpoint(raw: &str) -> Result<Endpoint, String> {
-    let raw = raw.trim();
+    if raw != raw.trim() {
+        return Err("the OTLP endpoint has leading or trailing whitespace".to_string());
+    }
+    if !raw.is_ascii()
+        || raw.bytes().any(|b| b <= 0x20 || b == 0x7f)
+        || raw.contains('#')
+        || raw.contains('\\')
+    {
+        return Err(
+            "the OTLP endpoint contains whitespace, control characters, a fragment, or a backslash"
+                .to_string(),
+        );
+    }
     if let Some(rest) = raw.strip_prefix("https://") {
         let _ = rest;
         return Err(
@@ -209,6 +221,9 @@ pub fn parse_endpoint(raw: &str) -> Result<Endpoint, String> {
     }
     if authority.contains('@') {
         return Err("the OTLP endpoint must not carry userinfo".to_string());
+    }
+    if authority.contains('?') {
+        return Err("the OTLP endpoint authority contains a query".to_string());
     }
 
     // IPv6 literals are bracketed and contain the colons that would otherwise
@@ -266,6 +281,7 @@ pub struct OtlpExporter {
     max_batch: usize,
     interval: Duration,
     resource: Vec<(String, String)>,
+    dropped: Arc<AtomicU64>,
     /// Taken once by `start`. A `BackgroundService` is handed `&self`, so the
     /// receiving half has to be moved out from behind a lock exactly once.
     rx: parking_lot::Mutex<Option<mpsc::Receiver<SpanRecord>>>,
@@ -281,9 +297,10 @@ pub fn build(
 ) -> Result<(SpanSink, OtlpExporter), String> {
     let endpoint = parse_endpoint(&cfg.endpoint)?;
     let (tx, rx) = mpsc::channel(cfg.max_queue.max(1));
+    let dropped = Arc::new(AtomicU64::new(0));
     let sink = SpanSink {
         tx,
-        dropped: Arc::new(AtomicU64::new(0)),
+        dropped: dropped.clone(),
     };
     let exporter = OtlpExporter {
         endpoint,
@@ -291,6 +308,7 @@ pub fn build(
         max_batch: cfg.max_batch.max(1),
         interval: cfg.interval.as_duration(),
         resource,
+        dropped,
         rx: parking_lot::Mutex::new(Some(rx)),
     };
     Ok((sink, exporter))
@@ -307,7 +325,6 @@ impl OtlpExporter {
         }
         let count = u64::try_from(batch.len()).unwrap_or(u64::MAX);
         let body = encode(&self.resource, batch);
-        batch.clear();
         match self.post(&body).await {
             Ok(()) => metrics::SPANS
                 .with_label_values(&["exported"])
@@ -321,6 +338,17 @@ impl OtlpExporter {
                 log::debug!("OTLP export of {count} span(s) failed: {why}");
             }
         }
+        batch.clear();
+    }
+
+    fn record_shutdown_drop(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        self.dropped.fetch_add(count, Ordering::Relaxed);
+        metrics::SPANS.with_label_values(&["dropped"]).inc_by(count);
+        log::debug!("OTLP shutdown deadline dropped {count} queued span(s)");
     }
 
     /// One `POST`, one connection, no keep-alive.
@@ -402,13 +430,24 @@ impl BackgroundService for OtlpExporter {
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
-                    // One last flush so the spans from the requests served
-                    // during a drain are not the ones that go missing.
+                    // Flush within one total deadline. Applying `timeout` to
+                    // every batch independently lets max_queue/max_batch
+                    // multiply the shutdown budget; telemetry must never hold
+                    // the service lifecycle open that way.
                     rx.close();
-                    while rx.recv_many(&mut batch, self.max_batch).await > 0 {
-                        self.flush(&mut batch).await;
+                    let drain = async {
+                        loop {
+                            if batch.is_empty()
+                                && rx.recv_many(&mut batch, self.max_batch).await == 0
+                            {
+                                break;
+                            }
+                            self.flush(&mut batch).await;
+                        }
+                    };
+                    if tokio::time::timeout(self.timeout, drain).await.is_err() {
+                        self.record_shutdown_drop(batch.len().saturating_add(rx.len()));
                     }
-                    self.flush(&mut batch).await;
                     return;
                 }
                 received = rx.recv_many(&mut batch, self.max_batch) => {
@@ -595,6 +634,12 @@ mod tests {
             "http://host:notaport",
             "http://user@host:4318",
             "http://[::1:4318",
+            " http://collector:4318/v1/traces",
+            "http://collector:4318/v1/traces ",
+            "http://collector:4318/v1/traces#fragment",
+            "http://collector:4318/v1/traces HTTP/1.1\r\nX-Injected: yes",
+            "http://collector:4318\\v1\\traces",
+            "http://collector?tenant=x/v1/traces",
         ] {
             assert!(parse_endpoint(bad).is_err(), "accepted {bad:?}");
         }
@@ -681,6 +726,61 @@ mod tests {
         drop(exporter);
         sink.record(span());
         assert_eq!(sink.dropped(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_has_one_total_deadline_and_counts_the_remainder() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept connections but never answer them, so every attempted batch
+        // would consume a full per-request timeout without the outer deadline.
+        let collector = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        // Deep enough that the queue cannot empty before the shutdown branch
+        // is taken. `tokio::select!` picks at random among ready branches, and
+        // on the first poll all three are — the watch, the buffered spans, and
+        // `interval`'s immediate first tick. Every ordinary `recv` that wins
+        // the draw exports one span through the normal path, so a queue of
+        // four could be gone by the time shutdown is handled, leaving nothing
+        // to abandon and failing this test on a race rather than a defect.
+        const QUEUED: usize = 64;
+        let (sink, exporter) = build(
+            &Otlp {
+                timeout: Dur(Duration::from_millis(50)),
+                max_queue: QUEUED,
+                max_batch: 1,
+                interval: Dur(Duration::from_secs(60)),
+                ..otlp(&format!("http://127.0.0.1:{port}/v1/traces"))
+            },
+            vec![],
+        )
+        .unwrap();
+        for _ in 0..QUEUED {
+            sink.record(span());
+        }
+        // The queue is exactly full, never over: a span dropped here would be
+        // a full-channel drop, and would satisfy the assertion below without
+        // the shutdown path ever having abandoned anything.
+        assert_eq!(sink.dropped(), 0, "a span was dropped before shutdown");
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { exporter.start(rx).await });
+        tx.send(true).unwrap();
+        let started = std::time::Instant::now();
+        task.await.unwrap();
+        collector.abort();
+
+        // One deadline for the whole drain. Applied per batch instead, this
+        // collector answers nothing, so 64 batches would cost 64 × 50ms.
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            sink.dropped() > 0,
+            "the abandoned queue was not accounted for"
+        );
     }
 
     #[tokio::test]

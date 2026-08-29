@@ -44,9 +44,12 @@ impl UpstreamPool {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        // A configured health check has not passed yet at startup. Routing can
+        // still fall back to the full pool (see `select`), but strict readiness
+        // must not describe an unprobed backend as healthy.
         let healthy = backends
             .iter()
-            .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)))
             .collect();
         Ok(UpstreamPool {
             backends,
@@ -71,6 +74,15 @@ impl UpstreamPool {
     pub fn set_healthy(&self, id: usize, healthy: bool) {
         if let Some(flag) = self.healthy.get(id) {
             flag.store(healthy, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark every backend available when active health checking is disabled.
+    /// In that mode there is no probe whose result could move the pool out of
+    /// an initial unknown state.
+    pub fn assume_healthy(&self) {
+        for backend in &self.backends {
+            self.set_healthy(backend.id, true);
         }
     }
 
@@ -148,7 +160,7 @@ mod tests {
     use super::*;
 
     fn pool(strategy: LoadBalancing) -> UpstreamPool {
-        UpstreamPool::new(
+        let pool = UpstreamPool::new(
             &[
                 "127.0.0.1:3000".to_string(),
                 "127.0.0.2:3000".to_string(),
@@ -156,7 +168,18 @@ mod tests {
             ],
             strategy,
         )
-        .unwrap()
+        .unwrap();
+        pool.assume_healthy();
+        pool
+    }
+
+    #[test]
+    fn a_new_pool_is_unknown_until_a_probe_or_explicit_assumption() {
+        let p =
+            UpstreamPool::new(&["127.0.0.1:3000".to_string()], LoadBalancing::RoundRobin).unwrap();
+        assert_eq!(p.healthy_count(), 0);
+        p.assume_healthy();
+        assert_eq!(p.healthy_count(), 1);
     }
 
     #[test]

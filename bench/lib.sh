@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared harness for the bench/ scripts. Source it, never execute it.
 #
 # The scripts in this directory are the evidence behind the claims in the
@@ -74,10 +75,22 @@ bench_cleanup() {
 # — `tls` today. It is a parameter rather than a default because the TLS stack
 # is a two-minute compile that every other benchmark would pay for.
 bench_build() {
-  local flags=""
-  if [ "${BENCH_PROFILE:-debug}" = "release" ]; then flags="--release"; fi
-  if [ -n "${BENCH_FEATURES:-}" ]; then flags="$flags --features $BENCH_FEATURES"; fi
-  cargo build --workspace $flags -q || bench_fail "workspace build failed"
+  # Bash 3.2 (still shipped by macOS) treats expansion of an empty local array
+  # as an unbound variable under `set -u`. Keep the no-option path scalar so
+  # the same benchmark harness works on both macOS and Linux.
+  if [ "${BENCH_PROFILE:-debug}" = "release" ]; then
+    if [ -n "${BENCH_FEATURES:-}" ]; then
+      cargo build --workspace --release --features "$BENCH_FEATURES" -q \
+        || bench_fail "workspace build failed"
+    else
+      cargo build --workspace --release -q || bench_fail "workspace build failed"
+    fi
+  elif [ -n "${BENCH_FEATURES:-}" ]; then
+    cargo build --workspace --features "$BENCH_FEATURES" -q \
+      || bench_fail "workspace build failed"
+  else
+    cargo build --workspace -q || bench_fail "workspace build failed"
+  fi
 }
 
 bench_bin() {
@@ -93,17 +106,44 @@ bench_port_open() {
 
 # Hand out a port nothing is listening on, and never the same one twice within
 # one run. Racy in principle against the rest of the machine; in practice a
-# random draw from 20000 unused ports beats a hardcoded 8080 by a wide margin.
+# random draw from thousands of unused ports beats a hardcoded 8080 by a wide
+# margin.
+#
+# The band is deliberately *below* the kernel's ephemeral range, and that is
+# the whole point rather than a detail. A port inside that range can be handed
+# to any outbound connection as its source port in the window between the
+# probe below and the fixture's `bind` — and `SO_REUSEADDR`, which std sets on
+# every listener, rescues a bind against a `TIME_WAIT` socket but not against a
+# live one. This suite opens thousands of loopback connections, including one
+# per probe here, so the window is not theoretical: a draw from the old
+# 20000-39999 band landed on 34798 while Linux was using its default
+# 32768-60999, `slow-origin` exited `AddrInUse`, and the run then spent 30s
+# waiting for a port that was never going to open.
 #
 # The ledger of already-issued ports lives in a file, not a variable: callers
 # use this as `PORT=$(bench_free_port)`, and a command substitution runs in a
 # subshell whose variable assignments are discarded — so a variable would hand
 # out the same port twice.
 bench_free_port() {
-  local port attempt ledger="$BENCH_DIR/ports"
+  local port ledger="$BENCH_DIR/ports" lo=20000 hi=32767 eph_lo eph_hi span
   touch "$ledger"
-  for attempt in $(seq 1 200); do
-    port=$(( 20000 + RANDOM % 20000 ))
+  if [ -r /proc/sys/net/ipv4/ip_local_port_range ]; then
+    read -r eph_lo eph_hi < /proc/sys/net/ipv4/ip_local_port_range
+    case "${eph_lo:-x}" in *[!0-9]*) eph_lo="" ;; esac
+    case "${eph_hi:-x}" in *[!0-9]*) eph_lo="" ;; esac
+    if [ -n "$eph_lo" ]; then
+      if [ "$eph_lo" -gt 21024 ]; then
+        hi=$((eph_lo - 1))
+      elif [ "$eph_hi" -lt 64511 ]; then
+        lo=$((eph_hi + 1)); hi=65535
+      else
+        bench_fail "no port band outside the kernel ephemeral range $eph_lo-$eph_hi"
+      fi
+    fi
+  fi
+  span=$((hi - lo + 1))
+  for _ in $(seq 1 200); do
+    port=$(( lo + RANDOM % span ))
     grep -qx "$port" "$ledger" && continue
     if ! bench_port_open 127.0.0.1 "$port"; then
       echo "$port" >> "$ledger"
@@ -141,11 +181,11 @@ bench_alive() {
 
 # Stop one named process politely, then insist.
 bench_stop() {
-  local pid attempt
+  local pid
   pid=$(bench_pid "$1")
   [ -n "$pid" ] || return 0
   kill -TERM "$pid" 2>/dev/null || true
-  for attempt in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     bench_alive "$pid" || { rm -f "$BENCH_DIR/pids/$1"; return 0; }
     sleep 0.1
   done
@@ -165,21 +205,40 @@ bench_stop_all() {
 
 # --------------------------------------------------------------- readiness
 
+# What every process this run started had to say, printed when a wait gives
+# up. "The port never opened" is a symptom; the cause is in the log of the
+# process that was supposed to open it, and reporting only the symptom once
+# cost a CI run 30s and an afternoon — the origin had exited `AddrInUse`
+# immediately and said so, into a log nobody printed.
+bench_dump_logs() {
+  local log name
+  [ -d "${BENCH_DIR:-/nonexistent}/logs" ] || return 0
+  for log in "$BENCH_DIR"/logs/*.log; do
+    [ -f "$log" ] || continue
+    [ -s "$log" ] || continue
+    name=$(basename "$log" .log)
+    echo "  --- $name, last 15 lines ---" >&2
+    tail -n 15 "$log" | sed 's/^/    /' >&2
+  done
+}
+
 bench_wait_port() {
-  local host=$1 port=$2 label=${3:-"$1:$2"} attempt
-  for attempt in $(seq 1 300); do
+  local host=$1 port=$2 label=${3:-"$1:$2"}
+  for _ in $(seq 1 300); do
     bench_port_open "$host" "$port" && return 0
     sleep 0.1
   done
+  bench_dump_logs
   bench_fail "$label never accepted a connection on $host:$port"
 }
 
 bench_wait_http() {
-  local url=$1 label=${2:-$1} attempt
-  for attempt in $(seq 1 300); do
+  local url=$1 label=${2:-$1}
+  for _ in $(seq 1 300); do
     if curl -fsS -o /dev/null --max-time 2 "$url" 2>/dev/null; then return 0; fi
     sleep 0.1
   done
+  bench_dump_logs
   bench_fail "$label never answered $url"
 }
 
@@ -187,8 +246,8 @@ bench_wait_http() {
 # observable event is a log line rather than a socket — a config reload, for
 # example, has no port of its own to poll.
 bench_wait_log() {
-  local name=$1 pattern=$2 attempt
-  for attempt in $(seq 1 100); do
+  local name=$1 pattern=$2
+  for _ in $(seq 1 100); do
     grep -q "$pattern" "$(bench_log "$name")" 2>/dev/null && return 0
     sleep 0.1
   done

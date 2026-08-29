@@ -156,9 +156,10 @@ impl Admin {
         field_str(&mut s, "path", &self.config_path);
         let _ = write!(
             s,
-            "\"schema_version\":{},\"generation\":{},\"routes\":{},\"features\":[",
+            "\"schema_version\":{},\"generation\":{},\"fingerprint\":{},\"routes\":{},\"features\":[",
             crate::config::SCHEMA_VERSION,
             policy.generation,
+            policy.fingerprint,
             cfg.routes.len()
         );
         let mut first = true;
@@ -356,13 +357,15 @@ mod tests {
             config_path: "/etc/harmost/harmost.yaml".to_string(),
             policy: Arc::new(ArcSwap::from(policy)),
             admission,
-            upstreams: Arc::new(
-                UpstreamPool::new(
+            upstreams: Arc::new({
+                let pool = UpstreamPool::new(
                     &["127.0.0.1:3000".to_string(), "127.0.0.2:3000".to_string()],
                     LoadBalancing::RoundRobin,
                 )
-                .unwrap(),
-            ),
+                .unwrap();
+                pool.assume_healthy();
+                pool
+            }),
             store: BoundedStore::new(64 * 1024 * 1024),
             spool: SpoolBudget::new(1024 * 1024),
             upgrades: Limiter::new("upgrade", 100, 0, Duration::ZERO),
@@ -426,6 +429,7 @@ mod tests {
         for expected in [
             r#""schema_version":1"#,
             r#""generation":7"#,
+            r#""fingerprint":"#,
             r#""routes":1"#,
             r#""draining":false"#,
             r#""path":"/etc/harmost/harmost.yaml""#,

@@ -104,6 +104,18 @@ pub fn validate(cfg: &Config) -> Result<()> {
             ));
         }
     }
+    if cfg
+        .telemetry
+        .admin
+        .as_ref()
+        .is_some_and(|admin| admin.require_healthy_upstream)
+        && cfg.health.is_none()
+    {
+        return Err(err(
+            "telemetry.admin.require_healthy_upstream is true but no health check is configured; \
+             readiness could never establish that an upstream passed",
+        ));
+    }
 
     check_unimplemented(cfg)?;
     check_coalesce_wait(cfg)?;
@@ -362,8 +374,9 @@ fn validate_admin(cfg: &Config) -> Result<()> {
     };
     validate_listen(&admin.listen, "telemetry.admin.listen")?;
 
-    // Compared as parsed addresses, not as strings, so `127.0.0.1:9090` and
-    // `127.000.000.001:9090` cannot slip past as "different".
+    // Compared as parsed addresses, not as strings. Equality alone is not
+    // enough: `0.0.0.0:9091` also owns `127.0.0.1:9091`, and `[::]` may be a
+    // dual-stack listener depending on the platform.
     let admin_addr = admin.listen.parse::<std::net::SocketAddr>().ok();
     let mut taken: Vec<(&str, &str)> = vec![("server.listen", cfg.server.listen.as_str())];
     if let Some(tls) = &cfg.server.tls {
@@ -373,7 +386,11 @@ fn validate_admin(cfg: &Config) -> Result<()> {
         taken.push(("telemetry.prometheus.listen", p.listen.as_str()));
     }
     for (name, address) in taken {
-        if address.parse::<std::net::SocketAddr>().ok() == admin_addr {
+        let taken_addr = address.parse::<std::net::SocketAddr>().ok();
+        if admin_addr
+            .zip(taken_addr)
+            .is_some_and(|(admin, taken)| listeners_overlap(admin, taken))
+        {
             return Err(err(format!(
                 "telemetry.admin.listen `{}` is the same address as {name}; the admin \
                  endpoints publish backend health, cache occupancy and the configuration \
@@ -383,6 +400,21 @@ fn validate_admin(cfg: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn listeners_overlap(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
+    if a.port() != b.port() {
+        return false;
+    }
+    if a.ip() == b.ip() {
+        return true;
+    }
+
+    // An IPv6 wildcard commonly accepts IPv4 too unless IPV6_V6ONLY is set;
+    // reject that platform-dependent collision conservatively. An IPv4
+    // wildcard does not, however, own a specific IPv6 address.
+    (a.ip().is_unspecified() && (a.is_ipv6() || b.is_ipv4()))
+        || (b.ip().is_unspecified() && (b.is_ipv6() || a.is_ipv4()))
 }
 
 fn validate_tracing(cfg: &Config) -> Result<()> {
@@ -678,6 +710,50 @@ origin:
     }
 
     #[test]
+    fn the_admin_listener_may_not_hide_under_a_wildcard_traffic_listener() {
+        let e = validate(&parse(&format!(
+            "{BASE}server:\n  listen: \"0.0.0.0:9091\"\ntelemetry:\n  admin:\n    listen: \"127.0.0.1:9091\"\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("server.listen"), "{e}");
+    }
+
+    #[test]
+    fn a_wildcard_admin_listener_may_not_cover_a_specific_metrics_listener() {
+        let e = validate(&parse(&format!(
+            "{BASE}telemetry:\n  prometheus:\n    listen: \"127.0.0.1:9090\"\n  admin:\n    listen: \"0.0.0.0:9090\"\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("telemetry.prometheus.listen"), "{e}");
+    }
+
+    #[test]
+    fn an_ipv4_wildcard_does_not_claim_a_specific_ipv6_address() {
+        let cfg = parse(&format!(
+            "{BASE}server:\n  listen: \"0.0.0.0:9091\"\ntelemetry:\n  admin:\n    listen: \"[::1]:9091\"\n"
+        ));
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn an_ipv6_wildcard_is_conservatively_treated_as_dual_stack() {
+        let e = validate(&parse(&format!(
+            "{BASE}server:\n  listen: \"[::]:9091\"\ntelemetry:\n  admin:\n    listen: \"127.0.0.1:9091\"\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("server.listen"), "{e}");
+    }
+
+    #[test]
+    fn strict_upstream_readiness_requires_an_active_health_check() {
+        let e = validate(&parse(&format!(
+            "{BASE}telemetry:\n  admin:\n    listen: \"127.0.0.1:9091\"\n    require_healthy_upstream: true\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("no health check"), "{e}");
+    }
+
+    #[test]
     fn a_malformed_admin_address_is_refused() {
         assert!(
             validate(&parse(&format!(
@@ -816,6 +892,7 @@ server:
         let cfg = parse(BASE);
         validate(&cfg).unwrap();
         assert!(cfg.server.trusted_proxies.from.is_empty());
+        assert_eq!(cfg.telemetry.tracing.trust_incoming, TrustIncoming::Never);
     }
 
     #[test]

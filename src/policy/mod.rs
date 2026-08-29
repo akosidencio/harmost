@@ -40,10 +40,15 @@ pub struct PolicySnapshot {
     pub routes: Vec<ResolvedRoute>,
     pub config: Config,
     pub generation: u64,
+    /// Stable for the effective configuration, independent of how many times a
+    /// particular process has reloaded it. Kept below 2^53 so Prometheus can
+    /// represent the integer exactly in its floating-point sample format.
+    pub fingerprint: u64,
 }
 
 impl PolicySnapshot {
     pub fn build(config: Config, generation: u64) -> Result<Arc<Self>, MatcherError> {
+        let fingerprint = config_fingerprint(&config);
         let routes = config
             .routes
             .iter()
@@ -59,6 +64,7 @@ impl PolicySnapshot {
             routes,
             config,
             generation,
+            fingerprint,
         }))
     }
 
@@ -84,6 +90,21 @@ impl PolicySnapshot {
             .map(|d| d.as_duration())
             .unwrap_or_else(|| self.config.timeouts.origin.as_duration())
     }
+}
+
+/// Fingerprint the fully defaulted, effective configuration rather than the
+/// source YAML. Comments and formatting therefore do not create false fleet
+/// drift, while any value Harmost actually reads changes the input.
+fn config_fingerprint(config: &Config) -> u64 {
+    let rendered = format!("{config:#?}");
+    // FNV-1a is deterministic, tiny, and sufficient here: config is trusted
+    // input and this value detects drift; it is not an authentication tag.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in rendered.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash & ((1u64 << 53) - 1)
 }
 
 #[cfg(test)]
@@ -131,6 +152,18 @@ routes:
             s.resolve("h", "/anything-else", &Method::GET).unwrap().id,
             "catchall"
         );
+    }
+
+    #[test]
+    fn fingerprint_tracks_effective_config_not_reload_count() {
+        let one = snapshot(YAML);
+        let same = PolicySnapshot::build(one.config.clone(), 99).unwrap();
+        assert_eq!(one.fingerprint, same.fingerprint);
+
+        let mut changed = one.config.clone();
+        changed.debug_headers = !changed.debug_headers;
+        let changed = PolicySnapshot::build(changed, 1).unwrap();
+        assert_ne!(one.fingerprint, changed.fingerprint);
     }
 
     #[test]

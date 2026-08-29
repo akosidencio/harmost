@@ -45,21 +45,13 @@ classification, cache-key and shareability rules, and bounded origin admission.
 
 ## Project maturity and expectations
 
-**Harmost has not been run in production, by anyone, ever.** It has no
-production users and no third-party security review. There is now a
-[threat model](./docs/THREAT-MODEL.md) and a
-[twenty-second adversarial suite](./bench/adversarial.sh) in CI, which is a
-smoke test rather than a campaign — and the threat model is the author's own
-analysis, which is exactly the thing a threat model is least able to check about
-itself.
-
-There is also now a [soak](./bench/soak.sh), a
-[memory-pressure test](./bench/memory.sh), a [restart test](./bench/upgrade.sh)
-and a [chaos test](./bench/chaos.sh), all of which assert rather than report.
-They are synthetic load against a local fixture origin. They can find a leak, a
-permit that is never returned, a budget that is not a budget and a restart that
-drops requests — and they have found several. They cannot tell you how this
-behaves against real traffic on a real network, and no amount of them will.
+**Treat it as a working prototype with a serious test suite.** There is a
+[threat model](./docs/THREAT-MODEL.md), an
+[adversarial suite](./bench/adversarial.sh) in CI, and a
+[soak](./bench/soak.sh), [memory-pressure](./bench/memory.sh),
+[restart](./bench/upgrade.sh) and [chaos](./bench/chaos.sh) test that assert
+rather than report — and have found real bugs. All of it is synthetic load
+against a local fixture origin.
 
 Reference documentation:
 
@@ -67,51 +59,40 @@ Reference documentation:
 |---|---|
 | [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | Running it: readiness, drain, restart, systemd, Kubernetes, what to alert on |
 | [`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md) | Schema versioning, what may change without a bump, migration notes |
-| [`docs/BUILDING.md`](./docs/BUILDING.md) | Building, verifying a release, reproducible builds — and what is *not* reproducible |
 | [`docs/RELEASE-GATES.md`](./docs/RELEASE-GATES.md) | What has to pass before a tag, and what is deliberately not gated |
 | [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) | What is protected, from whom, and what is not defended |
 | [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) | A brief for the independent review that has not yet happened |
 | [`ops/`](./ops) | Example Prometheus alerts and a Grafana dashboard |
+| [`CHANGELOG.md`](./CHANGELOG.md) | What changed in each release, and what to do when upgrading |
 
 Everything described below as a benefit is a **design goal supported by local
-tests**, not an outcome observed under real traffic. The focused benchmarks use
-a deterministic origin that `sleep`s instead of rendering; a separate Docker
-scenario runs one Harmost process against three real Next.js standalone
-origins. Together they demonstrate the mechanisms and framework protocol
-handling, but they do not predict production traffic, networks or attackers.
-
-Treat it as a working prototype with a serious test suite. If you deploy it, do
-so behind something you can fail back to, and read
+tests**, not an outcome observed under real traffic. If you deploy it, do so
+behind something you can fail back to, and read
 [Slow readers and render capacity](#slow-readers-and-render-capacity) and
 [Roadmap](#roadmap) for the parts that are known to be incomplete.
 
 ## Contents
 
-- [Project maturity and expectations](#project-maturity-and-expectations)
-- [The problem](#the-problem)
-- [Why Harmost exists](#why-harmost-exists)
-- [Is Harmost for you?](#is-harmost-for-you)
-- [Intended benefits](#intended-benefits)
-- [What Harmost does](#what-harmost-does)
-- [How Harmost works](#how-harmost-works)
-- [Why use Harmost instead of a standard reverse-proxy cache?](#why-use-harmost-instead-of-a-standard-reverse-proxy-cache)
-- [Admission control benchmark](#admission-control-benchmark)
-- [Request coalescing benchmark](#request-coalescing-benchmark)
-- [Streaming coalescing benchmark](#streaming-coalescing-benchmark)
-- [Private-response safety check](#private-response-safety-check)
-- [Quick start](#quick-start)
-- [Installation](#installation)
-- [Using Harmost with Next.js](#using-harmost-with-nextjs)
-- [Project status](#project-status)
-- [Roadmap](#roadmap)
-- [Design principles](#design-principles)
-- [Operating Harmost](#operating-harmost)
-- [Slow readers and render capacity](#slow-readers-and-render-capacity)
-- [Request coalescing and microcache architecture](#request-coalescing-and-microcache-architecture)
-- [Next.js caching and cache-key design](#nextjs-caching-and-cache-key-design)
-- [Configuration](#configuration)
-- [Security](#security)
-- [License](#license)
+**Using it**
+[Quick start](#quick-start) ·
+[Installation](#installation) ·
+[Using Harmost with Next.js](#using-harmost-with-nextjs) ·
+[Configuration](#configuration) ·
+[Operating Harmost](#operating-harmost)
+
+**Understanding it**
+[The problem](#the-problem) ·
+[Is Harmost for you?](#is-harmost-for-you) ·
+[What Harmost does](#what-harmost-does) ·
+[Benchmarks](#benchmarks) ·
+[Design and internals](#design-and-internals)
+
+**Where it stands**
+[Project maturity](#project-maturity-and-expectations) ·
+[Project status](#project-status) ·
+[Current limitations and non-goals](#current-limitations-and-non-goals) ·
+[Roadmap](#roadmap) ·
+[Security](#security)
 
 ## The problem
 
@@ -144,7 +125,7 @@ Conventional protection is a poor fit for this shape:
 - **Autoscaling** reacts on the order of tens of seconds. A traffic spike arrives
   in one.
 
-## Why Harmost exists
+### Why Harmost exists
 
 Because the useful unit to bound is *origin work*, not requests, and few
 off-the-shelf proxy configurations combine per-route work limits, a bounded
@@ -155,7 +136,7 @@ Traffic Server have done it for years. Harmost's argument is the other half:
 duplicate work is reused *first*, and whatever genuinely has to reach the origin
 then passes through admission control that can say no.
 
-### Scope: Next.js today, framework-agnostic by design
+#### Scope: Next.js today, framework-agnostic by design
 
 Harmost's policy contract — routes, work classes, cache keys, shareability
 rules — does not assume a framework. Next.js is the first and only supported
@@ -228,7 +209,7 @@ is what makes running fewer pods a considered decision rather than a gamble.
 The cost side deserves the same scrutiny. Harmost is another process in your
 request path, another configuration to maintain and another failure mode to
 understand, and today it is
-[unproven software](#project-maturity-and-expectations). For a small
+unproven software. For a small
 deployment, adding a pod or putting a CDN in front is sometimes simply the
 better trade.
 
@@ -236,25 +217,6 @@ If you want to know where you stand before installing anything, the useful
 measurements are your origin's **peak concurrent in-flight requests** and your
 **render latency** — not requests per day. Their product against your pod count
 is the number Harmost exists to bound.
-
-## Intended benefits
-
-Stated as goals, for the reasons in
-[Project maturity](#project-maturity-and-expectations). Each links to the
-benchmark that demonstrates the mechanism locally.
-
-| Goal | Mechanism | Demonstrated by |
-| --- | --- | --- |
-| One Harmost process never admits more render work than its configured ceilings | Global and per-route concurrency limits with bounded queues | [`bench/demo.sh`](#admission-control-benchmark) |
-| A burst on one URL costs one render, not thousands | Request coalescing on the cache lock | [`bench/coalesce.sh`](#request-coalescing-benchmark) |
-| Collapsing does not destroy streaming | Waiters attach to the in-flight write | [`bench/stream.sh`](#streaming-coalescing-benchmark) |
-| Overload degrades predictably instead of collapsing | Bounded queues, deadlines, stale-or-shed | [`bench/demo.sh`](#admission-control-benchmark) |
-| Authorization-bearing requests and `Set-Cookie` responses are never shared | Absolute request/response barriers | [`bench/safety.sh`](#private-response-safety-check) |
-| A slow client cannot make Harmost release render capacity early | Permits remain held until observed origin end-of-stream; downstream writes have a timeout | [`bench/slowclient.sh`](#slow-readers-and-render-capacity) |
-
-What Harmost explicitly does **not** promise: lower latency. Bounding
-concurrency makes a burst slower on purpose — see the wall-clock discussion in
-[Why use Harmost](#why-use-harmost-instead-of-a-standard-reverse-proxy-cache).
 
 ## What Harmost does
 
@@ -303,7 +265,7 @@ it. NGINX is not mandatory specifically—a CDN, cloud load balancer or Kubernet
 ingress can fill that role. For local development or a trusted private network
 using cleartext HTTP, clients can connect directly to Harmost.
 
-## How Harmost works
+### How Harmost works
 
 ![Animated diagram showing how Harmost classifies requests, reuses cached or in-flight responses, bounds cache misses, and protects the SSR origin](./assets/harmost-flow.svg)
 
@@ -314,20 +276,44 @@ receives an eligible stale response or is shed when the queue is full or its
 deadline expires. Every origin response is checked again before it can be
 shared or stored.
 
-## Why use Harmost instead of a standard reverse-proxy cache?
+### Why use Harmost instead of a standard reverse-proxy cache?
 
-Request collapsing is not new — Varnish, `proxy_cache_lock`, Fastly and Apache
-Traffic Server have all done it for years, and forty lines of `nginx.conf` will
-collapse a thousand concurrent hits on one URL down to a single origin request.
-
-Harmost's intended distinction is the combination: reuse equivalent work
+Forty lines of `nginx.conf` will collapse a thousand concurrent hits on one URL
+down to a single origin request. Harmost's intended distinction is the
+combination: reuse equivalent work
 before applying per-route and global render ceilings, then use bounded queues
 and stale-or-shed overload handling. Similar pieces exist elsewhere; Harmost
 packages them around SSR work as one policy pipeline.
 
 So the demo that matters is not the cacheable one.
 
-## Admission control benchmark
+### Intended benefits
+
+Stated as goals, for the reasons in
+[Project maturity](#project-maturity-and-expectations). Each links to the
+benchmark that demonstrates the mechanism locally.
+
+| Goal | Mechanism | Demonstrated by |
+| --- | --- | --- |
+| One Harmost process never admits more render work than its configured ceilings | Global and per-route concurrency limits with bounded queues | [`bench/demo.sh`](#admission-control-benchmark) |
+| A burst on one URL costs one render, not thousands | Request coalescing on the cache lock | [`bench/coalesce.sh`](#request-coalescing-benchmark) |
+| Collapsing does not destroy streaming | Waiters attach to the in-flight write | [`bench/stream.sh`](#streaming-coalescing-benchmark) |
+| Overload degrades predictably instead of collapsing | Bounded queues, deadlines, stale-or-shed | [`bench/demo.sh`](#admission-control-benchmark) |
+| Authorization-bearing requests and `Set-Cookie` responses are never shared | Absolute request/response barriers | [`bench/safety.sh`](#private-response-safety-check) |
+| A slow client cannot make Harmost release render capacity early | Permits remain held until observed origin end-of-stream; downstream writes have a timeout | [`bench/slowclient.sh`](#slow-readers-and-render-capacity) |
+
+What Harmost explicitly does **not** promise: lower latency. Bounding
+concurrency makes a burst slower on purpose — see the wall-clock discussion in
+[Why use Harmost](#why-use-harmost-instead-of-a-standard-reverse-proxy-cache).
+
+## Benchmarks
+
+Each script starts a test origin and a proxy, runs load, asserts its own claim
+and exits non-zero when it fails, so each is a gate rather than a report. The
+numbers below are one machine's; see [Quick start](#quick-start) for how to run
+them and what the parameter block is for.
+
+### Admission control benchmark
 
 ```
 $ ./bench/demo.sh 60 1000
@@ -356,7 +342,7 @@ concurrency does not degrade linearly.
 
 Caching and coalescing are the bonus. Governing is the product.
 
-## Request coalescing benchmark
+### Request coalescing benchmark
 
 ```
 $ ./bench/coalesce.sh 100 1000
@@ -371,7 +357,7 @@ $ ./bench/coalesce.sh 100 1000
        1 MISS
 ```
 
-## Streaming coalescing benchmark
+### Streaming coalescing benchmark
 
 Collapsing is only worth having if waiters still receive bytes as the leader
 produces them. Otherwise every waiter but the leader trades a 1 ms first byte
@@ -398,7 +384,7 @@ its `/__stats` endpoint. It used to be derived by grepping the *proxy's* access
 log for upstream lines — measuring the component under test with an expression
 that silently returned `0` whenever the log format changed.
 
-## Private-response safety check
+### Private-response safety check
 
 Same route, same permissive config. This path answers with `Set-Cookie`:
 
@@ -479,17 +465,25 @@ origins, and makes machine-checked assertions across their combined traffic.
 behaviours a curl-written request cannot reach are the ones Next's own client
 constructs: a router prefetch carrying a real `Next-Router-State-Tree`, and a
 Server Action POST carrying an action id the build assigned. Neither setup
-predicts behaviour under real traffic — see
-[Project maturity](#project-maturity-and-expectations).
+predicts behaviour under real traffic.
 
 ## Installation
 
-Harmost is not on crates.io and there are no standalone release binaries.
+Harmost is not on crates.io. It targets Linux: the published image is
+`linux/amd64` and the release binary is `x86_64-unknown-linux-gnu`. There are
+no macOS or Windows artifacts.
 
 Tagged releases publish a `linux/amd64` container image to GitHub Packages at
 `ghcr.io/akosidencio/harmost`, built from the repository
 [`Dockerfile`](./Dockerfile). The same Dockerfile builds a local image for
-testing and as a base for deployment work.
+testing and as a base for deployment work. The image is the recommended way to
+run Harmost, and the one every topology below assumes unless it says otherwise.
+
+A release also attaches a single `x86_64-unknown-linux-gnu` binary, with a
+checksum for both the archive and the binary inside it. That exists for the one
+topology a container does not serve — the systemd unit in
+[`docs/OPERATIONS.md`](./docs/OPERATIONS.md), which runs
+`/usr/local/bin/harmost` directly.
 
 ```bash
 docker pull ghcr.io/akosidencio/harmost:<version>
@@ -528,10 +522,10 @@ The binary lands at `target/release/harmost`.
 `harmost check` exits non-zero on an invalid or unsafe configuration, so it
 works as a CI gate on a config change.
 
-Signals: `SIGHUP` reloads reloadable policy in place and `SIGTERM` asks Pingora
-for a graceful shutdown. Harmost does not yet expose Pingora's complete
-zero-downtime upgrade workflow, so do not treat `SIGQUIT` alone as an upgrade
-procedure.
+Signals: `SIGHUP` reloads reloadable policy in place; `SIGUSR1` enters drain
+without exiting; and `SIGTERM` automatically advertises not-ready for the
+configured drain window before Pingora stops its listeners. On Linux,
+`--upgrade` plus `SIGQUIT` performs Pingora's socket-handover workflow.
 
 **Listeners are cleartext unless you build with `--features tls` and configure
 `server.tls`.** A binary built without the feature *rejects* a config containing
@@ -864,612 +858,6 @@ The second pair is the ratio worth watching: `harmost_origin_requests_total`
 over `harmost_reuse_eligible_requests_total` is the share of eligible traffic
 that still reached the origin.
 
-## Project status
-
-**Not production ready.** Harmost is under active development and remains in an
-early validation, verification, and testing phase. It runs as a Pingora reverse
-proxy with experimental cache and request-coalescing integration, but it has
-not completed production hardening or operational validation.
-
-| Area | State |
-| --- | --- |
-| Config schema, units, validation | done, tested |
-| Route matching and policy snapshot | done, tested |
-| Request classification (generic + Next.js) | done, tested |
-| Cache key construction | done, tested |
-| Response shareability rules | done, tested |
-| Admission control, queueing, load shedding | done, tested |
-| Cache store | implemented with Pingora `Storage` ([spike](./spike/pingora-cache/FINDINGS.md)) |
-| Request coalescing | implemented with `pingora-cache` cache locks |
-| Pingora proxy layer | proxy, routing, admission, upstream selection wired |
-| Cache and coalescing wiring | implemented; experimental |
-| Prometheus metrics, JSON/text access logs | done |
-| Active health checks | done |
-| Graceful reload (SIGHUP) | done |
-| Stale-while-revalidate, stale-if-error | done |
-| Real Next.js fixture (App Router + Pages Router) | done; local Docker integration tested |
-| Browser-driven prefetch and Server Action checks | done (Chromium, [`bench/nextjs-browser.sh`](./bench/nextjs-browser.sh)) |
-| Property tests and fuzz targets | done ([`fuzz/`](./fuzz)); 7 targets run in CI |
-| HTTP/2 downstream (h2c and ALPN) and upstream | done, tested ([`bench/http2.sh`](./bench/http2.sh)) |
-| `HEAD`, `Range`, conditional requests, disconnects, malformed bodies | done, tested ([`bench/protocol.sh`](./bench/protocol.sh)) |
-| `Upgrade`/WebSocket proxying, bounded separately from renders | done, tested, off by default ([`bench/websocket.sh`](./bench/websocket.sh)) |
-| Native TLS, downstream and upstream (`--features tls`) | done, tested ([`bench/tls.sh`](./bench/tls.sh)); [Pingora labels its rustls backend experimental](https://github.com/cloudflare/pingora#feature-highlights), so external TLS termination remains recommended |
-| Trusted proxies, forwarded scheme and client IP | done, tested ([`bench/forwarded.sh`](./bench/forwarded.sh)) |
-| Bounded response spool | done, tested ([`bench/spool.sh`](./bench/spool.sh)) |
-| Threat model | [written](./docs/THREAT-MODEL.md); **not independently reviewed** |
-| Independent review of cache keys and shareability | **not obtained**; brief prepared at [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) |
-| Sustained adversarial testing | 20s in CI ([`bench/adversarial.sh`](./bench/adversarial.sh)); a smoke test, not a campaign |
-| Readiness, liveness and status endpoints | done, tested ([`bench/admin.sh`](./bench/admin.sh)) |
-| Drain state, `SIGUSR1`, graceful restart | done, tested ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
-| Pingora zero-downtime socket handover | done, tested — **Linux only**; `--upgrade` is refused elsewhere ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
-| W3C trace-context correlation | done, tested; unconditional ([`bench/tracing.sh`](./bench/tracing.sh)) |
-| OpenTelemetry span export | done, tested — OTLP/HTTP JSON, **plaintext only** ([`bench/tracing.sh`](./bench/tracing.sh)) |
-| Config schema version and migration notes | done ([`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md)) |
-| Soak, memory-pressure, restart and chaos tests | done ([`soak.sh`](./bench/soak.sh), [`memory.sh`](./bench/memory.sh), [`upgrade.sh`](./bench/upgrade.sh), [`chaos.sh`](./bench/chaos.sh)); CI-sized on every push, full size before a tag ([gates](./docs/RELEASE-GATES.md)) |
-| Example Prometheus alerts and Grafana dashboard | done ([`ops/`](./ops)) |
-| Release binaries, checksums, SBOM, reproducible builds | workflow written ([`docs/BUILDING.md`](./docs/BUILDING.md)); **no release has been cut yet**, so the reproducibility claim is untested by anyone but its author |
-| Circuit breaking, least-loaded balancing | not started ([roadmap](#roadmap)) |
-| Cache purge API | not started ([roadmap](#roadmap)) |
-
-The security- and correctness-sensitive parts — cache-key construction, response
-shareability, and bounded admission — remain isolated as testable logic beneath
-the Pingora proxy layer. The full workspace test suite (276 tests, including
-property tests over generated inputs) runs without external network services.
-
-"done, tested" means unit-tested and, where a `bench/` script exists, verified
-end to end against a local test origin. It does not mean production-validated;
-see [Project maturity](#project-maturity-and-expectations).
-
-Configuration options that are accepted but not yet implemented are rejected at
-startup rather than silently ignored, so a config can never claim a protection
-that is not running.
-
-## Roadmap
-
-Ordered by dependency and risk rather than novelty. Later phases depend on the
-evidence and safety work before them.
-
-### 0. Make the evidence trustworthy — done
-
-- **Benchmark harness.** [`bench/lib.sh`](./bench/lib.sh) tracks the exact pid
-  of every process it starts and allocates ports per run, replacing
-  `pkill -f target/debug/harmost` (which killed every Harmost on the machine)
-  and the hardcoded 3000/8080/9090. Readiness is polled rather than slept
-  through. Every script asserts and exits non-zero on failure — `reload.sh`
-  previously printed log lines and checked nothing, and now proves the new
-  ceiling took effect by measuring the origin's peak concurrency after the
-  reload rather than trusting the "config reloaded" message. `stream.sh`
-  counted renders by grepping the proxy's own access log, an expression that
-  returned `0` whenever the log format changed; both it and every other script
-  now read the fixture origin's own `/__stats` counter.
-- **Framework coverage.** The fixture serves a Pages Router surface alongside
-  the App Router, and `nextjs.sh` asserts across both: `getServerSideProps`
-  coalescing, the `/_next/data/<buildId>/…json` payload keyed apart from its
-  own document, and the `Set-Cookie` barrier holding on the legacy path.
-  [`bench/nextjs-browser.sh`](./bench/nextjs-browser.sh) drives the same stack
-  with Chromium for the two requests curl cannot construct — a real router
-  prefetch and a real Server Action form submission.
-- **CI.** Linux runs fmt, clippy, the test suite, the end-to-end benchmarks and
-  the containerised Next.js proof; macOS builds and runs the unit tests.
-  Benchmark results are published as an artifact together with the parameters
-  and the machine that produced them.
-- **Property tests and fuzz targets.** Proptest covers cache-key
-  canonicalisation, `Cache-Control`, `Vary`, cookies and malformed HTTP
-  metadata; six [fuzz targets](./fuzz/fuzz_targets) ran in CI at the time (a
-  seventh, covering forwarded-header resolution, arrived with phase 1).
-
-That last item found two real bugs, which is the point of the phase:
-
-- **`HeaderValue::to_str` refuses obs-text that `HeaderValue` accepts**, and
-  every caller dropped the value on failure. One non-ASCII byte in an unrelated
-  cookie hid every cookie in the header — including `__prerender_bypass`, so a
-  Next.js draft-mode render was cached and served publicly while Next itself,
-  parsing the same header from bytes, honoured the cookie. The same pattern
-  made an unreadable `Next-Action` classify as a document (a mutation becomes
-  cacheable), an unreadable prefetch header make a near-unbounded key space
-  storable, and any variant header value that was not ASCII collapse to
-  "header absent", sharing one entry between clients that asked for different
-  things. Cookie lookup is now compared on bytes, presence checks no longer
-  read the value, and header values reach the key through a lossless encoding.
-- **The cache key rendered `deployment: None` and `deployment: Some("")`
-  identically.** Two structurally distinct keys shared one entry.
-
-The key's canonical encoding is now length-prefixed rather than merely
-separator-delimited, so its injectivity is a property of the function rather
-than of `http`'s input validation — asserted by a property test that fails
-against the old encoding.
-
-### 1. Close protocol and security gaps — done, with one item outstanding
-
-- **HTTP/2, downstream and upstream.** `server.h2c` accepts cleartext HTTP/2 on
-  the ordinary listener (Pingora peeks for the preface, so HTTP/1.1 clients are
-  unaffected); `server.tls.h2` offers `h2` over ALPN; `origin.http_version`
-  chooses what Harmost speaks to the origin.
-  [`bench/http2.sh`](./bench/http2.sh) exercises both ends by chaining two
-  Harmost processes, and checks that the governor's own rules survive the
-  protocol change rather than only that bytes move.
-- **`HEAD`, `Range`, conditional requests, disconnects, malformed bodies.**
-  Fourteen assertions in [`bench/protocol.sh`](./bench/protocol.sh), each
-  checking the *later, ordinary* request rather than the odd one: that a `GET`
-  after a `HEAD` still has a body, that a `206` was not stored under the
-  document's key, that a revalidation costs no origin render, that a truncated
-  or unterminated body is never promoted to a complete entry, and that six
-  clients hanging up mid-render leak no capacity against a ceiling of one.
-- **`Upgrade`/WebSocket.** Off by default and answered `501` when off. When on,
-  an upgrade takes `upgrade.max_concurrent` rather than a render permit, and is
-  never cached or coalesced. [`bench/websocket.sh`](./bench/websocket.sh) drives
-  a real RFC 6455 handshake — the fixture computes `Sec-WebSocket-Accept`
-  properly, so a proxy answering `101` on its own would fail — and renders a
-  page with every socket held open against a render ceiling of one.
-- **TLS and trusted proxies.** `--features tls` builds rustls termination
-  (`server.tls`) and origin TLS (`origin.tls`); rustls rather than
-  boringssl/openssl so the build needs no cmake, Go or system OpenSSL headers.
-  `server.trusted_proxies` gates every forwarded header behind the connection
-  peer's address, trusts nobody by default, and walks the hop chain from the
-  right. [`bench/tls.sh`](./bench/tls.sh) and
-  [`bench/forwarded.sh`](./bench/forwarded.sh).
-- **A bounded response spool.** `spool.enabled` closes the gap this README has
-  described since the first release: capacity now returns when the origin
-  finishes rather than when the client finishes reading. See
-  [Slow readers and render capacity](#slow-readers-and-render-capacity) for the
-  measurement and the trade-off it makes.
-- **Threat model and adversarial testing.**
-  [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) states what is protected,
-  from whom, by which mechanism, and — at equal length — what is deliberately
-  not defended. [`bench/adversarial.sh`](./bench/adversarial.sh) runs every
-  mechanism at once under sustained hostile traffic and asserts four properties
-  afterwards: the ceiling held, nothing private was shared, memory stayed inside
-  its budget, and nothing panicked.
-
-**Still outstanding: the independent review.** Obtaining a third-party review of
-cache-key construction and response shareability is not something the author can
-complete alone. [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) is
-written to make one cheap: eleven falsifiable claims, the attacks already tried
-so a reviewer does not repeat them, and the author's own assessment of where the
-design is weakest. Until someone takes it up, this phase is incomplete and the
-project status table says so.
-
-Three bugs this phase found, all fixed, all with regression tests verified to
-fail against the previous code:
-
-- **Over HTTP/2 the cache key had no host.** There is no `Host` header in
-  HTTP/2; the authority is the `:authority` pseudo-header, which Pingora
-  surfaces on the URI. Reading `Host` alone gave every h2 request an empty host
-  and merged **every virtual host on the listener into one cache entry** — a
-  cross-tenant response leak that appears the day `server.h2c` or `server.tls`
-  is switched on and is invisible before then. Found while writing
-  [`bench/http2.sh`](./bench/http2.sh), which fails against the old code with
-  two authorities at one path costing one origin render instead of two.
-- **`X-Forwarded-For` was appended to, not replaced.** Whatever the client sent
-  was kept and the observed peer added to the end, so an origin reading the
-  first entry — where every framework's `getClientIp` looks — read a value the
-  client chose. Since the origin's rate limits and audit logs are downstream of
-  that, it was a forged identity with real effects.
-- **`X-Forwarded-Proto` was hardcoded to `http`,** and the cache key's scheme
-  with it. Correct while Harmost only ever spoke cleartext; wrong the moment it
-  terminates TLS, and the symptom is a plaintext response served to a client
-  that asked for TLS.
-
-And one limitation of the dependency, refused rather than papered over:
-**`origin.tls.ca` is rejected at startup.** Pingora 0.8's rustls connector never
-reads the per-peer CA store — its `connect` path carries an explicit `TODO` and
-`peer.get_ca()` is unused — so accepting the key would mean a config naming a
-CA, a proxy verifying against the system roots, and no way to tell from outside.
-Use `SSL_CERT_FILE` / `SSL_CERT_DIR`, which the platform store does honour.
-
-### 2. Become operable as a service — done, with two items outstanding
-
-- **Release artifacts.** The release workflow builds versioned binaries for
-  Linux and macOS, publishes a `SHA256SUMS` covering every archive, generates a
-  CycloneDX SBOM, and pushes an OCI image with provenance and its own SBOM
-  attached as attestations. [`docs/BUILDING.md`](./docs/BUILDING.md) documents
-  how to reproduce a Linux binary from a tag — and is equally explicit about
-  what is *not* reproducible and why: the `.tar.gz` archives (gzip stores an
-  mtime), the image digest, and the macOS builds.
-- **Readiness and status endpoints.** `telemetry.admin` serves
-  `/health/live`, `/health/ready` and `/status` on a listener of their own,
-  reporting configuration generation, per-backend health, cache and spool
-  occupancy, admission limits and drain state. Nothing on that surface is
-  parameterised: there is no path, query or header a client can vary to change
-  what is computed, which is the same rule the metrics labels follow. Startup
-  refuses to share the address with the traffic or metrics listener.
-- **OpenTelemetry and correlation.** Correlation is unconditional — every
-  request gets a W3C trace id and span id, both go on every access log line,
-  and the id Harmost concluded is what reaches the origin as `traceparent`.
-  Span export is configuration: two spans per sampled request, a server span
-  and a nested origin-fetch span, over OTLP/HTTP.
-- **Zero-downtime upgrade and drain.** `--upgrade` performs Pingora's socket
-  handover; `--test` is the pre-flight that proves a new binary can start
-  before the old one is signalled; `SIGUSR1` drains without exiting, for a
-  Kubernetes `preStop` hook. [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) has
-  working systemd and Kubernetes definitions with the timeout arithmetic
-  spelled out.
-- **Configuration schema versioning.** `version:` is checked against a
-  constant and a file naming an unknown version is refused with both numbers
-  in the message. [`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md) states
-  what may change without a bump, what may not, and the migration notes.
-- **Soak, memory-pressure, restart and chaos tests.**
-  [`soak.sh`](./bench/soak.sh) watches for leaks, held permits and a cache that
-  outgrows its budget; [`memory.sh`](./bench/memory.sh) drives every configured
-  budget past its limit and measures RSS; [`upgrade.sh`](./bench/upgrade.sh)
-  covers both restart mechanisms; [`chaos.sh`](./bench/chaos.sh) removes every
-  backend under load. All four run CI-sized on every push and full-size before
-  a tag — [`docs/RELEASE-GATES.md`](./docs/RELEASE-GATES.md). Example alerts
-  and a dashboard are in [`ops/`](./ops).
-
-**Two things are outstanding, and neither can be closed by writing more code.**
-
-First, **no release has actually been cut**. The workflow exists and its steps
-are individually exercised, but "the artifacts verify" is a claim nobody has
-tested end to end, including the author. Until a tag has been pushed and a
-downloaded binary reproduced from source, treat
-[`docs/BUILDING.md`](./docs/BUILDING.md) as a specification rather than a
-report.
-
-Second, **the socket handover is Linux-only, and that is a property of the
-dependency**. Pingora passes listening descriptors with `SCM_RIGHTS`; its
-non-Linux `get_fds_from` is a stub that returns `ECONNREFUSED`. Harmost refuses
-`--upgrade` off Linux rather than letting that surface as a connection error
-that reads like a missing peer, and [`bench/upgrade.sh`](./bench/upgrade.sh)
-asserts the drain-based restart there instead — but it does not claim zero
-dropped requests on a platform that cannot deliver it.
-
-Three non-obvious findings from this phase, all measured rather than assumed:
-
-- **`shutdown_timeout` is a floor, not a ceiling.** Pingora ends a shutdown
-  with `Runtime::shutdown_timeout`, and its listener tasks are parked in
-  `accept` rather than watching for the signal, so the wait runs to completion
-  **whether or not anything is in flight**. A `SIGTERM` costs about
-  `drain_period + shutdown_timeout` on a completely idle process. The former
-  30-second default therefore made every restart take 35 seconds and put the
-  process past Kubernetes' default 30-second termination grace period — where
-  it is `SIGKILL`ed mid-drain, dropping exactly the requests the drain existed
-  to protect. The defaults are now 5s + 10s, `harmost check` prints the sum,
-  and `bench/upgrade.sh` asserts it from both sides.
-- **Route limiters were created lazily, on a route's first request.** So
-  `/status` reported no route limits at all until traffic arrived — the first
-  thing an operator checks after a deploy said the policy they had just
-  shipped was not there. They are now built at startup, as reload already did.
-- **The benchmark fixture minted colliding session ids.** `user-{seq}` was a
-  per-process counter, so two backends — or one restarted mid-test — produce
-  the same ids, and a benchmark counting distinct sessions reads a fixture
-  collision as a shared response. Wrong in the dangerous direction: it can
-  manufacture a failure, or mask a real one by making the count noisy enough
-  to be given slack. Ids now carry a per-process instance identifier.
-
-And one dependency limitation refused rather than papered over: **the OTLP
-exporter is plaintext-only, and an `https://` endpoint is rejected at
-startup.** The exporter is hand-written — the alternative was a gRPC or
-`reqwest` stack larger than the rest of this binary — so it does not implement
-TLS. Accepting an `https` URL and speaking cleartext to it would be the same
-class of failure as a config naming a CA that is never read. Run a collector
-as a sidecar.
-
-### 3. Improve origin resilience
-
-- Add passive failure observation, per-backend circuit breakers and outlier
-  ejection alongside active health checks.
-- Add retry budgets for eligible idempotent requests only; never retry
-  mutations blindly.
-- Add least-loaded selection using in-flight work and latency observations.
-- Add weighted admission, route priorities and reserved capacity so a slow,
-  expensive route cannot starve cheap critical work.
-
-### 4. Complete cache lifecycle and framework integration
-
-- Add a purge API and cache tags, including deployment-safe invalidation and a
-  path from Next.js `revalidateTag()`/`revalidatePath()` events.
-- Replace FIFO eviction with a measured production policy and evaluate optional
-  disk or external storage without making it required for admission control.
-- Build a versioned `@harmost/next` integration that exports route hints,
-  deployment ids and invalidation events; maintain a tested Next.js
-  compatibility matrix.
-- Add adapters only after the generic policy contract is stable, starting with
-  frameworks that expose reliable route and privacy metadata.
-
-### 5. Adapt and scale deliberately
-
-- Evaluate adaptive concurrency only after latency and failure signals are
-  trustworthy; retain hard operator-defined ceilings as safety rails.
-- Define a multi-instance capacity model so replicas cannot accidentally
-  multiply the intended origin ceiling.
-- Keep distributed coalescing optional. Path-stable ingress routing remains the
-  simpler default; a distributed lock is justified only by measured need.
-
-### Current limitations and non-goals
-
-- **On a route without `spool.enabled`, a slow reader still delays observed
-  origin end-of-stream and occupies a render slot,** bounded only by
-  `timeouts.downstream_write`. The spool fixes this and is off by default
-  because it costs progressive rendering; see
-  [Slow readers and render capacity](#slow-readers-and-render-capacity).
-- Cache, coalescing and admission state are process-local. Replicas multiply
-  origin ceilings unless their limits are partitioned, and one key can render
-  once per replica.
-- The only cache backend is bounded in-process memory. Restarting clears it,
-  and FIFO eviction is intentionally simple rather than production-tuned. There
-  is no purge API, so an entry that turns out to be wrong can only be waited out.
-- **There is no rate limiting of any kind.** Harmost bounds origin *work*, not
-  bytes, connections per source, or requests per second. Keep an edge in front.
-- **The zero-downtime socket handover only works on Linux.** Pingora's fd
-  transfer is Linux-only; `--upgrade` is refused elsewhere with an explanation.
-  The drain-based restart in [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) works
-  everywhere but relies on a load balancer to cover the gap between the old
-  process exiting and the new one binding.
-- **A `SIGTERM` costs `drain_period + shutdown_timeout` even when nothing is in
-  flight**, because Pingora's shutdown waits out its timeout rather than
-  finishing early. Size your supervisor's stop timeout above that sum.
-- **The OTLP exporter is plaintext-only.** It is hand-written to avoid a gRPC
-  or HTTP-client dependency tree larger than the rest of the binary, and an
-  `https://` endpoint is refused at startup rather than silently downgraded.
-  Run an OpenTelemetry Collector as a sidecar.
-- **No release has been cut yet.** The release workflow, checksums, SBOM and
-  reproducible-build instructions are written but unexercised end to end.
-- `origin.tls.ca` is rejected: Pingora 0.8's rustls connector does not read a
-  per-peer CA store. Use `SSL_CERT_FILE` / `SSL_CERT_DIR`.
-- Several settings are startup-bound and a SIGHUP reload **refuses** rather than
-  silently ignores them: listeners, TLS, `trusted_proxies`, `origin.http_version`,
-  `spool.max_memory`, `upgrade.max_concurrent`, the cache budget and
-  `timeouts.origin`.
-- `serde_yaml`, which is deprecated, still enters the dependency tree through
-  `pingora-core`'s own config parsing. Harmost's config is parsed with
-  `serde-saphyr`.
-
-## Design principles
-
-**Uncertain means pass through.** If Harmost cannot prove a response is safe to
-share, it does not share it. A higher hit ratio is never worth a wrong response.
-
-**Reuse before admission.** Cache hits and coalescing waiters consume no origin
-capacity, so they must never queue for it.
-
-**Shareability is a property of the response, not the request.** A route that
-looks public can still answer with a `Set-Cookie`. That check is absolute and no
-configuration reaches past it.
-
-**The cache is optional.** With `cache.enabled: false` you still get bounded
-concurrency, bounded queues, load shedding, health-aware balancing and the
-metrics. If the caching half were removed entirely this would still be worth
-running.
-
-**A permit models observable origin work.** Origin capacity is returned only
-when Pingora observes upstream end-of-stream. A `Content-Length` is not proof
-that generation has finished, so headers alone never release capacity.
-
-## Operating Harmost
-
-Full procedures — systemd and Kubernetes definitions, the restart sequences,
-the timeout arithmetic — are in [`docs/OPERATIONS.md`](./docs/OPERATIONS.md).
-The short version:
-
-### Is this instance healthy?
-
-```yaml
-telemetry:
-  admin:
-    listen: "127.0.0.1:9091"
-```
-
-| Endpoint | Answers |
-|---|---|
-| `GET /health/live` | `200` while the process is running. Never anything else. |
-| `GET /health/ready` | `200` when this instance should receive traffic, `503` while draining. |
-| `GET /status` | Configuration generation, per-backend health, cache and spool occupancy, admission limits, drain state, compiled features. |
-
-Bind it privately. `/status` publishes your backend health and configuration
-generation, and startup refuses to put it on the traffic listener's address.
-
-**Liveness is not readiness.** A draining instance answers `200` on
-`/health/live` and `503` on `/health/ready`; pointing a liveness probe at the
-readiness endpoint makes an orchestrator kill the process mid-drain.
-
-### Restarting without dropping requests
-
-```bash
-# Prove the new binary and config can start, before touching the running one.
-harmost run --config /etc/harmost/harmost.yaml --test
-
-# Linux: hand the listening sockets over, then let the old process drain.
-harmost run --config /etc/harmost/harmost.yaml --upgrade &
-kill -QUIT "$(cat /run/harmost/harmost.pid)"
-
-# Anywhere: drain first so the balancer withdraws this instance, then stop.
-kill -USR1 "$(cat /run/harmost/harmost.pid)"   # readiness fails; still serving
-sleep 15                                        # let the balancer notice
-kill -TERM "$(cat /run/harmost/harmost.pid)"
-```
-
-`SIGUSR1` drains **without exiting** — that is the point, and it is what a
-Kubernetes `preStop` hook should send.
-
-**Budget `drain_period + shutdown_timeout` for every stop.** Pingora's shutdown
-waits out its timeout whether or not anything is in flight, so with the
-defaults a `SIGTERM` takes about fifteen seconds on an idle process.
-`harmost check` prints the number and warns when it exceeds Kubernetes'
-default grace period.
-
-### Following a request through
-
-Correlation costs nothing and is always on. Every access log line carries a
-`trace_id` and `span_id`, and the id Harmost concluded is the one it forwards
-to the origin as `traceparent` — so a Harmost log line and an origin log line
-for the same request join, even when the origin has never heard of Harmost.
-
-```json
-{"method":"GET","path":"/products/iphone","route":"product-pages","class":"public_document",
- "cache":"hit","upstream":"next-1:3000","client":"203.0.113.7","scheme":"https",
- "permit_released":"origin_end","spool":"complete",
- "trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7",
- "status":200,"shed":false,"origin_ms":0,"total_ms":3,
- "trace_continued":true,"generation":3}
-```
-
-Exporting spans is separate configuration, and sampled — two spans per request,
-a server span and a nested origin-fetch span, so an origin-latency number has
-something to hang off:
-
-```yaml
-telemetry:
-  tracing:
-    sample: { mode: parent_or_ratio, one_in: 20 }
-    otlp:
-      endpoint: "http://127.0.0.1:4318/v1/traces"
-```
-
-An inbound `traceparent` is treated exactly like `X-Forwarded-For`: believed
-from a peer in `server.trusted_proxies`, ignored from anyone else. Ignoring one
-never costs the request — Harmost simply starts a fresh trace.
-
-**Telemetry is never load-bearing.** The span queue is bounded and full means
-drop; recording is a non-blocking `try_send`; an export failure is counted and
-logged. [`bench/tracing.sh`](./bench/tracing.sh) kills the collector and then
-asserts that fifteen requests still complete promptly.
-
-### Alerts and dashboards
-
-[`ops/prometheus/alerts.yml`](./ops/prometheus/alerts.yml) and
-[`ops/grafana/dashboard.json`](./ops/grafana/dashboard.json). The four signals
-worth understanding before an incident:
-
-| Signal | Means |
-|---|---|
-| `harmost_admission_total{decision=~"shed_.*"}` rising | The ceiling is being hit. Harmost working, and users seeing `503`. Look at origin latency before raising it. |
-| `harmost_origin_in_flight` at `harmost_concurrency_limit` | Saturated. |
-| `harmost_upstream_healthy == 0` | No backend is passing. Harmost still serves, on `stale_if_error`. |
-| `harmost_draining == 1` for longer than a deploy | An instance drained and was never replaced. |
-
-## Slow readers and render capacity
-
-An origin work permit is meant to model *render* capacity: hold one while the
-origin is producing a response, hand it back when the origin has finished.
-Getting the second half right is harder than it sounds.
-
-Pingora's proxy loop pairs each upstream read with a downstream write through a
-four-slot channel, so the origin can never run more than a few chunks ahead of
-the client. A client reading a 4 MiB page a kilobyte at a time therefore keeps
-that pairing alive, and upstream end-of-stream — the only honest signal that the
-origin stopped rendering — does not arrive until the client is done. The permit
-is held for the client's reading time rather than the origin's rendering time.
-Measured on this codebase: a 1 MiB body returned capacity in 91 ms, while a
-2 MiB body against a rate-limited reader held it until the request was shed
-three seconds later.
-
-### The response spool
-
-`spool.enabled` closes that gap. Response body bytes are absorbed into a bounded
-buffer immediately before the downstream write that would have blocked, so the
-origin is never paced by the client; when the upstream reports end of stream,
-the origin has genuinely finished and the permit goes back then. The buffered
-body is handed downstream afterwards and drains at whatever pace the client
-manages, with no origin capacity attached to it.
-
-```yaml
-spool:
-  enabled: false      # global default
-  max_body: 2MiB      # ceiling on one response
-  max_memory: 256MiB  # ceiling across every in-flight spool at once
-
-routes:
-  - id: product-pages
-    match: "/products/**"
-    spool:
-      enabled: true
-```
-
-**It costs progressive rendering.** A spooled response reaches the client only
-once the origin has finished producing it, so a streamed SSR shell no longer
-arrives early. That is why it is off by default, set per route, and refused
-outright on a `class: streaming` route.
-
-Two ceilings, because one is not enough: `max_body` bounds a single response
-and `max_memory` bounds every in-flight spool together, which is what stops a
-thousand slow readers turning a 2 MiB per-request bound into 2 GiB resident.
-Exceeding either is not an error — the buffered bytes are flushed, the rest of
-the body streams through as before, and the permit reverts to being bounded by
-`timeouts.downstream_write`. Degrading to the previous behaviour is always safe.
-
-[`bench/spool.sh`](./bench/spool.sh) measures both directions in one run,
-against an origin fixture that reports when it has finished *rendering*
-separately from when it has finished *writing*:
-
-| configuration | probe after the origin finished |
-| --- | --- |
-| spool off (the previous behaviour) | `503` after 8.0s — queued behind capacity nobody was using |
-| spool on | `200` in 233ms |
-| body larger than `spool.max_body` | `503` — degrades to the previous behaviour, body intact |
-
-The script **fails** if the control case also returns capacity quickly, because
-a run that cannot reproduce the problem cannot be evidence that it was fixed.
-Parameters: 8 MiB body, two readers at 32 KB/s, ceiling of 2,
-`timeouts.downstream_write: 60s` so that a write timeout cannot be what returns
-the capacity.
-
-### Reading it in the logs
-
-Each access log line records where the permit went:
-
-* `"permit_released":"origin_end"` — the response was spooled, so this is the
-  instant the origin finished.
-* `"permit_released":"body_end"` — it was not, so a slow client may have
-  delayed the observation.
-* `"permit_released":"-"` — this request never held a permit.
-
-`"spool"` records what the spool did: `complete`, `body_too_large`,
-`budget_exhausted`, or `-`.
-
-## Request coalescing and microcache architecture
-
-Harmost provides a bounded in-memory implementation of `pingora-cache`'s
-`Storage` trait and uses Pingora's cache lock for coalescing. The
-[spike](./spike/pingora-cache/FINDINGS.md) that settled this found that a waiter
-can attach to the leader's write *in progress* and receive the first chunk
-immediately, so collapsing duplicate requests does not cost every waiter the
-full render latency.
-
-It also found the sharp edge worth knowing: when a response turns out to be
-uncacheable, the lock raises `GiveUp` and releases every waiting reader to the
-origin at once. That is safe — an uncacheable response is never fanned out —
-but it is an unbounded herd, and admission control is what bounds it. The
-governor protects the cache, not the other way around.
-
-## Next.js caching and cache-key design
-
-### Explicit caching for dynamic Next.js routes
-
-A dynamically rendered Next.js route answers `Cache-Control: private, no-cache, no-store,
-max-age=0, must-revalidate`. Honouring that unconditionally — which is the
-correct default — means the microcache never engages on precisely the pages
-worth protecting. So a route may declare:
-
-```yaml
-- id: product-pages
-  match: "/products/**"
-  class: public_ssr          # required: you are asserting these are shareable
-  cache:
-    override_origin: true
-    ttl:
-      max: 2s                # required: an override with no ceiling is unbounded
-```
-
-It is per-route, never global, refuses to combine with a private class, and
-still cannot override the absolute rules. Coalescing has a separate, weaker
-override — collapsing duplicate renders persists nothing and lasts one render.
-
-### Structural cache keys
-
-Harmost builds the cache key as a *structure* — scheme, host, method, path,
-canonicalised query, the headers that select a variant, and the deployment id —
-rather than folding those into a number early. Query parameters are sorted only
-when keys are unique; duplicate-key order and `?flag` versus `?flag=` remain
-distinct. `Accept-Encoding` retains coding order and quality values, configured
-`Vary` headers join the framework variants, and the Next.js RSC headers are
-included so a flight payload can never be served as an HTML document.
-
-That structure is then rendered to one canonical string, with a separator that
-cannot occur inside any component so `host=a.com path=/b` cannot collide with
-`host=a.com/b path=`. Pingora hashes that string (128-bit) at the storage
-boundary, which is where the key finally becomes opaque.
-
 ## Configuration
 
 Harmost uses YAML configuration for upstream servers, route matching, cache
@@ -1572,6 +960,466 @@ Both are off by default and both are documented where their trade-offs are:
 [Slow readers and render capacity](#slow-readers-and-render-capacity) for
 `spool`, and [Using Harmost with Next.js](#using-harmost-with-nextjs) for
 `upgrade`.
+
+## Operating Harmost
+
+Full procedures — systemd and Kubernetes definitions, the restart sequences,
+the timeout arithmetic — are in [`docs/OPERATIONS.md`](./docs/OPERATIONS.md).
+The short version:
+
+### Is this instance healthy?
+
+```yaml
+telemetry:
+  admin:
+    listen: "127.0.0.1:9091"
+```
+
+| Endpoint | Answers |
+|---|---|
+| `GET /health/live` | `200` while the process is running. Never anything else. |
+| `GET /health/ready` | `200` when this instance should receive traffic, `503` while draining. |
+| `GET /status` | Configuration generation and stable fingerprint, per-backend health, cache and spool occupancy, admission limits, drain state, compiled features. |
+
+Bind it privately. `/status` publishes your backend health and configuration
+generation, and startup refuses to put it on the traffic listener's address.
+
+**Liveness is not readiness.** A draining instance answers `200` on
+`/health/live` and `503` on `/health/ready`; pointing a liveness probe at the
+readiness endpoint makes an orchestrator kill the process mid-drain.
+
+### Restarting without dropping requests
+
+```bash
+# Prove the new binary and config can start, before touching the running one.
+harmost run --config /etc/harmost/harmost.yaml --test
+
+# Set this from your supervisor, a captured `$!`, or the pid file written by
+# `--daemon`. Foreground mode does not write server.graceful.pid_file.
+pid=${HARMOST_PID:?set HARMOST_PID to the running Harmost process}
+
+# Linux: hand the listening sockets over, then let the old process drain.
+harmost run --config /etc/harmost/harmost.yaml --upgrade &
+kill -QUIT "$pid"
+
+# Anywhere: drain first so the balancer withdraws this instance, then stop.
+kill -USR1 "$pid"                              # readiness fails; still serving
+sleep 15                                        # let the balancer notice
+kill -TERM "$pid"
+```
+
+`SIGUSR1` drains **without exiting** — that is the point, and it is what a
+Kubernetes `preStop` hook should send.
+
+If the pre-stop sleep already covers `drain_period`, the later `SIGTERM` does
+not wait that period again; it waits only any remainder before starting the
+shutdown timeout.
+
+**Budget `drain_period + shutdown_timeout` for a direct stop.** Pingora's
+shutdown waits out its timeout whether or not anything is in flight, so with
+the defaults a direct `SIGTERM` takes about fifteen seconds on an idle process.
+`harmost check` prints the number and warns when it exceeds Kubernetes'
+default grace period.
+
+### Following a request through
+
+Correlation costs nothing and is always on. Every access log line carries a
+`trace_id` and `span_id`, and the id Harmost concluded is the one it forwards
+to the origin as `traceparent` — so a Harmost log line and an origin log line
+for the same request join, even when the origin has never heard of Harmost.
+
+```json
+{"method":"GET","path":"/products/iphone","route":"product-pages","class":"public_document",
+ "cache":"hit","upstream":"next-1:3000","client":"203.0.113.7","scheme":"https",
+ "permit_released":"origin_end","spool":"complete",
+ "trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7",
+ "status":200,"shed":false,"origin_ms":0,"total_ms":3,
+ "trace_continued":true,"generation":3}
+```
+
+Exporting spans is separate configuration, and sampled — two spans per request,
+a server span and a nested origin-fetch span, so an origin-latency number has
+something to hang off:
+
+```yaml
+telemetry:
+  tracing:
+    sample: { mode: parent_or_ratio, one_in: 20 }
+    otlp:
+      endpoint: "http://127.0.0.1:4318/v1/traces"
+```
+
+Inbound `traceparent` is ignored by default. `from_trusted_proxies` is an
+explicit opt-in and is safe only when every trusted proxy strips or replaces
+client-supplied `traceparent` and `tracestate`; unlike `X-Forwarded-For`, trace
+context has no hop chain Harmost can validate. Ignoring one never costs the
+request — Harmost simply starts a fresh trace.
+
+**Telemetry is never load-bearing.** The span queue is bounded and full means
+drop; recording is a non-blocking `try_send`; an export failure is counted and
+logged. [`bench/tracing.sh`](./bench/tracing.sh) kills the collector and then
+asserts that fifteen requests still complete promptly.
+
+### Alerts and dashboards
+
+[`ops/prometheus/alerts.yml`](./ops/prometheus/alerts.yml) and
+[`ops/grafana/dashboard.json`](./ops/grafana/dashboard.json). The four signals
+worth understanding before an incident:
+
+Run the complete local observability demo with Docker Compose:
+
+```bash
+docker compose -f compose.observability.yaml up --build
+```
+
+It starts three Next.js origins, Harmost, a continuous traffic generator,
+Prometheus, and Grafana. Open <http://127.0.0.1:13000/d/harmost-overview/harmost>
+to use the dashboard; no separate Grafana installation is needed for this demo.
+Prometheus is available at <http://127.0.0.1:19000> and traffic enters Harmost
+at <http://127.0.0.1:18080>.
+
+![Harmost dashboard showing live origin, admission, latency, queue, and cache metrics](./assets/harmost-dashboard.png)
+
+This is a capture of the running stack, not a mockup. To refresh both the
+overview above and the [full dashboard capture](./assets/harmost-dashboard-full.png),
+leave the stack running and execute:
+
+```bash
+npm --prefix bench/browser ci
+npm exec --prefix bench/browser -- playwright install chromium
+node scripts/capture-dashboard.mjs
+```
+
+The first two commands install the pinned Playwright dependency and Chromium;
+subsequent captures only need the `node` command. Stop the demo with:
+
+```bash
+docker compose -f compose.observability.yaml down
+```
+
+| Signal | Means |
+|---|---|
+| `harmost_admission_total{decision=~"shed_.*"}` rising | The ceiling is being hit. Harmost working, and users seeing `503`. Look at origin latency before raising it. |
+| `harmost_origin_in_flight` at `harmost_concurrency_limit` | Saturated. |
+| `harmost_upstream_healthy == 0` | No backend is passing. Harmost still serves, on `stale_if_error`. |
+| `harmost_draining == 1` for longer than a deploy | An instance drained and was never replaced. |
+
+## Design and internals
+
+### Design principles
+
+**Uncertain means pass through.** If Harmost cannot prove a response is safe to
+share, it does not share it. A higher hit ratio is never worth a wrong response.
+
+**Reuse before admission.** Cache hits and coalescing waiters consume no origin
+capacity, so they must never queue for it.
+
+**Shareability is a property of the response, not the request.** A route that
+looks public can still answer with a `Set-Cookie`. That check is absolute and no
+configuration reaches past it.
+
+**The cache is optional.** With `cache.enabled: false` you still get bounded
+concurrency, bounded queues, load shedding, health-aware balancing and the
+metrics. If the caching half were removed entirely this would still be worth
+running.
+
+**A permit models observable origin work.** Origin capacity is returned only
+when Pingora observes upstream end-of-stream. A `Content-Length` is not proof
+that generation has finished, so headers alone never release capacity.
+
+### Slow readers and render capacity
+
+An origin work permit is meant to model *render* capacity: hold one while the
+origin is producing a response, hand it back when the origin has finished.
+Getting the second half right is harder than it sounds.
+
+Pingora's proxy loop pairs each upstream read with a downstream write through a
+four-slot channel, so the origin can never run more than a few chunks ahead of
+the client. A client reading a 4 MiB page a kilobyte at a time therefore keeps
+that pairing alive, and upstream end-of-stream — the only honest signal that the
+origin stopped rendering — does not arrive until the client is done. The permit
+is held for the client's reading time rather than the origin's rendering time.
+Measured on this codebase: a 1 MiB body returned capacity in 91 ms, while a
+2 MiB body against a rate-limited reader held it until the request was shed
+three seconds later.
+
+#### The response spool
+
+`spool.enabled` closes that gap. Response body bytes are absorbed into a bounded
+buffer immediately before the downstream write that would have blocked, so the
+origin is never paced by the client; when the upstream reports end of stream,
+the origin has genuinely finished and the permit goes back then. The buffered
+body is handed downstream afterwards and drains at whatever pace the client
+manages, with no origin capacity attached to it.
+
+```yaml
+spool:
+  enabled: false      # global default
+  max_body: 2MiB      # ceiling on one response
+  max_memory: 256MiB  # ceiling across every in-flight spool at once
+
+routes:
+  - id: product-pages
+    match: "/products/**"
+    spool:
+      enabled: true
+```
+
+**It costs progressive rendering.** A spooled response reaches the client only
+once the origin has finished producing it, so a streamed SSR shell no longer
+arrives early. That is why it is off by default, set per route, and refused
+outright on a `class: streaming` route.
+
+Two ceilings, because one is not enough: `max_body` bounds a single response
+and `max_memory` bounds every in-flight spool together, which is what stops a
+thousand slow readers turning a 2 MiB per-request bound into 2 GiB resident.
+Exceeding either is not an error — the buffered bytes are flushed, the rest of
+the body streams through as before, and the permit reverts to being bounded by
+`timeouts.downstream_write`. Degrading to the previous behaviour is always safe.
+
+[`bench/spool.sh`](./bench/spool.sh) measures both directions in one run,
+against an origin fixture that reports when it has finished *rendering*
+separately from when it has finished *writing*:
+
+| configuration | probe after the origin finished |
+| --- | --- |
+| spool off (the previous behaviour) | `503` after 8.0s — queued behind capacity nobody was using |
+| spool on | `200` in 233ms |
+| body larger than `spool.max_body` | `503` — degrades to the previous behaviour, body intact |
+
+The script **fails** if the control case also returns capacity quickly, because
+a run that cannot reproduce the problem cannot be evidence that it was fixed.
+Parameters: 8 MiB body, two readers at 32 KB/s, ceiling of 2,
+`timeouts.downstream_write: 60s` so that a write timeout cannot be what returns
+the capacity.
+
+#### Reading it in the logs
+
+Each access log line records where the permit went:
+
+* `"permit_released":"origin_end"` — the response was spooled, so this is the
+  instant the origin finished.
+* `"permit_released":"body_end"` — it was not, so a slow client may have
+  delayed the observation.
+* `"permit_released":"-"` — this request never held a permit.
+
+`"spool"` records what the spool did: `complete`, `body_too_large`,
+`budget_exhausted`, or `-`.
+
+### Request coalescing and microcache architecture
+
+Harmost provides a bounded in-memory implementation of `pingora-cache`'s
+`Storage` trait and uses Pingora's cache lock for coalescing. The
+[spike](./spike/pingora-cache/FINDINGS.md) that settled this found that a waiter
+can attach to the leader's write *in progress* and receive the first chunk
+immediately, so collapsing duplicate requests does not cost every waiter the
+full render latency.
+
+It also found the sharp edge worth knowing: when a response turns out to be
+uncacheable, the lock raises `GiveUp` and releases every waiting reader to the
+origin at once. That is safe — an uncacheable response is never fanned out —
+but it is an unbounded herd, and admission control is what bounds it. The
+governor protects the cache, not the other way around.
+
+### Next.js caching and cache-key design
+
+#### Explicit caching for dynamic Next.js routes
+
+A dynamically rendered Next.js route answers `Cache-Control: private, no-cache, no-store,
+max-age=0, must-revalidate`. Honouring that unconditionally — which is the
+correct default — means the microcache never engages on precisely the pages
+worth protecting. So a route may declare:
+
+```yaml
+- id: product-pages
+  match: "/products/**"
+  class: public_ssr          # required: you are asserting these are shareable
+  cache:
+    override_origin: true
+    ttl:
+      max: 2s                # required: an override with no ceiling is unbounded
+```
+
+It is per-route, never global, refuses to combine with a private class, and
+still cannot override the absolute rules. Coalescing has a separate, weaker
+override — collapsing duplicate renders persists nothing and lasts one render.
+
+#### Structural cache keys
+
+Harmost builds the cache key as a *structure* — scheme, host, method, path,
+canonicalised query, the headers that select a variant, and the deployment id —
+rather than folding those into a number early. Query parameters are sorted only
+when keys are unique; duplicate-key order and `?flag` versus `?flag=` remain
+distinct. `Accept-Encoding` retains coding order and quality values, configured
+`Vary` headers join the framework variants, and the Next.js RSC headers are
+included so a flight payload can never be served as an HTML document.
+
+That structure is then rendered to one canonical string, with a separator that
+cannot occur inside any component so `host=a.com path=/b` cannot collide with
+`host=a.com/b path=`. Pingora hashes that string (128-bit) at the storage
+boundary, which is where the key finally becomes opaque.
+
+## Project status
+
+What is built, and how far it has been verified. "done, tested" means
+unit-tested and, where a `bench/` script exists, verified end to end against a
+local test origin — never production-validated; see
+[Project maturity](#project-maturity-and-expectations).
+
+| Area | State |
+| --- | --- |
+| Config schema, units, validation | done, tested |
+| Route matching and policy snapshot | done, tested |
+| Request classification (generic + Next.js) | done, tested |
+| Cache key construction | done, tested |
+| Response shareability rules | done, tested |
+| Admission control, queueing, load shedding | done, tested |
+| Cache store | implemented with Pingora `Storage` ([spike](./spike/pingora-cache/FINDINGS.md)) |
+| Request coalescing | implemented with `pingora-cache` cache locks |
+| Pingora proxy layer | proxy, routing, admission, upstream selection wired |
+| Cache and coalescing wiring | implemented; experimental |
+| Prometheus metrics, JSON/text access logs | done |
+| Active health checks | done |
+| Graceful reload (SIGHUP) | done |
+| Stale-while-revalidate, stale-if-error | done |
+| Real Next.js fixture (App Router + Pages Router) | done; local Docker integration tested |
+| Browser-driven prefetch and Server Action checks | done (Chromium, [`bench/nextjs-browser.sh`](./bench/nextjs-browser.sh)) |
+| Property tests and fuzz targets | done ([`fuzz/`](./fuzz)); 7 targets run in CI |
+| HTTP/2 downstream (h2c and ALPN) and upstream | done, tested ([`bench/http2.sh`](./bench/http2.sh)) |
+| `HEAD`, `Range`, conditional requests, disconnects, malformed bodies | done, tested ([`bench/protocol.sh`](./bench/protocol.sh)) |
+| `Upgrade`/WebSocket proxying, bounded separately from renders | done, tested, off by default ([`bench/websocket.sh`](./bench/websocket.sh)) |
+| Native TLS, downstream and upstream (`--features tls`) | done, tested ([`bench/tls.sh`](./bench/tls.sh)); [Pingora labels its rustls backend experimental](https://github.com/cloudflare/pingora#feature-highlights), so external TLS termination remains recommended |
+| Trusted proxies, forwarded scheme and client IP | done, tested ([`bench/forwarded.sh`](./bench/forwarded.sh)) |
+| Bounded response spool | done, tested ([`bench/spool.sh`](./bench/spool.sh)) |
+| Threat model | [written](./docs/THREAT-MODEL.md); **not independently reviewed** |
+| Independent review of cache keys and shareability | **not obtained**; brief prepared at [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) |
+| Sustained adversarial testing | 20s in CI ([`bench/adversarial.sh`](./bench/adversarial.sh)); a smoke test, not a campaign |
+| Readiness, liveness and status endpoints | done, tested ([`bench/admin.sh`](./bench/admin.sh)) |
+| Drain state, `SIGUSR1`, graceful restart | done, tested ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
+| Pingora zero-downtime socket handover | done, tested — **Linux only**; `--upgrade` is refused elsewhere ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
+| W3C trace-context correlation | done, tested; unconditional ([`bench/tracing.sh`](./bench/tracing.sh)) |
+| OpenTelemetry span export | done, tested — OTLP/HTTP JSON, **plaintext only** ([`bench/tracing.sh`](./bench/tracing.sh)) |
+| Config schema version and migration notes | done ([`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md)) |
+| Soak, memory-pressure, restart and chaos tests | done ([`soak.sh`](./bench/soak.sh), [`memory.sh`](./bench/memory.sh), [`upgrade.sh`](./bench/upgrade.sh), [`chaos.sh`](./bench/chaos.sh)); CI-sized on every push, full size before a tag ([gates](./docs/RELEASE-GATES.md)) |
+| Example Prometheus alerts and Grafana dashboard | done ([`ops/`](./ops)) |
+| Release binary, checksums, SBOM, reproducible builds | workflow written ([`scripts/reproducible-build.sh`](./scripts/reproducible-build.sh)); **no release has been cut yet**, so the reproducibility claim is untested by anyone but its author |
+| Circuit breaking, least-loaded balancing | not started ([roadmap](#roadmap)) |
+| Cache purge API | not started ([roadmap](#roadmap)) |
+
+The security- and correctness-sensitive parts — cache-key construction, response
+shareability, and bounded admission — remain isolated as testable logic beneath
+the Pingora proxy layer. The full workspace test suite (276 tests, including
+property tests over generated inputs) runs without external network services.
+
+Configuration options that are accepted but not yet implemented are rejected at
+startup rather than silently ignored, so a config can never claim a protection
+that is not running.
+
+## Current limitations and non-goals
+
+- **On a route without `spool.enabled`, a slow reader still delays observed
+  origin end-of-stream and occupies a render slot,** bounded only by
+  `timeouts.downstream_write`. The spool fixes this and is off by default
+  because it costs progressive rendering; see
+  [Slow readers and render capacity](#slow-readers-and-render-capacity).
+- Cache, coalescing and admission state are process-local. Replicas multiply
+  origin ceilings unless their limits are partitioned, and one key can render
+  once per replica.
+- The only cache backend is bounded in-process memory. Restarting clears it,
+  and FIFO eviction is intentionally simple rather than production-tuned. There
+  is no purge API, so an entry that turns out to be wrong can only be waited out.
+- **There is no rate limiting of any kind.** Harmost bounds origin *work*, not
+  bytes, connections per source, or requests per second. Keep an edge in front.
+- **The zero-downtime socket handover only works on Linux.** Pingora's fd
+  transfer is Linux-only; `--upgrade` is refused elsewhere with an explanation.
+  The drain-based restart in [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) works
+  everywhere but relies on a load balancer to cover the gap between the old
+  process exiting and the new one binding.
+- **A `SIGTERM` costs `drain_period + shutdown_timeout` even when nothing is in
+  flight**, because Pingora's shutdown waits out its timeout rather than
+  finishing early. Size your supervisor's stop timeout above that sum.
+- **The OTLP exporter is plaintext-only.** It is hand-written to avoid a gRPC
+  or HTTP-client dependency tree larger than the rest of the binary, and an
+  `https://` endpoint is refused at startup rather than silently downgraded.
+  Run an OpenTelemetry Collector as a sidecar.
+- **No release has been cut yet.** The release workflow, checksums, SBOM and
+  reproducible-build instructions are written but unexercised end to end.
+- `origin.tls.ca` is rejected: Pingora 0.8's rustls connector does not read a
+  per-peer CA store. Use `SSL_CERT_FILE` / `SSL_CERT_DIR`.
+- Several settings are startup-bound and a SIGHUP reload **refuses** rather than
+  silently ignores them: listeners, TLS, `trusted_proxies`, `origin.http_version`,
+  `spool.max_memory`, `upgrade.max_concurrent`, the cache budget and
+  `timeouts.origin`.
+- `serde_yaml`, which is deprecated, still enters the dependency tree through
+  `pingora-core`'s own config parsing. Harmost's config is parsed with
+  `serde-saphyr`.
+
+## Roadmap
+
+Ordered by dependency and risk rather than novelty. Later phases depend on the
+evidence and safety work before them.
+
+### Phases 0–2 — done
+
+Evidence, protocol and security gaps, and operability are complete. Each phase
+found real bugs; those, and the dependency limitations each one refused to paper
+over, are recorded in [`CHANGELOG.md`](./CHANGELOG.md).
+
+| Phase | Delivered |
+| --- | --- |
+| **0. Make the evidence trustworthy** | Per-run pid and port tracking in [`bench/lib.sh`](./bench/lib.sh); every script asserts rather than prints; render counts read from the fixture origin's own `/__stats` rather than the proxy's account of itself; a Pages Router surface alongside the App Router; Chromium-driven prefetch and Server Action checks; property tests and seven [fuzz targets](./fuzz/fuzz_targets) in CI |
+| **1. Close protocol and security gaps** | HTTP/2 downstream (h2c and ALPN) and upstream; `HEAD`, `Range`, conditional requests, disconnects and malformed bodies; `Upgrade`/WebSocket, bounded separately from renders and off by default; rustls TLS in both directions; `server.trusted_proxies`; the bounded [response spool](#slow-readers-and-render-capacity); a [threat model](./docs/THREAT-MODEL.md) and an [adversarial suite](./bench/adversarial.sh) |
+| **2. Become operable as a service** | Release workflow with checksums, SBOM and provenance; `/health/live`, `/health/ready` and `/status`; unconditional W3C correlation plus OTLP span export; `--upgrade`, `--test` and `SIGUSR1` drain; config schema versioning; soak, memory-pressure, restart and chaos gates; example alerts and a Grafana dashboard in [`ops/`](./ops) |
+
+**Three things remain outstanding, and none can be closed by writing more code.**
+
+- **The independent review has not happened.**
+  [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) is written to make one
+  cheap: eleven falsifiable claims, the attacks already tried so a reviewer does
+  not repeat them, and the author's own assessment of where the design is
+  weakest. Until someone takes it up, phase 1 is incomplete and the
+  [status table](#project-status) says so.
+- **No release has been cut.** The workflow exists and its steps are
+  individually exercised, but "the artifacts verify" is a claim nobody has
+  tested end to end, including the author.
+- **The socket handover is Linux-only**, because Pingora's fd transfer is.
+  Harmost refuses `--upgrade` elsewhere rather than letting that surface as a
+  connection error, and [`bench/upgrade.sh`](./bench/upgrade.sh) asserts the
+  drain-based restart there instead.
+
+Both of the last two are also listed under
+[Current limitations](#current-limitations-and-non-goals).
+
+### 3. Improve origin resilience
+
+- Add passive failure observation, per-backend circuit breakers and outlier
+  ejection alongside active health checks.
+- Add retry budgets for eligible idempotent requests only; never retry
+  mutations blindly.
+- Add least-loaded selection using in-flight work and latency observations.
+- Add weighted admission, route priorities and reserved capacity so a slow,
+  expensive route cannot starve cheap critical work.
+
+### 4. Complete cache lifecycle and framework integration
+
+- Add a purge API and cache tags, including deployment-safe invalidation and a
+  path from Next.js `revalidateTag()`/`revalidatePath()` events.
+- Replace FIFO eviction with a measured production policy and evaluate optional
+  disk or external storage without making it required for admission control.
+- Build a versioned `@harmost/next` integration that exports route hints,
+  deployment ids and invalidation events; maintain a tested Next.js
+  compatibility matrix.
+- Add adapters only after the generic policy contract is stable, starting with
+  frameworks that expose reliable route and privacy metadata.
+
+### 5. Adapt and scale deliberately
+
+- Evaluate adaptive concurrency only after latency and failure signals are
+  trustworthy; retain hard operator-defined ceilings as safety rails.
+- Define a multi-instance capacity model so replicas cannot accidentally
+  multiply the intended origin ceiling.
+- Keep distributed coalescing optional. Path-stable ingress routing remains the
+  simpler default; a distributed lock is justified only by measured need.
 
 ## Security
 

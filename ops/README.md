@@ -3,6 +3,43 @@
 Two files, both meant to be copied into your own monitoring stack rather than
 imported and forgotten.
 
+## Local end-to-end demo
+
+The repository includes a self-contained deployment that proves the metrics,
+rules, and dashboard work together:
+
+```bash
+docker compose -f compose.observability.yaml up --build
+```
+
+The stack runs three Next.js fixture origins behind Harmost. A traffic container
+continuously exercises reusable, dynamic, private, and queueing routes while
+Prometheus scrapes Harmost and Grafana provisions this dashboard automatically.
+
+| Service | Local address |
+|---|---|
+| Harmost | <http://127.0.0.1:18080> |
+| Prometheus | <http://127.0.0.1:19000> |
+| Grafana dashboard | <http://127.0.0.1:13000/d/harmost-overview/harmost> |
+
+Grafana is included in the Compose stack, so the demo does not require a local
+Grafana installation. The first build compiles the Rust and Next.js images;
+later starts reuse Docker's build cache.
+
+Capture the same real dashboard images used in the main README after the stack
+has collected data:
+
+```bash
+npm --prefix bench/browser ci
+npm exec --prefix bench/browser -- playwright install chromium
+node scripts/capture-dashboard.mjs
+docker compose -f compose.observability.yaml down
+```
+
+The dependency and browser installation commands are only needed once. The
+capture writes `assets/harmost-dashboard.png` plus
+`assets/harmost-dashboard-full.png`.
+
 ## `prometheus/alerts.yml`
 
 Alerting rules, grouped by the question they answer: availability, origin load,

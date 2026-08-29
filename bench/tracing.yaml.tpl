@@ -23,6 +23,9 @@ telemetry:
     listen: "127.0.0.1:@METRICS@"
   tracing:
     service_name: harmost-bench
+    # This fixture deliberately tests trusted inbound propagation. Production
+    # keeps the safer `never` default unless this opt-in is explicit.
+    trust_incoming: from_trusted_proxies
     sample:
       mode: always
     otlp:

@@ -85,7 +85,7 @@ for i in $(seq 1 "$SOCKETS"); do
   bench_spawn "socket$i" python3 "$WS_CLIENT" 127.0.0.1 "$LISTEN" "/ws/hold-$i" --hold 6
 done
 
-for attempt in $(seq 1 100); do
+for _ in $(seq 1 100); do
   OPEN=$(bench_origin_stat "$ORIGIN_PORT" sockets_open)
   [ "${OPEN:-0}" -ge "$SOCKETS" ] && break
   sleep 0.1

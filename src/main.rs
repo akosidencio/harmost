@@ -126,7 +126,7 @@ fn unknown_run_flag(args: &[String]) -> Option<&str> {
 
 fn run(path: &str, flags: RunFlags) -> ExitCode {
     use harmost::admin::Admin;
-    use harmost::admin::drain::{DrainState, DrainWatcher};
+    use harmost::admin::drain::{DrainShutdownSignalWatch, DrainState, DrainWatcher};
     use harmost::admission::AdmissionController;
     use harmost::policy::PolicySnapshot;
     use harmost::policy::reload::Reloader;
@@ -241,6 +241,8 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
     }
 
     harmost::telemetry::metrics::CONFIG_GENERATION.set(1);
+    harmost::telemetry::metrics::CONFIG_FINGERPRINT
+        .set(i64::try_from(policy.load().fingerprint).unwrap_or(i64::MAX));
     // The ceilings the occupancy gauges are measured against. Published from
     // config rather than left for a dashboard to hardcode, so an alert cannot
     // go stale the first time somebody edits the budget.
@@ -262,16 +264,16 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         pid_file: graceful.pid_file.clone(),
         upgrade_sock: graceful.upgrade_socket.clone(),
         daemon: flags.daemon,
-        graceful_shutdown_timeout_seconds: Some(graceful.shutdown_timeout.as_duration().as_secs()),
+        graceful_shutdown_timeout_seconds: Some(pingora_seconds(
+            graceful.shutdown_timeout.as_duration(),
+        )),
         ..Default::default()
     };
-    // Pingora waits this long after broadcasting shutdown before it begins the
-    // final step, which is precisely the drain window — so the two are the
-    // same number rather than two that have to be kept in agreement. Adding
-    // the shutdown timeout on top would make every `SIGTERM` take the sum of
-    // both before the process could exit, and an orchestrator that gave up
-    // waiting would `SIGKILL` mid-drain.
-    pingora_conf.grace_period_seconds = Some(graceful.drain_period.as_duration().as_secs());
+    // Harmost's signal watcher spends the load-balancer drain window before it
+    // returns SIGTERM to Pingora. Once Pingora receives it, every listener
+    // stops accepting immediately, so repeating the drain here would only add
+    // a second silent wait after the useful window had already ended.
+    pingora_conf.grace_period_seconds = Some(0);
     // Pingora's socket handover is Linux-only: on every other platform
     // `get_fds_from` logs "Upgrade is not currently supported" and returns
     // `ECONNREFUSED`, which reads exactly like "no old process is listening"
@@ -319,18 +321,31 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
     let health_cfg = snapshot.config.health.clone();
     drop(snapshot);
 
+    // Without an active checker, configured backends are assumed available.
+    // With one, they remain unknown/unhealthy until a probe actually passes,
+    // which makes `require_healthy_upstream` truthful during startup.
+    if health_cfg.is_none() {
+        upstreams.assume_healthy();
+    }
+    for backend in upstreams.backends() {
+        harmost::telemetry::metrics::UPSTREAM_HEALTHY
+            .with_label_values(&[&backend.address])
+            .set(i64::from(upstreams.is_healthy(backend.id)));
+    }
+
     server.add_service(pingora_core::services::background::background_service(
         "reload",
         Reloader::new(path.to_string(), policy.clone(), admission.clone()),
     ));
     eprintln!("  reload config with: kill -HUP <pid>");
 
-    // Drain state is shared: the admin endpoints read it, and the watcher
-    // sets it from Pingora's shutdown broadcast or from SIGUSR1.
+    // Drain state is shared: the admin endpoints read it, the background
+    // watcher sets it for SIGUSR1, and the server signal watcher sets it before
+    // allowing SIGTERM to reach Pingora.
     let drain = Arc::new(DrainState::new());
     server.add_service(pingora_core::services::background::background_service(
         "drain",
-        DrainWatcher::new(drain.clone(), graceful.drain_period.as_duration()),
+        DrainWatcher::new(drain.clone()),
     ));
     eprintln!(
         "  drain without exiting with: kill -USR1 <pid>  (drain window {:?})",
@@ -454,7 +469,24 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
 
     eprintln!("harmost listening on {listen}");
     eprintln!("  origin concurrency ceiling: {}", concurrency.max);
-    server.run_forever();
+    let run_args = pingora_core::server::RunArgs {
+        shutdown_signal: Box::new(DrainShutdownSignalWatch::new(
+            drain,
+            graceful.drain_period.as_duration(),
+        )),
+    };
+    server.run(run_args);
+    ExitCode::SUCCESS
+}
+
+/// Pingora's lifecycle configuration is expressed in whole seconds. Round up
+/// rather than truncate: `500ms` must never become an immediate shutdown, and
+/// a configured safety window should be a floor rather than an accidental
+/// shorter value.
+fn pingora_seconds(duration: std::time::Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() != 0))
 }
 
 /// Build the listener's TLS settings.
@@ -593,12 +625,20 @@ fn check(path: &str) -> ExitCode {
                      forwarded to the origin, but no spans leave this process"
                 ),
             }
-            let stop_budget = cfg
-                .server
-                .graceful
-                .drain_period
-                .as_duration()
-                .saturating_add(cfg.server.graceful.shutdown_timeout.as_duration());
+            if cfg.telemetry.tracing.trust_incoming
+                == harmost::config::schema::TrustIncoming::FromTrustedProxies
+            {
+                println!(
+                    "  WARNING: traceparent is trusted from server.trusted_proxies; those proxies \
+                     must strip or replace client-supplied traceparent/tracestate headers, or an \
+                     internet client can choose trace ids and force parent-based sampling"
+                );
+            }
+            let drain_period = cfg.server.graceful.drain_period.as_duration();
+            let shutdown_timeout = std::time::Duration::from_secs(pingora_seconds(
+                cfg.server.graceful.shutdown_timeout.as_duration(),
+            ));
+            let stop_budget = drain_period.saturating_add(shutdown_timeout);
             println!(
                 "  graceful restart: pid {}, socket {}",
                 cfg.server.graceful.pid_file, cfg.server.graceful.upgrade_socket,
@@ -608,10 +648,8 @@ fn check(path: &str) -> ExitCode {
             // rather than a ceiling — a SIGTERM costs the full sum even on an
             // idle process. See the note on `Graceful` in the schema.
             println!(
-                "    a SIGTERM takes about {}s ({}s drain + {}s shutdown), on an idle process too",
-                stop_budget.as_secs(),
-                cfg.server.graceful.drain_period.as_duration().as_secs(),
-                cfg.server.graceful.shutdown_timeout.as_duration().as_secs(),
+                "    a SIGTERM takes about {stop_budget:?} ({drain_period:?} drain + \
+                 {shutdown_timeout:?} shutdown), on an idle process too",
             );
             if stop_budget > std::time::Duration::from_secs(30) {
                 println!(
@@ -619,7 +657,7 @@ fn check(path: &str) -> ExitCode {
                      terminationGracePeriodSeconds of 30, so the pod will be SIGKILLed \
                      part-way through the drain. Raise the supervisor's timeout to at \
                      least {}s or lower these two",
-                    stop_budget.as_secs() + 5
+                    stop_budget.as_secs().saturating_add(5)
                 );
             }
             if cfg.upgrade.enabled {
@@ -658,6 +696,14 @@ fn check(path: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pingora_timeouts_round_fractional_seconds_up() {
+        assert_eq!(pingora_seconds(std::time::Duration::ZERO), 0);
+        assert_eq!(pingora_seconds(std::time::Duration::from_millis(500)), 1);
+        assert_eq!(pingora_seconds(std::time::Duration::from_secs(1)), 1);
+        assert_eq!(pingora_seconds(std::time::Duration::from_millis(1500)), 2);
+    }
 
     #[test]
     fn check_rejects_a_matcher_that_cannot_be_compiled() {

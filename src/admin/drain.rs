@@ -10,17 +10,17 @@
 //! serve, so the balancer withdraws it on its own schedule, and only then does
 //! the shutdown begin.
 //!
-//! Harmost enters this state from three places:
+//! Harmost enters this state from two places:
 //!
-//! * `SIGTERM` / `SIGQUIT` / `SIGINT` — Pingora broadcasts its shutdown watch,
-//!   and [`DrainWatcher`] turns that into drain state. This is the automatic
-//!   path, and it is bounded by whatever Pingora's own grace period is.
+//! * `SIGTERM` — [`DrainShutdownSignalWatch`] enters drain state and waits for
+//!   the configured window *before* it returns the signal to Pingora. Pingora
+//!   stops every listener as soon as it receives that signal, so doing this
+//!   after its shutdown broadcast would make readiness and traffic disappear
+//!   at the same instant.
 //! * `SIGUSR1` — drain *without* exiting. This is the one a Kubernetes
 //!   `preStop` hook or a rolling-restart script wants: send it, wait for the
 //!   balancer to withdraw the instance, then send `SIGTERM`. Nothing else in
 //!   the process reacts to `SIGUSR1`, and Pingora does not claim it.
-//! * The explicit `drain_period` in [`crate::config::schema::Graceful`], which
-//!   holds the process in drain state before the shutdown proper starts.
 //!
 //! Draining never affects liveness. A draining instance is alive and serving;
 //! an orchestrator that killed it here would be undoing the whole mechanism.
@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use pingora_core::server::ShutdownWatch;
+use pingora_core::server::{
+    ShutdownSignal, ShutdownSignalWatch, ShutdownWatch, UnixShutdownSignalWatch,
+};
 use pingora_core::services::background::BackgroundService;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -89,23 +91,19 @@ impl DrainState {
     }
 }
 
-/// Turns Pingora's shutdown broadcast, and `SIGUSR1`, into drain state.
+/// Turns `SIGUSR1` into drain state without terminating the process.
 ///
-/// Runs as a background service so it shares the server runtime. It holds the
-/// shutdown open for `drain_period` after the broadcast: Pingora's own grace
-/// period governs in-flight *requests*, and this one governs the load
-/// balancer's polling interval, which is a different and usually longer thing.
+/// Automatic `SIGTERM` draining is deliberately handled by
+/// [`DrainShutdownSignalWatch`] before Pingora sees the signal. This background
+/// task only owns the manual pre-stop signal and exits when Pingora eventually
+/// broadcasts shutdown.
 pub struct DrainWatcher {
     state: Arc<DrainState>,
-    drain_period: Duration,
 }
 
 impl DrainWatcher {
-    pub fn new(state: Arc<DrainState>, drain_period: Duration) -> DrainWatcher {
-        DrainWatcher {
-            state,
-            drain_period,
-        }
+    pub fn new(state: Arc<DrainState>) -> DrainWatcher {
+        DrainWatcher { state }
     }
 }
 
@@ -138,16 +136,6 @@ impl BackgroundService for DrainWatcher {
             };
             tokio::select! {
                 _ = shutdown.changed() => {
-                    self.state.begin("shutdown");
-                    if !self.drain_period.is_zero() {
-                        log::info!(
-                            "draining for {:?} before shutdown continues",
-                            self.drain_period
-                        );
-                        // Keeps this service's task alive for the window, which
-                        // is what Pingora waits on before the final step.
-                        tokio::time::sleep(self.drain_period).await;
-                    }
                     return;
                 }
                 () = usr1_recv => {
@@ -156,6 +144,54 @@ impl BackgroundService for DrainWatcher {
                 }
             }
         }
+    }
+}
+
+/// Delays graceful termination until readiness has been failing for the full
+/// load-balancer drain window.
+///
+/// Pingora broadcasts shutdown to its traffic, metrics and admin listeners at
+/// once. Their accept loops stop on that broadcast, before Pingora sleeps its
+/// own grace period. Intercepting `SIGTERM` here is therefore the only point at
+/// which Harmost can remain reachable while advertising itself not-ready.
+pub struct DrainShutdownSignalWatch {
+    inner: UnixShutdownSignalWatch,
+    state: Arc<DrainState>,
+    drain_period: Duration,
+}
+
+impl DrainShutdownSignalWatch {
+    pub fn new(state: Arc<DrainState>, drain_period: Duration) -> Self {
+        Self {
+            inner: UnixShutdownSignalWatch,
+            state,
+            drain_period,
+        }
+    }
+
+    async fn prepare(&self, signal: ShutdownSignal) -> ShutdownSignal {
+        if !matches!(&signal, ShutdownSignal::GracefulTerminate) {
+            return signal;
+        }
+
+        self.state.begin("sigterm");
+        let elapsed = self.state.draining_for().unwrap_or_default();
+        let remaining = self.drain_period.saturating_sub(elapsed);
+        if !remaining.is_zero() {
+            log::info!(
+                "draining for {:?} more before Pingora stops accepting connections",
+                remaining
+            );
+            tokio::time::sleep(remaining).await;
+        }
+        signal
+    }
+}
+
+#[async_trait]
+impl ShutdownSignalWatch for DrainShutdownSignalWatch {
+    async fn recv(&self) -> ShutdownSignal {
+        self.prepare(self.inner.recv().await).await
     }
 }
 
@@ -188,7 +224,7 @@ mod tests {
         let s = DrainState::new();
         s.begin("sigusr1");
         std::thread::sleep(Duration::from_millis(20));
-        s.begin("shutdown");
+        s.begin("sigterm");
         assert_eq!(s.reason(), "sigusr1", "the first reason must be kept");
         assert!(
             s.draining_for().unwrap() >= Duration::from_millis(20),
@@ -197,9 +233,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_watcher_drains_when_the_server_broadcasts_shutdown() {
+    async fn the_manual_watcher_exits_when_the_server_broadcasts_shutdown() {
         let state = Arc::new(DrainState::new());
-        let watcher = DrainWatcher::new(state.clone(), Duration::ZERO);
+        let watcher = DrainWatcher::new(state.clone());
         let (tx, rx) = tokio::sync::watch::channel(false);
 
         let task = tokio::spawn(async move { watcher.start(rx).await });
@@ -207,25 +243,52 @@ mod tests {
         tx.send(true).unwrap();
         task.await.unwrap();
 
-        assert!(state.is_draining(), "shutdown did not enter drain state");
-        assert_eq!(state.reason(), "shutdown");
+        assert!(
+            !state.is_draining(),
+            "the post-broadcast watcher drained too late"
+        );
     }
 
     #[tokio::test]
-    async fn the_watcher_holds_the_drain_window_open() {
-        // The window is the mechanism. A watcher that returned immediately
-        // would drain and shut down in the same instant, which is the bug.
+    async fn graceful_termination_waits_before_pingora_sees_the_signal() {
         let state = Arc::new(DrainState::new());
-        let watcher = DrainWatcher::new(state.clone(), Duration::from_millis(200));
-        let (tx, rx) = tokio::sync::watch::channel(false);
+        let watcher = DrainShutdownSignalWatch::new(state.clone(), Duration::from_millis(200));
         let started = Instant::now();
-        let task = tokio::spawn(async move { watcher.start(rx).await });
-        tx.send(true).unwrap();
-        task.await.unwrap();
+        let signal = watcher.prepare(ShutdownSignal::GracefulTerminate).await;
+
+        assert!(matches!(signal, ShutdownSignal::GracefulTerminate));
+        assert!(state.is_draining());
+        assert_eq!(state.reason(), "sigterm");
         assert!(
             started.elapsed() >= Duration::from_millis(180),
             "the drain window was skipped: {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn fast_shutdown_is_not_delayed_or_reported_as_a_drain() {
+        let state = Arc::new(DrainState::new());
+        let watcher = DrainShutdownSignalWatch::new(state.clone(), Duration::from_secs(30));
+        let started = Instant::now();
+        let signal = watcher.prepare(ShutdownSignal::FastShutdown).await;
+
+        assert!(matches!(signal, ShutdownSignal::FastShutdown));
+        assert!(!state.is_draining());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_manual_pre_drain_is_not_paid_twice_on_sigterm() {
+        let state = Arc::new(DrainState::new());
+        state.begin("sigusr1");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let watcher = DrainShutdownSignalWatch::new(state, Duration::from_millis(100));
+        let started = Instant::now();
+
+        let signal = watcher.prepare(ShutdownSignal::GracefulTerminate).await;
+
+        assert!(matches!(signal, ShutdownSignal::GracefulTerminate));
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 }
