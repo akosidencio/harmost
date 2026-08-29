@@ -740,10 +740,18 @@ mod tests {
                 held.push(sock);
             }
         });
+        // Deep enough that the queue cannot empty before the shutdown branch
+        // is taken. `tokio::select!` picks at random among ready branches, and
+        // on the first poll all three are — the watch, the buffered spans, and
+        // `interval`'s immediate first tick. Every ordinary `recv` that wins
+        // the draw exports one span through the normal path, so a queue of
+        // four could be gone by the time shutdown is handled, leaving nothing
+        // to abandon and failing this test on a race rather than a defect.
+        const QUEUED: usize = 64;
         let (sink, exporter) = build(
             &Otlp {
                 timeout: Dur(Duration::from_millis(50)),
-                max_queue: 4,
+                max_queue: QUEUED,
                 max_batch: 1,
                 interval: Dur(Duration::from_secs(60)),
                 ..otlp(&format!("http://127.0.0.1:{port}/v1/traces"))
@@ -751,9 +759,14 @@ mod tests {
             vec![],
         )
         .unwrap();
-        for _ in 0..4 {
+        for _ in 0..QUEUED {
             sink.record(span());
         }
+        // The queue is exactly full, never over: a span dropped here would be
+        // a full-channel drop, and would satisfy the assertion below without
+        // the shutdown path ever having abandoned anything.
+        assert_eq!(sink.dropped(), 0, "a span was dropped before shutdown");
+
         let (tx, rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move { exporter.start(rx).await });
         tx.send(true).unwrap();
@@ -761,6 +774,8 @@ mod tests {
         task.await.unwrap();
         collector.abort();
 
+        // One deadline for the whole drain. Applied per batch instead, this
+        // collector answers nothing, so 64 batches would cost 64 × 50ms.
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(
             sink.dropped() > 0,
