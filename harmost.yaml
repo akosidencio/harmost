@@ -52,7 +52,11 @@ origin:
   upstreams:
     - "next-1:3000"
     - "next-2:3000"
+  # round_robin (default), hash_by_path, or least_loaded.
+  #
   # Hashing by path also warms the origin's own render cache and JIT state.
+  # least_loaded scores each backend on outstanding work against observed
+  # latency, which is what notices a backend that is up but slow.
   load_balancing: hash_by_path
   # http1 (default), http2 (prior-knowledge h2c), or auto (ALPN, needs tls).
   http_version: http1
@@ -65,6 +69,36 @@ origin:
     queue:
       max: 1000
       timeout: 2s
+  # Reserved capacity, stated as what each priority may occupy rather than
+  # what it is promised. Leaving `low` at 50 keeps half the origin ceiling
+  # away from low-priority routes however many of them arrive. Every tier
+  # defaults to 100, which is the same as having no tiers at all.
+  priorities:
+    high: 100
+    normal: 90
+    low: 50
+  # Eject a backend that is failing real traffic, which is the failure an
+  # active probe on a static path cannot see. Off by default, and pointless
+  # with a single backend — there is nowhere to eject to.
+  breaker:
+    enabled: true
+    window: 10s
+    min_requests: 20
+    failure_percent: 50
+    open_for: 30s
+    # The cap that stops a breaker causing the outage it exists to contain:
+    # past it, every backend is failing and "failing" stops being a reason to
+    # prefer one over another.
+    max_ejected_percent: 50
+  # Retry a failed request, without amplifying an outage. Safe methods only,
+  # and only before the origin has answered; the budget caps retries as a
+  # share of the traffic actually flowing.
+  retry:
+    enabled: true
+    max_attempts: 2
+    window: 10s
+    budget_percent: 10
+    budget_min: 3
 
 health:
   path: "/healthz"

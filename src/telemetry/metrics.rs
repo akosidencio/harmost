@@ -266,6 +266,100 @@ pub static UPSTREAM_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric registration")
 });
 
+/// 1 while a backend's circuit breaker is open, 0 while it is closed.
+///
+/// The companion to `harmost_upstream_healthy`, and the one that moves when an
+/// origin is answering probes and failing renders. A backend that is healthy
+/// and ejected at the same time is not a contradiction — it is the whole
+/// reason passive observation exists, and seeing both series is how an
+/// operator tells that story apart from a network partition.
+pub static UPSTREAM_EJECTED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "harmost_upstream_ejected",
+        "1 when a backend's circuit breaker is open and it is out of rotation",
+        &["upstream"]
+    )
+    .expect("metric registration")
+});
+
+/// Cumulative ejections per backend. A gauge says a backend is out now; this
+/// says it has been out and back eleven times this hour, which is a different
+/// and usually worse problem.
+pub static UPSTREAM_TRIPS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "harmost_upstream_breaker_trips_total",
+        "Times a backend's circuit breaker has opened",
+        &["upstream"]
+    )
+    .expect("metric registration")
+});
+
+/// Origin failures as the breaker counts them. `kind` is one of `connect`,
+/// `proxy`, `status` — bounded, and worth separating: a connect failure is a
+/// dead process, a status failure is a live one that cannot do its job.
+pub static UPSTREAM_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "harmost_upstream_failures_total",
+        "Origin failures observed passively, by backend and kind",
+        &["upstream", "kind"]
+    )
+    .expect("metric registration")
+});
+
+/// Origin requests currently outstanding to each backend. The input to
+/// least-loaded selection, published so the routing decision is auditable
+/// rather than a black box.
+pub static UPSTREAM_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "harmost_upstream_in_flight",
+        "Origin requests currently outstanding to each backend",
+        &["upstream"]
+    )
+    .expect("metric registration")
+});
+
+/// The other input to least-loaded selection: the exponentially weighted mean
+/// time to first byte per backend.
+///
+/// Microseconds rather than seconds because the gauge is an integer, and a
+/// 5ms origin would otherwise publish as zero.
+pub static UPSTREAM_LATENCY_EWMA: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "harmost_upstream_latency_ewma_microseconds",
+        "Exponentially weighted mean time to first byte per backend",
+        &["upstream"]
+    )
+    .expect("metric registration")
+});
+
+/// Retry decisions. `outcome` is one of `allowed`, `ineligible`,
+/// `attempts_exhausted`, `budget_exhausted` — the variants of
+/// [`crate::upstream::retry::RetryDecision`].
+///
+/// `budget_exhausted` is the one to alert on: it means requests are failing
+/// faster than the budget will absorb, which is an origin problem rather than
+/// a retry-tuning problem.
+pub static RETRIES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "harmost_origin_retries_total",
+        "Retry decisions, by route and outcome",
+        &["route", "outcome"]
+    )
+    .expect("metric registration")
+});
+
+/// Retries the budget would currently allow. The denominator for
+/// `harmost_origin_retries_total{outcome="allowed"}`, published for the same
+/// reason as `harmost_cache_max_bytes`: a count with no ceiling beside it is a
+/// number nobody can act on.
+pub static RETRY_BUDGET: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_origin_retry_budget",
+        "Retries the current window's budget would allow"
+    )
+    .expect("metric registration")
+});
+
 /// Touch every metric family so a fresh scrape shows zeros rather than absent
 /// series. A dashboard that renders "no data" during an incident is worse than
 /// one that renders zero.
@@ -293,6 +387,13 @@ pub fn preregister() {
     LazyLock::force(&CONFIG_GENERATION);
     LazyLock::force(&CONFIG_FINGERPRINT);
     LazyLock::force(&UPSTREAM_HEALTHY);
+    LazyLock::force(&UPSTREAM_EJECTED);
+    LazyLock::force(&UPSTREAM_TRIPS);
+    LazyLock::force(&UPSTREAM_FAILURES);
+    LazyLock::force(&UPSTREAM_IN_FLIGHT);
+    LazyLock::force(&UPSTREAM_LATENCY_EWMA);
+    LazyLock::force(&RETRIES);
+    LazyLock::force(&RETRY_BUDGET);
 }
 
 #[cfg(test)]
@@ -312,6 +413,7 @@ mod tests {
         // config-derived, like `route`.
         let allowed = [
             "route", "class", "status", "reason", "decision", "upstream", "limiter", "outcome",
+            "kind",
         ];
         preregister();
         for family in prometheus::gather() {

@@ -21,7 +21,79 @@ asserted end to end against a local fixture origin. See
 
 ---
 
-## [0.1.1] — unreleased
+## [0.1.2] — unreleased
+
+Roadmap phase 3: origin resilience. Everything here is off or inert by default,
+so no existing config changes behaviour.
+
+### Added
+
+- **Per-backend circuit breakers** (`origin.breaker`), fed by passive
+  observation of real traffic rather than a probe. Catches the origin that
+  answers `/healthz` while every render fails.
+- **Outlier ejection cap** (`origin.breaker.max_ejected_percent`). Past it,
+  breaker state is ignored and routing falls back to health — an origin-wide
+  failure must not leave Harmost with nowhere to send anything.
+- **Recovery probes.** One request per `open_for` is spent testing an ejected
+  backend, so a blip cannot eject it permanently.
+- **Bounded retries** (`origin.retry`). Safe methods only, only before the
+  origin has answered, and capped by a budget measured as a share of live
+  traffic. A retry re-enters peer selection, so it lands on a different
+  backend.
+- **`origin.load_balancing: least_loaded`**, scoring in-flight work against
+  EWMA time-to-first-byte. Routes around a backend that is up but slow.
+- **Route priorities and reserved capacity** (`origin.priorities`,
+  `route.priority`). Each tier gets a ceiling as a percentage of
+  `origin.concurrency.max`; reserved capacity is the complement.
+- **Weighted admission** (`route.weight`). A ceiling counts units of origin
+  work instead of requests.
+- **Metrics:** `harmost_upstream_ejected`,
+  `harmost_upstream_breaker_trips_total`, `harmost_upstream_failures_total`,
+  `harmost_upstream_in_flight`, `harmost_upstream_latency_ewma_microseconds`,
+  `harmost_origin_retries_total`, `harmost_origin_retry_budget`. Priority tiers
+  publish under the existing `limiter` label as `tier:high` / `tier:normal` /
+  `tier:low`.
+- **`/status`** reports per-backend ejection, in-flight, EWMA latency, breaker
+  window counts and trips; plus tier ceilings and retry-budget state.
+- **Benchmarks:** [`bench/breaker.sh`](./bench/breaker.sh) and
+  [`bench/retry.sh`](./bench/retry.sh), both asserting on what the origin
+  fixtures counted. `bench/slow-origin` gained `/__fail` and `/__heal`.
+- **Alerts** for the above in [`ops/prometheus/alerts.yml`](./ops/prometheus/alerts.yml).
+
+### Changed
+
+- `harmost check` prints the breaker, retry and priority settings in force.
+- `SIGHUP` refuses `origin.breaker` and `origin.retry`: both carry rolling
+  windows bound at startup. `origin.priorities`, `route.priority` and
+  `route.weight` **do** reload.
+- Configurations that would silently do nothing are refused at startup: a
+  breaker with one upstream, an ejection cap that floors to zero backends,
+  `max_attempts: 1`, a zero retry budget, a priority share that floors to a
+  ceiling of zero, `route.priority` with uniform `origin.priorities`, and a
+  `route.weight` above any ceiling it is charged against.
+
+### Known limitations
+
+- Breaker and retry-budget state is process-local, like the cache and the
+  admission ceilings. Each replica must observe a failing backend for itself,
+  and *n* replicas have *n* retry budgets.
+- Priority tiers isolate ceilings, not queues. Waiting is FIFO within a tier.
+- Any 5xx counts as an origin failure. An application that 500s by design will
+  move breakers no backend deserves.
+- Passive observation records one outcome per attempt, decided by the response
+  header. A body error after a successful header counts as the success it began
+  as.
+
+### Upgrading from 0.1.1
+
+No configuration change is required. If you run more than one backend,
+`origin.breaker` is the piece worth adding first — watch
+`harmost_upstream_ejected` before relying on it. Leave `origin.retry` off until
+`harmost_upstream_failures_total` says what is actually failing.
+
+---
+
+## [0.1.1] — 2026-08-29
 
 Two roadmap phases: closing the protocol and security gaps that made the first
 release unsafe to put in front of real traffic, and making the result operable

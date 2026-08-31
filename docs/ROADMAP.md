@@ -16,9 +16,17 @@ shareability; the review brief is in
 - Without `spool.enabled`, a slow reader can occupy a render slot until
   `timeouts.downstream_write`. Spooling avoids that at the cost of progressive
   rendering.
-- Cache, coalescing, and admission state are process-local. Replicas multiply
-  origin ceilings unless operators partition their limits, and the same key
-  may render once per replica.
+- Cache, coalescing, admission, circuit-breaker, and retry-budget state are all
+  process-local. Replicas multiply origin ceilings and retry budgets unless
+  operators partition their limits, the same key may render once per replica,
+  and each replica must observe a failing backend for itself before it ejects
+  it.
+- Priority tiers isolate ceilings, not queues. Waiting for a permit is FIFO
+  within a tier, so a high-priority request that arrives behind a queue of its
+  own peers waits its turn.
+- Passive failure observation counts any 5xx as an origin failure. An origin
+  that answers 5xx for reasons of its own — a deliberate error page, a route
+  that 500s on bad input — will trip breakers that no backend deserves.
 - The cache is bounded in-process memory with FIFO eviction. Restarting clears
   it, and there is no purge API.
 - Harmost does not rate-limit bytes, connections, clients, or requests per
@@ -39,16 +47,8 @@ shareability; the review brief is in
 
 See [`OPERATIONS.md`](./OPERATIONS.md) for deployment consequences and
 [`THREAT-MODEL.md`](./THREAT-MODEL.md) for intentionally undefended threats.
-Milestone numbering continues phases 0–2, whose completed work is recorded in
+Milestone numbering continues phases 0–3, whose completed work is recorded in
 the changelog.
-
-## 3. Improve origin resilience
-
-- Add passive failure observation, per-backend circuit breakers, and outlier
-  ejection alongside active health checks.
-- Add bounded retry budgets for eligible idempotent requests only.
-- Add least-loaded selection based on in-flight work and latency.
-- Add weighted admission, route priorities, and reserved capacity.
 
 ## 4. Complete the cache lifecycle and framework integration
 
