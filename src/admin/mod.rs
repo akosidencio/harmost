@@ -49,6 +49,8 @@ use crate::policy::PolicySnapshot;
 use crate::proxy::spool::SpoolBudget;
 use crate::telemetry::json::{field_str, quoted};
 use crate::upstream::UpstreamPool;
+use crate::upstream::breaker::BreakerState;
+use crate::upstream::retry::RetryBudget;
 use drain::DrainState;
 
 /// Everything the admin endpoints read. Every field is a handle to live state,
@@ -63,6 +65,7 @@ pub struct Admin {
     pub store: &'static BoundedStore,
     pub spool: Arc<SpoolBudget>,
     pub upgrades: Arc<Limiter>,
+    pub retry: Arc<RetryBudget>,
     pub drain: Arc<DrainState>,
     /// Report not-ready when no upstream is passing its health check. Off by
     /// default; see [`crate::config::schema::Admin`].
@@ -188,7 +191,14 @@ impl Admin {
         // ---- admission
         s.push_str("\"admission\":{\"global\":");
         limiter_json(&mut s, self.admission.global());
-        s.push_str(",\"routes\":[");
+        s.push_str(",\"tiers\":[");
+        for (i, limiter) in self.admission.tier_limiters().iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            limiter_json(&mut s, limiter);
+        }
+        s.push_str("],\"routes\":[");
         for (i, limiter) in self.admission.route_limiters().iter().enumerate() {
             if i > 0 {
                 s.push(',');
@@ -198,14 +208,29 @@ impl Admin {
         s.push_str("]},");
 
         // ---- upstreams
+        //
+        // `healthy` and `ejected` are separate answers to separate questions,
+        // and a backend can be both healthy and ejected at once: that is what
+        // an origin answering its probe while failing its renders looks like,
+        // and collapsing the two into one field would hide the distinction
+        // that makes passive observation worth having.
         s.push_str("\"upstreams\":[");
         for (i, backend) in self.upstreams.backends().iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
+            let (ok, failed, trips) = self.upstreams.breaker_counts(backend.id);
             s.push('{');
             field_str(&mut s, "address", &backend.address);
-            let _ = write!(s, "\"healthy\":{}}}", self.upstreams.is_healthy(backend.id));
+            let _ = write!(
+                s,
+                "\"healthy\":{},\"ejected\":{},\"in_flight\":{},\"latency_ewma_us\":{},\
+                 \"window\":{{\"ok\":{ok},\"failed\":{failed}}},\"trips\":{trips}}}",
+                self.upstreams.is_healthy(backend.id),
+                self.upstreams.breaker_state(backend.id) == BreakerState::Open,
+                self.upstreams.in_flight(backend.id),
+                self.upstreams.ewma_micros(backend.id),
+            );
         }
         let _ = write!(
             s,
@@ -222,6 +247,18 @@ impl Admin {
             self.spool.used(),
             self.spool.limit()
         );
+        {
+            let now = self.upstreams.now_ms();
+            let (attempts, retries) = self.retry.counts(now);
+            let _ = write!(
+                s,
+                "\"retry\":{{\"enabled\":{},\"max_attempts\":{},\"window_attempts\":{attempts},\
+                 \"window_retries\":{retries},\"budget\":{}}},",
+                self.retry.enabled(),
+                self.retry.max_attempts(),
+                self.retry.allowance(now),
+            );
+        }
         let _ = write!(
             s,
             "\"upgrades\":{{\"enabled\":{},\"limit\":{},\"in_flight\":{}}}}}",
@@ -350,7 +387,12 @@ mod tests {
         let cfg: crate::config::Config = serde_saphyr::from_str(yaml).unwrap();
         crate::config::validation::validate(&cfg).unwrap();
         let policy = PolicySnapshot::build(cfg, 7).unwrap();
-        let admission = Arc::new(AdmissionController::new(10, 5, Duration::from_millis(250)));
+        let admission = Arc::new(AdmissionController::new(
+            10,
+            5,
+            Duration::from_millis(250),
+            &crate::config::schema::Priorities::default(),
+        ));
         admission.route_limiter("products", 4, 2, Duration::from_millis(100));
         Admin {
             started: Instant::now(),
@@ -361,6 +403,7 @@ mod tests {
                 let pool = UpstreamPool::new(
                     &["127.0.0.1:3000".to_string(), "127.0.0.2:3000".to_string()],
                     LoadBalancing::RoundRobin,
+                    &crate::config::schema::Breaker::default(),
                 )
                 .unwrap();
                 pool.assume_healthy();
@@ -369,6 +412,7 @@ mod tests {
             store: BoundedStore::new(64 * 1024 * 1024),
             spool: SpoolBudget::new(1024 * 1024),
             upgrades: Limiter::new("upgrade", 100, 0, Duration::ZERO),
+            retry: Arc::new(RetryBudget::new(&crate::config::schema::Retry::default())),
             drain: Arc::new(DrainState::new()),
             require_healthy_upstream: require_healthy,
         }
@@ -441,9 +485,57 @@ mod tests {
             r#""queue_timeout_ms":250"#,
             r#""bytes_used":0"#,
             r#""max_bytes":67108864"#,
+            // Resilience state: the three priority tiers, per-backend breaker
+            // and load figures, and the retry budget.
+            r#""name":"tier:high""#,
+            r#""name":"tier:normal""#,
+            r#""name":"tier:low""#,
+            r#""ejected":false"#,
+            r#""in_flight":0"#,
+            r#""latency_ewma_us":0"#,
+            r#""window":{"ok":0,"failed":0}"#,
+            r#""trips":0"#,
+            r#""retry":{"enabled":false"#,
         ] {
             assert!(body.contains(expected), "missing {expected} in {body}");
         }
+    }
+
+    /// A backend that passes its probe and fails its renders is the case
+    /// passive observation exists for, so the two states have to be separately
+    /// visible rather than collapsed into one field.
+    #[test]
+    fn the_status_document_reports_health_and_ejection_separately() {
+        let breaker = crate::config::schema::Breaker {
+            enabled: true,
+            min_requests: 2,
+            failure_percent: 50,
+            max_ejected_percent: 50,
+            ..Default::default()
+        };
+        let pool = UpstreamPool::new(
+            &["127.0.0.1:3000".to_string(), "127.0.0.2:3000".to_string()],
+            LoadBalancing::RoundRobin,
+            &breaker,
+        )
+        .unwrap();
+        pool.assume_healthy();
+        pool.record_outcome(0, false);
+        pool.record_outcome(0, false);
+
+        let mut a = admin(false);
+        a.upstreams = Arc::new(pool);
+        let body = a.status_body();
+        assert_balanced(&body);
+        assert!(
+            body.contains(r#""address":"127.0.0.1:3000","healthy":true,"ejected":true"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#""address":"127.0.0.2:3000","healthy":true,"ejected":false"#),
+            "{body}"
+        );
+        assert!(body.contains(r#""trips":1"#), "{body}");
     }
 
     #[test]

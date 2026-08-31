@@ -40,6 +40,16 @@ in this phase at CI-sized parameters:
 | [`memory.sh`](../bench/memory.sh) | every configured budget holds while the workload exceeds it; an oversized body is served and not stored |
 | [`chaos.sh`](../bench/chaos.sh) | survives losing every backend; nothing private is shared; the admin surface answers *during* the outage; capacity comes back |
 
+And the origin-resilience scripts. Both are written so the *origins* are the
+witnesses — each fixture counts what it was actually asked to render — because
+a breaker benchmark that reads the proxy's own metrics is measuring the
+component under test:
+
+| Script | Asserts |
+|---|---|
+| [`breaker.sh`](../bench/breaker.sh) | a backend whose `/healthz` answers `200` while every render answers `502` is **still reported healthy** and is nonetheless ejected; the good backend then takes essentially all the traffic; once the bad one heals, a recovery probe returns it to rotation and the split evens out again |
+| [`retry.sh`](../bench/retry.sh) | with one of two backends killed outright: retries off loses about half the requests; a generous budget serves nearly all of them; **a budget with a floor of one retry refuses the rest rather than amplifying the failure** |
+
 ---
 
 ## Before a tag

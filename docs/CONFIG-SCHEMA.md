@@ -89,6 +89,11 @@ needs to change:
 | `server.graceful.*` | zero-downtime restart | `/tmp` paths, 5s drain, 10s shutdown |
 | `telemetry.admin` | readiness and status | absent — **no readiness endpoint** |
 | `telemetry.tracing` | OpenTelemetry | correlation on, export off |
+| `origin.breaker` | circuit breaking | disabled |
+| `origin.retry` | bounded retries | disabled |
+| `origin.priorities` | reserved capacity | every tier 100% — no tiering |
+| `origin.load_balancing: least_loaded` | load-aware selection | `round_robin` |
+| `route.priority`, `route.weight` | weighted admission | `normal`, `1` |
 
 Two of those are worth acting on rather than merely noting:
 
@@ -105,6 +110,31 @@ Two of those are worth acting on rather than merely noting:
 - **Inbound trace context is ignored by default.** Opt into
   `from_trusted_proxies` only when every trusted proxy strips or replaces
   client-supplied `traceparent` and `tracestate`.
+- **`origin.breaker` needs at least two upstreams.** With one backend the
+  ejection cap keeps it in rotation — ejecting the only backend turns a partial
+  failure into a total outage — so the breaker would observe failures and never
+  act on one. Validation refuses the combination rather than leaving it inert.
+- **`route.priority` needs `origin.priorities`.** Labelling routes by priority
+  while every tier may occupy the whole ceiling is a prioritisation that does
+  nothing, so it is refused for the same reason as everything else in this
+  file.
+
+### Keys that are refused because they would do nothing
+
+Distinct from the table below, which lists keys Harmost cannot honour. These
+*could* be honoured and would have no effect, which is the failure mode this
+project treats as worse than a crash: someone ships believing a protection is
+running.
+
+| Combination | Why |
+|---|---|
+| `origin.breaker.enabled` with one upstream | The ejection cap keeps the only backend in rotation. |
+| `origin.breaker.max_ejected_percent` that floors to 0 backends | Failures would be observed and never acted on. |
+| `origin.retry.max_attempts: 1` | Attempts include the first try, so it never retries. |
+| `origin.retry` with `budget_percent: 0` and `budget_min: 0` | No retry can ever be afforded. |
+| An `origin.priorities` share that floors to a ceiling of 0 | Every request at that priority would be refused. |
+| `route.priority` with uniform `origin.priorities` | Every priority competes for the same ceiling. |
+| `route.weight` above any ceiling it is charged against | No request on the route could ever be admitted. |
 
 ### Keys that are deliberately refused
 

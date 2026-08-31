@@ -41,28 +41,42 @@ impl ShedReason {
     }
 }
 
-/// One unit of origin work in flight. Releasing it is what lets the next
-/// request in, so it is held for exactly as long as the origin is busy.
+/// Origin work in flight. Releasing it is what lets the next request in, so it
+/// is held for exactly as long as the origin is busy.
+///
+/// A permit may be worth more than one unit — see the `weight` argument to
+/// [`Limiter::acquire`] — because not every request is the same load on an
+/// origin.
 #[derive(Debug)]
 pub struct Permit {
     inner: Option<OwnedSemaphorePermit>,
     limiter: Arc<Limiter>,
-    /// A second permit released at the same moment as this one. A request
-    /// needs both route and global capacity, and they must be given back
-    /// together or one limiter drifts out of step with the other.
-    companion: Option<Box<Permit>>,
+    /// Permits released at the same moment as this one. A request needs
+    /// capacity on its tier, its route and the global ceiling, and they must
+    /// be given back together or the limiters drift out of step.
+    companions: Vec<Permit>,
 }
 
 impl Permit {
-    pub fn with_companion(mut self, other: Option<Permit>) -> Permit {
-        self.companion = other.map(Box::new);
+    /// Bind other permits to this one's lifetime. Dropping this releases all
+    /// of them, in one operation as far as any caller can observe.
+    #[must_use]
+    pub fn with_companions(mut self, others: impl IntoIterator<Item = Permit>) -> Permit {
+        self.companions.extend(others);
         self
+    }
+
+    /// How many units of the ceiling this permit occupies.
+    pub fn weight(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, OwnedSemaphorePermit::num_permits)
     }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        if let Some(permit) = self.inner.take() {
+        if let Some(mut permit) = self.inner.take() {
             // Resize and return form one semaphore transaction. Without this
             // guard, a shrink can forget the currently available permits, a
             // group of in-flight permits can return, and only then can the
@@ -70,14 +84,27 @@ impl Drop for Permit {
             // returned in that window and keep concurrency near the old
             // ceiling for another generation of work.
             let mut debt = self.limiter.debt.lock();
-            if *debt > 0 {
-                *debt -= 1;
-                // Absorb this returned permit directly. Returning it to the
+            let units = permit.num_permits();
+            let absorbed = (*debt).min(units);
+            *debt -= absorbed;
+            if absorbed == units {
+                // Absorb the whole return directly. Handing it to the
                 // semaphore first lets an already-queued waiter steal it.
                 permit.forget();
-            } else {
-                // Make the permit visible while the guard is still held. A
+            } else if absorbed > 0 {
+                // A weighted permit can settle part of the debt and still owe
+                // the ceiling the rest. Split so each half goes where it
+                // belongs; a partial split that somehow failed would leave the
+                // debt paid and the permits returned, so the debt is restored
+                // rather than lost.
+                match permit.split(absorbed) {
+                    Some(settled) => settled.forget(),
+                    None => *debt += absorbed,
+                }
+                // Make the remainder visible while the guard is still held. A
                 // following resize therefore observes and collects it.
+                drop(permit);
+            } else {
                 drop(permit);
             }
         }
@@ -200,16 +227,28 @@ impl Limiter {
     ///
     /// `deadline` bounds the *total* wait, so a request crossing several
     /// limiters cannot spend each one's queue timeout in turn.
+    ///
+    /// `weight` is how many units of the ceiling this one request occupies.
+    /// One is the ordinary case and says every request is the same load; a
+    /// route that fans out to three services can be given a weight so that a
+    /// ceiling of 50 means fifty units of origin work rather than fifty
+    /// requests of wildly different cost. A weight larger than the ceiling can
+    /// never be satisfied, which is why configuration refuses one.
     pub async fn acquire(
         self: &Arc<Self>,
         deadline: Option<Instant>,
+        weight: u32,
     ) -> Result<Permit, ShedReason> {
-        if let Ok(p) = self.sem.clone().try_acquire_owned() {
+        // A weight of zero would take nothing and bound nothing. Treated as
+        // one rather than rejected: the caller has already been through
+        // validation, and admitting an unbounded request is the worse failure.
+        let weight = weight.max(1);
+        if let Ok(p) = self.sem.clone().try_acquire_many_owned(weight) {
             self.admitted.fetch_add(1, Ordering::Relaxed);
             return Ok(Permit {
                 inner: Some(p),
                 limiter: self.clone(),
-                companion: None,
+                companions: Vec::new(),
             });
         }
 
@@ -238,7 +277,7 @@ impl Limiter {
             None => self.queue_timeout(),
         };
 
-        let result = tokio::time::timeout(wait, self.sem.clone().acquire_owned()).await;
+        let result = tokio::time::timeout(wait, self.sem.clone().acquire_many_owned(weight)).await;
         drop(queue_slot);
 
         match result {
@@ -247,7 +286,7 @@ impl Limiter {
                 Ok(Permit {
                     inner: Some(p),
                     limiter: self.clone(),
-                    companion: None,
+                    companions: Vec::new(),
                 })
             }
             // The semaphore is closed only at shutdown.
@@ -284,31 +323,31 @@ mod tests {
     #[tokio::test]
     async fn admits_up_to_the_limit_and_no_further() {
         let l = lim(2, 0, 0);
-        let _a = l.acquire(None).await.unwrap();
-        let _b = l.acquire(None).await.unwrap();
-        assert_eq!(l.acquire(None).await.unwrap_err(), ShedReason::QueueFull);
+        let _a = l.acquire(None, 1).await.unwrap();
+        let _b = l.acquire(None, 1).await.unwrap();
+        assert_eq!(l.acquire(None, 1).await.unwrap_err(), ShedReason::QueueFull);
     }
 
     #[tokio::test]
     async fn a_released_permit_admits_the_next_request() {
         let l = lim(1, 0, 0);
-        let a = l.acquire(None).await.unwrap();
-        assert!(l.acquire(None).await.is_err());
+        let a = l.acquire(None, 1).await.unwrap();
+        assert!(l.acquire(None, 1).await.is_err());
         drop(a);
-        assert!(l.acquire(None).await.is_ok());
+        assert!(l.acquire(None, 1).await.is_ok());
     }
 
     #[tokio::test]
     async fn queue_is_bounded_and_refuses_immediately_when_full() {
         let l = lim(1, 1, 5_000);
-        let _held = l.acquire(None).await.unwrap();
+        let _held = l.acquire(None, 1).await.unwrap();
         let l2 = l.clone();
         // One waiter occupies the single queue slot.
-        let waiter = tokio::spawn(async move { l2.acquire(None).await });
+        let waiter = tokio::spawn(async move { l2.acquire(None, 1).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(l.queue_depth(), 1);
         // The next arrival is refused rather than queued.
-        assert_eq!(l.acquire(None).await.unwrap_err(), ShedReason::QueueFull);
+        assert_eq!(l.acquire(None, 1).await.unwrap_err(), ShedReason::QueueFull);
         waiter.abort();
         let _ = waiter.await;
         assert_eq!(
@@ -321,18 +360,21 @@ mod tests {
     #[tokio::test]
     async fn queue_deadline_sheds_rather_than_waiting_forever() {
         let l = lim(1, 10, 50);
-        let _held = l.acquire(None).await.unwrap();
-        assert_eq!(l.acquire(None).await.unwrap_err(), ShedReason::QueueTimeout);
+        let _held = l.acquire(None, 1).await.unwrap();
+        assert_eq!(
+            l.acquire(None, 1).await.unwrap_err(),
+            ShedReason::QueueTimeout
+        );
     }
 
     #[tokio::test]
     async fn growing_the_limit_admits_more_immediately() {
         let l = lim(1, 0, 0);
-        let _a = l.acquire(None).await.unwrap();
-        assert!(l.acquire(None).await.is_err());
+        let _a = l.acquire(None, 1).await.unwrap();
+        assert!(l.acquire(None, 1).await.is_err());
         l.resize(3);
-        assert!(l.acquire(None).await.is_ok());
-        assert!(l.acquire(None).await.is_ok());
+        assert!(l.acquire(None, 1).await.is_ok());
+        assert!(l.acquire(None, 1).await.is_ok());
         assert_eq!(l.limit(), 3);
     }
 
@@ -341,32 +383,32 @@ mod tests {
         // The reload hazard: 4 permits out, ceiling drops to 1. Returning
         // permits must be absorbed, not handed to new arrivals.
         let l = lim(4, 0, 0);
-        let a = l.acquire(None).await.unwrap();
-        let b = l.acquire(None).await.unwrap();
-        let c = l.acquire(None).await.unwrap();
-        let d = l.acquire(None).await.unwrap();
+        let a = l.acquire(None, 1).await.unwrap();
+        let b = l.acquire(None, 1).await.unwrap();
+        let c = l.acquire(None, 1).await.unwrap();
+        let d = l.acquire(None, 1).await.unwrap();
 
         l.resize(1);
         assert_eq!(l.limit(), 1);
 
         drop(a);
         assert!(
-            l.acquire(None).await.is_err(),
+            l.acquire(None, 1).await.is_err(),
             "still 3 in flight against a ceiling of 1"
         );
         drop(b);
         assert!(
-            l.acquire(None).await.is_err(),
+            l.acquire(None, 1).await.is_err(),
             "still 2 in flight against a ceiling of 1"
         );
         drop(c);
         assert!(
-            l.acquire(None).await.is_err(),
+            l.acquire(None, 1).await.is_err(),
             "still 1 in flight against a ceiling of 1"
         );
         drop(d);
         assert!(
-            l.acquire(None).await.is_ok(),
+            l.acquire(None, 1).await.is_ok(),
             "now empty, one permit is correct"
         );
     }
@@ -374,12 +416,12 @@ mod tests {
     #[tokio::test]
     async fn growing_cancels_a_pending_shrink() {
         let l = lim(4, 0, 0);
-        let a = l.acquire(None).await.unwrap();
-        let _b = l.acquire(None).await.unwrap();
+        let a = l.acquire(None, 1).await.unwrap();
+        let _b = l.acquire(None, 1).await.unwrap();
         l.resize(1); // owes 2
         l.resize(4); // operator changed their mind
         drop(a);
-        assert!(l.acquire(None).await.is_ok());
+        assert!(l.acquire(None, 1).await.is_ok());
         assert_eq!(l.limit(), 4);
     }
 
@@ -390,11 +432,11 @@ mod tests {
     #[tokio::test]
     async fn growing_by_less_than_the_debt_leaves_the_remainder_owed() {
         let l = lim(5, 0, 0);
-        let a = l.acquire(None).await.unwrap();
-        let b = l.acquire(None).await.unwrap();
-        let c = l.acquire(None).await.unwrap();
-        let d = l.acquire(None).await.unwrap();
-        let _e = l.acquire(None).await.unwrap();
+        let a = l.acquire(None, 1).await.unwrap();
+        let b = l.acquire(None, 1).await.unwrap();
+        let c = l.acquire(None, 1).await.unwrap();
+        let d = l.acquire(None, 1).await.unwrap();
+        let _e = l.acquire(None, 1).await.unwrap();
 
         l.resize(1); // owes 4; nothing is available to forget outright
         l.resize(2); // cancels one, three still owed
@@ -403,7 +445,7 @@ mod tests {
         for (n, permit) in [a, b, c].into_iter().enumerate() {
             drop(permit);
             assert!(
-                l.acquire(None).await.is_err(),
+                l.acquire(None, 1).await.is_err(),
                 "return {} of 3 must be absorbed against the remaining debt",
                 n + 1
             );
@@ -411,18 +453,81 @@ mod tests {
 
         drop(d);
         assert!(
-            l.acquire(None).await.is_ok(),
+            l.acquire(None, 1).await.is_ok(),
             "the debt is settled, so this return is the ceiling's own permit"
         );
+    }
+
+    // ------------------------------------------------- weighted admission
+
+    #[tokio::test]
+    async fn a_weighted_request_occupies_its_whole_weight() {
+        let l = lim(6, 0, 0);
+        let _heavy = l.acquire(None, 4).await.unwrap();
+        assert_eq!(l.available(), 2);
+        let _light = l.acquire(None, 2).await.unwrap();
+        assert_eq!(l.acquire(None, 1).await.unwrap_err(), ShedReason::QueueFull);
+    }
+
+    #[tokio::test]
+    async fn releasing_a_weighted_permit_returns_every_unit() {
+        let l = lim(6, 0, 0);
+        let heavy = l.acquire(None, 5).await.unwrap();
+        assert_eq!(heavy.weight(), 5);
+        drop(heavy);
+        assert_eq!(l.available(), 6);
+    }
+
+    /// A ceiling of 6 admits six cheap requests or two expensive ones, and the
+    /// point of weighting is that those are the same amount of origin work.
+    #[tokio::test]
+    async fn a_ceiling_bounds_units_of_work_rather_than_requests() {
+        let l = lim(6, 0, 0);
+        let mut held = Vec::new();
+        while let Ok(p) = l.acquire(None, 3).await {
+            held.push(p);
+        }
+        assert_eq!(held.len(), 2);
+        assert_eq!(l.available(), 0);
+    }
+
+    /// The reload hazard, with weights: a shrink's debt is measured in units,
+    /// so a returning heavy permit can settle part of it and hand back the
+    /// rest.
+    #[tokio::test]
+    async fn a_weighted_return_settles_shrink_debt_unit_by_unit() {
+        let l = lim(8, 0, 0);
+        let heavy = l.acquire(None, 6).await.unwrap();
+        assert_eq!(l.available(), 2);
+
+        l.resize(4); // 4 owed; 2 are available to forget outright, 2 are out
+        assert_eq!(l.available(), 0);
+
+        drop(heavy); // returns 6: 2 settle the remaining debt, 4 come back
+        assert_eq!(
+            l.available(),
+            4,
+            "the ceiling settled somewhere other than its new limit"
+        );
+        assert!(l.acquire(None, 4).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_zero_weight_still_takes_a_slot() {
+        // Validation refuses a zero weight, so this is the belt to that
+        // braces: an unbounded request is a worse outcome than a rejected one.
+        let l = lim(1, 0, 0);
+        let _held = l.acquire(None, 0).await.unwrap();
+        assert_eq!(l.available(), 0);
     }
 
     #[tokio::test]
     async fn shrinking_absorbs_a_returned_permit_before_a_waiter_can_take_it() {
         let l = lim(2, 1, 5_000);
-        let a = l.acquire(None).await.unwrap();
-        let b = l.acquire(None).await.unwrap();
+        let a = l.acquire(None, 1).await.unwrap();
+        let b = l.acquire(None, 1).await.unwrap();
         let waiting_limiter = l.clone();
-        let mut waiter = tokio::spawn(async move { waiting_limiter.acquire(None).await });
+        let mut waiter = tokio::spawn(async move { waiting_limiter.acquire(None, 1).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         l.resize(1);

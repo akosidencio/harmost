@@ -82,6 +82,13 @@ run soak.sh "${SOAK_SECONDS:-45}" "${SOAK_WORKERS:-10}"
 run memory.sh "${MEMORY_ROUNDS:-6}" "${MEMORY_SLOW_READERS:-12}"
 run chaos.sh "${CHAOS_ROUNDS:-2}"
 
+# Phase 3: origin resilience. Both scripts turn a backend into the failure the
+# feature exists for — one that passes its health check and fails its renders,
+# and one that is simply gone — and assert on what the *origins* counted rather
+# than on what the proxy says about itself.
+run breaker.sh "${BREAKER_REQUESTS:-40}" "${BREAKER_RENDER_MS:-20}"
+run retry.sh "${RETRY_REQUESTS:-40}" "${RETRY_RENDER_MS:-20}"
+
 # bench/tracing.sh also needs python3 (for the OTLP collector it asserts
 # against) and skips itself with a message when it is missing.
 #

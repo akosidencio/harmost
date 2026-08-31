@@ -1,0 +1,44 @@
+# Retry budgets, against a backend that has died rather than one that is
+# failing.
+#
+# Note what is *absent*: there is no `health:` block. That is deliberate and it
+# is the scenario retries exist for. With active health checking a dead backend
+# is marked down after its failure streak and simply stops being selected, so
+# no connect failure ever reaches a request. Retries are what covers the window
+# *before* the probe notices — and on a config with no probe at all, that
+# window is the whole time.
+#
+# `@LISTEN@`, `@ORIGIN_A@`, `@ORIGIN_B@`, `@METRICS@`, `@RETRY@`, `@PERCENT@`
+# and `@MIN@` are substituted by bench/lib.sh for this run.
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+origin:
+  upstreams:
+    - "127.0.0.1:@ORIGIN_A@"
+    - "127.0.0.1:@ORIGIN_B@"
+  load_balancing: round_robin
+  concurrency:
+    max: 50
+    queue:
+      max: 500
+      timeout: 20s
+  retry:
+    enabled: @RETRY@
+    max_attempts: 2
+    window: 10s
+    budget_percent: @PERCENT@
+    budget_min: @MIN@
+
+cache:
+  enabled: false
+coalesce:
+  enabled: false
+
+timeouts:
+  connect: 500ms
+  origin: 20s
+
+telemetry:
+  prometheus:
+    listen: "127.0.0.1:@METRICS@"

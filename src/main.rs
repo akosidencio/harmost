@@ -159,6 +159,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
     let admin_cfg = cfg.telemetry.admin.clone();
     let graceful = cfg.server.graceful.clone();
     let concurrency = cfg.origin.concurrency.clone();
+    let priorities = cfg.origin.priorities.clone();
 
     // Span export, if it is configured. Built before the server so a bad
     // endpoint is a startup failure rather than a background service that
@@ -209,6 +210,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         concurrency.max,
         concurrency.queue.max,
         concurrency.queue.timeout.as_duration(),
+        &priorities,
     ));
     // Create every configured route limiter now rather than on the route's
     // first request. Reload already does this, and without it the admin
@@ -236,6 +238,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
             concurrency.max,
             concurrency.queue.max,
             concurrency.queue.timeout.as_duration(),
+            &priorities,
             &route_limits,
         );
     }
@@ -311,6 +314,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
     let upstreams = match UpstreamPool::new(
         &snapshot.config.origin.upstreams,
         snapshot.config.origin.load_balancing,
+        &snapshot.config.origin.breaker,
     ) {
         Ok(pool) => Arc::new(pool),
         Err(error) => {
@@ -399,6 +403,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         store: harmost.store(),
         spool: harmost.spool_budget(),
         upgrades: harmost.upgrade_limiter(),
+        retry: harmost.retry_budget(),
         drain: drain.clone(),
         require_healthy_upstream: admin_cfg.require_healthy_upstream,
     });
@@ -557,6 +562,45 @@ fn check(path: &str) -> ExitCode {
                 if overrides {
                     println!("  route `{}` overrides origin cache directives", r.id);
                 }
+            }
+            // Origin resilience. Each of these changes where requests go or
+            // how many of them the origin sees, so `check` says what is on
+            // and what the consequence is rather than leaving it in the file.
+            if !cfg.origin.priorities.is_uniform() {
+                let p = &cfg.origin.priorities;
+                let max = cfg.origin.concurrency.max;
+                // Saturating: `concurrency.max` is bounded only by tokio's
+                // semaphore maximum, which is large enough that `max * 100`
+                // is not obviously in range.
+                let share = |percent: u32| max.saturating_mul(percent as usize) / 100;
+                println!(
+                    "  priority ceilings: high {} of {max}, normal {}, low {} — the rest of the \
+                     ceiling is reserved for higher tiers",
+                    share(p.high),
+                    share(p.normal),
+                    share(p.low),
+                );
+            }
+            if cfg.origin.breaker.enabled {
+                println!(
+                    "  circuit breakers on: a backend failing {}% of at least {} requests in {:?} \
+                     is ejected for {:?}, up to {}% of the pool at once",
+                    cfg.origin.breaker.failure_percent,
+                    cfg.origin.breaker.min_requests,
+                    cfg.origin.breaker.window.as_duration(),
+                    cfg.origin.breaker.open_for.as_duration(),
+                    cfg.origin.breaker.max_ejected_percent,
+                );
+            }
+            if cfg.origin.retry.enabled {
+                println!(
+                    "  retries on: safe methods only, up to {} attempts, capped at {}% of origin \
+                     requests in {:?} (never fewer than {})",
+                    cfg.origin.retry.max_attempts,
+                    cfg.origin.retry.budget_percent,
+                    cfg.origin.retry.window.as_duration(),
+                    cfg.origin.retry.budget_min,
+                );
             }
             // Everything below trades a safety property for convenience.
             // `check` is the last place someone reads before deploying, so it
