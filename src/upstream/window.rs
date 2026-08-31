@@ -15,12 +15,14 @@
 //!
 //! # Accuracy under concurrency
 //!
-//! The window is a ring of lock-free buckets. Two threads recording either
-//! side of a bucket rollover can race, and the loser's observation can land in
-//! the neighbouring bucket. That is deliberate: this feeds a threshold, not a
-//! ledger, and taking a lock on the request path to make it exact would cost
-//! more than the imprecision does.
+//! The window is a ring of buckets whose steady-state updates are lock-free.
+//! Reusing one ring slot takes a short per-bucket lock so old counters are
+//! cleared before the new epoch becomes visible. Two threads recording either
+//! side of that rollover can still place one observation in the neighbouring
+//! bucket; this feeds a threshold rather than a ledger, and that bounded
+//! imprecision avoids a lock on every request.
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -43,6 +45,10 @@ struct Bucket {
     epoch: AtomicU64,
     total: AtomicU32,
     flagged: AtomicU32,
+    /// Serialises reuse of this ring slot. Recording remains lock-free while a
+    /// bucket belongs to the current epoch; the lock is taken only once per
+    /// bucket rollover.
+    rollover: Mutex<()>,
 }
 
 pub struct RollingRatio {
@@ -62,6 +68,7 @@ impl RollingRatio {
                     epoch: AtomicU64::new(0),
                     total: AtomicU32::new(0),
                     flagged: AtomicU32::new(0),
+                    rollover: Mutex::new(()),
                 })
                 .collect(),
         }
@@ -129,9 +136,14 @@ impl RollingRatio {
     /// misleading rather than merely old.
     pub fn reset(&self) {
         for bucket in &self.buckets {
-            bucket.epoch.store(0, Ordering::Release);
+            let _rollover = bucket.rollover.lock();
+            // Make the old counters ineligible before clearing them. Epoch 0
+            // is a real bucket near process startup, so publishing it first
+            // would let a reader observe the old counters as current.
+            bucket.epoch.store(u64::MAX, Ordering::Release);
             bucket.total.store(0, Ordering::Relaxed);
             bucket.flagged.store(0, Ordering::Relaxed);
+            bucket.epoch.store(0, Ordering::Release);
         }
     }
 
@@ -143,16 +155,17 @@ impl RollingRatio {
         let bucket = self
             .buckets
             .get(usize::try_from(epoch % BUCKETS as u64).ok()?)?;
-        let held = bucket.epoch.load(Ordering::Acquire);
-        if held != epoch
-            && bucket
-                .epoch
-                .compare_exchange(held, epoch, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            // The thread that claims the slot is the one that clears it.
-            bucket.total.store(0, Ordering::Relaxed);
-            bucket.flagged.store(0, Ordering::Relaxed);
+        if bucket.epoch.load(Ordering::Acquire) != epoch {
+            let _rollover = bucket.rollover.lock();
+            if bucket.epoch.load(Ordering::Acquire) != epoch {
+                // Clear before publishing the new epoch. Publishing first lets
+                // `totals` attribute the entire old bucket to the new window,
+                // and lets a concurrent writer add a new observation only for
+                // this thread to erase it afterwards.
+                bucket.total.store(0, Ordering::Relaxed);
+                bucket.flagged.store(0, Ordering::Relaxed);
+                bucket.epoch.store(epoch, Ordering::Release);
+            }
         }
         Some(bucket)
     }
@@ -226,5 +239,16 @@ mod tests {
         }
         w.reset();
         assert_eq!(w.totals(0), (0, 0));
+    }
+
+    #[test]
+    fn a_reused_bucket_is_cleared_before_its_new_epoch_is_visible() {
+        let w = window();
+        w.record(0, true);
+
+        // Epoch 10 reuses epoch 0's ring slot. Once the new epoch is visible,
+        // the old observation must already be gone.
+        w.record(1_000, false);
+        assert_eq!(w.totals(1_000), (1, 0));
     }
 }

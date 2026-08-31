@@ -375,13 +375,17 @@ impl Harmost {
         if ctx.outcome_recorded {
             return;
         }
-        let Some(id) = ctx.origin_slot.as_ref().map(InFlightGuard::backend_id) else {
+        let Some((id, probe)) = ctx
+            .origin_slot
+            .as_ref()
+            .map(|slot| (slot.backend_id(), slot.probe_token()))
+        else {
             return;
         };
         ctx.outcome_recorded = true;
 
         let was = self.upstreams.breaker_state(id);
-        self.upstreams.record_outcome(id, ok);
+        self.upstreams.record_outcome(id, probe, ok);
         let now = self.upstreams.breaker_state(id);
 
         let Some(address) = ctx.upstream.as_deref() else {
@@ -402,6 +406,54 @@ impl Harmost {
         metrics::UPSTREAM_EJECTED
             .with_label_values(&[address])
             .set(i64::from(now == BreakerState::Open));
+    }
+
+    /// Publish the one tier this request can have changed. The other tiers are
+    /// independent, so scanning and touching all three on every request only
+    /// adds metric-registry work without making their values fresher.
+    fn publish_tier_state(&self, priority: Priority) {
+        let Some(tier) = self.admission.tier_limiter(priority) else {
+            return;
+        };
+        metrics::LIMIT
+            .with_label_values(&[tier.name()])
+            .set(tier.limit() as i64);
+        metrics::QUEUE_DEPTH
+            .with_label_values(&[tier.name()])
+            .set(tier.queue_depth() as i64);
+        metrics::IN_FLIGHT
+            .with_label_values(&[tier.name()])
+            .set((tier.limit().saturating_sub(tier.available())) as i64);
+    }
+
+    /// Publish only the backend whose state this request touched.
+    fn publish_backend_state(&self, id: usize, address: &str) {
+        metrics::UPSTREAM_IN_FLIGHT
+            .with_label_values(&[address])
+            .set(i64::try_from(self.upstreams.in_flight(id)).unwrap_or(i64::MAX));
+        metrics::UPSTREAM_LATENCY_EWMA
+            .with_label_values(&[address])
+            .set(i64::try_from(self.upstreams.ewma_micros(id)).unwrap_or(i64::MAX));
+        metrics::UPSTREAM_EJECTED
+            .with_label_values(&[address])
+            .set(i64::from(
+                self.upstreams.breaker_state(id) == BreakerState::Open,
+            ));
+    }
+
+    /// Release and publish one attempt's backend occupancy. This is also used
+    /// before a retry replaces the attempt, so both the old and new backend
+    /// gauges remain exact without an O(backends) completion scan.
+    fn release_origin_slot(&self, ctx: &mut Ctx) {
+        let Some(slot) = ctx.origin_slot.take() else {
+            return;
+        };
+        let id = slot.backend_id();
+        let address = ctx.upstream.clone();
+        drop(slot);
+        if let Some(address) = address {
+            self.publish_backend_state(id, &address);
+        }
     }
 
     /// May this request be sent upstream again, and is there budget for it?
@@ -770,19 +822,7 @@ impl ProxyHttp for Harmost {
                 .with_label_values(&[l.name()])
                 .set((l.limit().saturating_sub(l.available())) as i64);
         }
-        // Tier ceilings share the `limiter` label with `global` and the route
-        // ids, so "which limit refused this" is answerable from one graph.
-        for tier in self.admission.tier_limiters() {
-            metrics::LIMIT
-                .with_label_values(&[tier.name()])
-                .set(tier.limit() as i64);
-            metrics::QUEUE_DEPTH
-                .with_label_values(&[tier.name()])
-                .set(tier.queue_depth() as i64);
-            metrics::IN_FLIGHT
-                .with_label_values(&[tier.name()])
-                .set((tier.limit().saturating_sub(tier.available())) as i64);
-        }
+        self.publish_tier_state(ctx.priority);
 
         match outcome {
             Admission::Admitted(permits) => {
@@ -939,8 +979,10 @@ impl ProxyHttp for Harmost {
         self.retry.record_attempt(self.upstreams.now_ms());
         // Assigning replaces any slot held from a previous attempt, and
         // dropping the old guard hands that backend's slot back.
-        ctx.origin_slot = Some(self.upstreams.enter(backend.id));
+        self.release_origin_slot(ctx);
+        ctx.origin_slot = Some(self.upstreams.enter_selected(backend));
         ctx.upstream = Some(backend.address.clone());
+        self.publish_backend_state(backend.id, &backend.address);
         ctx.origin_started = Some(Instant::now());
         ctx.origin_wall_started = Some(std::time::SystemTime::now());
         // The origin fetch gets its own span id, minted here so that the
@@ -1079,10 +1121,14 @@ impl ProxyHttp for Harmost {
         // origin's own queueing, and it does not make a backend that served a
         // large body look slow.
         if let (Some(slot), Some(started)) = (&ctx.origin_slot, ctx.origin_started) {
+            let id = slot.backend_id();
             self.upstreams.observe_latency(
-                slot.backend_id(),
+                id,
                 u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
             );
+            if let Some(address) = ctx.upstream.as_deref() {
+                self.publish_backend_state(id, address);
+            }
         }
         // Any 5xx is the origin saying it could not do its job, which is the
         // signal a health probe on a static path cannot see. A 4xx is not: the
@@ -1132,7 +1178,7 @@ impl ProxyHttp for Harmost {
             // it has to: least-loaded selection reads this count, and holding
             // it until the client finished reading would make a backend
             // serving slow readers look permanently busy.
-            ctx.origin_slot = None;
+            self.release_origin_slot(ctx);
         }
         Ok(None)
     }
@@ -1299,31 +1345,11 @@ impl ProxyHttp for Harmost {
                 .with_label_values(&[l.name()])
                 .set(l.queue_depth() as i64);
         }
-        for tier in self.admission.tier_limiters() {
-            metrics::IN_FLIGHT
-                .with_label_values(&[tier.name()])
-                .set((tier.limit().saturating_sub(tier.available())) as i64);
-            metrics::QUEUE_DEPTH
-                .with_label_values(&[tier.name()])
-                .set(tier.queue_depth() as i64);
-        }
+        self.publish_tier_state(ctx.priority);
         // Republish what least-loaded selection reads, so the routing decision
-        // is auditable rather than a black box. Dropping the slot above is
-        // what makes the in-flight figure here the post-release one.
-        ctx.origin_slot = None;
-        for backend in self.upstreams.backends() {
-            metrics::UPSTREAM_IN_FLIGHT
-                .with_label_values(&[&backend.address])
-                .set(i64::try_from(self.upstreams.in_flight(backend.id)).unwrap_or(i64::MAX));
-            metrics::UPSTREAM_LATENCY_EWMA
-                .with_label_values(&[&backend.address])
-                .set(i64::try_from(self.upstreams.ewma_micros(backend.id)).unwrap_or(i64::MAX));
-            metrics::UPSTREAM_EJECTED
-                .with_label_values(&[&backend.address])
-                .set(i64::from(
-                    self.upstreams.breaker_state(backend.id) == BreakerState::Open,
-                ));
-        }
+        // is auditable rather than a black box. `release_origin_slot` drops the
+        // guard before publishing, so the gauge is the post-release value.
+        self.release_origin_slot(ctx);
     }
 }
 

@@ -520,8 +520,8 @@ mod tests {
         )
         .unwrap();
         pool.assume_healthy();
-        pool.record_outcome(0, false);
-        pool.record_outcome(0, false);
+        pool.record_outcome(0, None, false);
+        pool.record_outcome(0, None, false);
 
         let mut a = admin(false);
         a.upstreams = Arc::new(pool);

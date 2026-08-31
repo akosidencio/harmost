@@ -213,6 +213,20 @@ impl Reloader {
             &snapshot.config.origin.priorities,
             &route_limits,
         );
+        for tier in self.admission.tier_limiters() {
+            crate::telemetry::metrics::LIMIT
+                .with_label_values(&[tier.name()])
+                .set(i64::try_from(tier.limit()).unwrap_or(i64::MAX));
+            crate::telemetry::metrics::QUEUE_DEPTH
+                .with_label_values(&[tier.name()])
+                .set(i64::try_from(tier.queue_depth()).unwrap_or(i64::MAX));
+            crate::telemetry::metrics::IN_FLIGHT
+                .with_label_values(&[tier.name()])
+                .set(
+                    i64::try_from(tier.limit().saturating_sub(tier.available()))
+                        .unwrap_or(i64::MAX),
+                );
+        }
         self.policy.store(snapshot);
         // Published only after the swap succeeded, so the gauge answers "which
         // config is actually serving" rather than "which one was attempted".

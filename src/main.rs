@@ -124,6 +124,17 @@ fn unknown_run_flag(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Pingora's limit counts total upstream tries, the same unit exposed by
+/// `origin.retry.max_attempts`. Bind the framework ceiling to the policy rather
+/// than leaving Pingora's independent default of 16 in force.
+fn proxy_max_attempts(retry: &harmost::config::schema::Retry) -> usize {
+    if retry.enabled {
+        usize::try_from(retry.max_attempts).unwrap_or(usize::MAX)
+    } else {
+        1
+    }
+}
+
 fn run(path: &str, flags: RunFlags) -> ExitCode {
     use harmost::admin::Admin;
     use harmost::admin::drain::{DrainShutdownSignalWatch, DrainState, DrainWatcher};
@@ -160,6 +171,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
     let graceful = cfg.server.graceful.clone();
     let concurrency = cfg.origin.concurrency.clone();
     let priorities = cfg.origin.priorities.clone();
+    let max_attempts = proxy_max_attempts(&cfg.origin.retry);
 
     // Span export, if it is configured. Built before the server so a bad
     // endpoint is a startup failure rather than a background service that
@@ -242,6 +254,20 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
             &route_limits,
         );
     }
+    // Create every tier series before traffic arrives. The request path only
+    // updates the tier it actually changes, avoiding nine registry lookups per
+    // request while keeping an idle tier visible as zero.
+    for tier in admission.tier_limiters() {
+        harmost::telemetry::metrics::LIMIT
+            .with_label_values(&[tier.name()])
+            .set(i64::try_from(tier.limit()).unwrap_or(i64::MAX));
+        harmost::telemetry::metrics::QUEUE_DEPTH
+            .with_label_values(&[tier.name()])
+            .set(0);
+        harmost::telemetry::metrics::IN_FLIGHT
+            .with_label_values(&[tier.name()])
+            .set(0);
+    }
 
     harmost::telemetry::metrics::CONFIG_GENERATION.set(1);
     harmost::telemetry::metrics::CONFIG_FINGERPRINT
@@ -267,6 +293,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         pid_file: graceful.pid_file.clone(),
         upgrade_sock: graceful.upgrade_socket.clone(),
         daemon: flags.daemon,
+        max_retries: max_attempts,
         graceful_shutdown_timeout_seconds: Some(pingora_seconds(
             graceful.shutdown_timeout.as_duration(),
         )),
@@ -335,6 +362,15 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         harmost::telemetry::metrics::UPSTREAM_HEALTHY
             .with_label_values(&[&backend.address])
             .set(i64::from(upstreams.is_healthy(backend.id)));
+        harmost::telemetry::metrics::UPSTREAM_EJECTED
+            .with_label_values(&[&backend.address])
+            .set(0);
+        harmost::telemetry::metrics::UPSTREAM_IN_FLIGHT
+            .with_label_values(&[&backend.address])
+            .set(0);
+        harmost::telemetry::metrics::UPSTREAM_LATENCY_EWMA
+            .with_label_values(&[&backend.address])
+            .set(0);
     }
 
     server.add_service(pingora_core::services::background::background_service(
@@ -747,6 +783,15 @@ mod tests {
         assert_eq!(pingora_seconds(std::time::Duration::from_millis(500)), 1);
         assert_eq!(pingora_seconds(std::time::Duration::from_secs(1)), 1);
         assert_eq!(pingora_seconds(std::time::Duration::from_millis(1500)), 2);
+    }
+
+    #[test]
+    fn pingora_attempt_ceiling_tracks_the_retry_policy_instead_of_its_default() {
+        let mut retry = harmost::config::schema::Retry::default();
+        assert_eq!(proxy_max_attempts(&retry), 1);
+        retry.enabled = true;
+        retry.max_attempts = 23;
+        assert_eq!(proxy_max_attempts(&retry), 23);
     }
 
     #[test]

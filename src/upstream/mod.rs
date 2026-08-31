@@ -26,13 +26,29 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::config::schema::{Breaker as BreakerConfig, LoadBalancing};
-use breaker::{Breaker, BreakerState};
+use breaker::{Breaker, BreakerAllowance, BreakerState, ProbeToken};
 
 #[derive(Debug, Clone)]
 pub struct Backend {
     pub id: usize,
     pub address: String,
     pub socket: SocketAddr,
+}
+
+/// A routing decision and, when applicable, the recovery-probe identity that
+/// must travel with this exact origin attempt.
+#[derive(Clone, Copy)]
+pub struct SelectedBackend<'a> {
+    pub backend: &'a Backend,
+    probe: Option<ProbeToken>,
+}
+
+impl std::ops::Deref for SelectedBackend<'_> {
+    type Target = Backend;
+
+    fn deref(&self) -> &Self::Target {
+        self.backend
+    }
 }
 
 /// Everything Harmost has learned about one backend since it started.
@@ -217,9 +233,12 @@ impl UpstreamPool {
     /// This is the passive observation the breaker runs on, and it is called
     /// for every attempt — a connect failure, a proxy error, and an ordinary
     /// response whose status says the origin could not do its job.
-    pub fn record_outcome(&self, id: usize, ok: bool) {
+    pub fn record_outcome(&self, id: usize, probe: Option<ProbeToken>, ok: bool) {
         if let Some(state) = self.state(id) {
-            state.breaker.record(self.now_ms(), ok);
+            match probe {
+                Some(token) => state.breaker.record_probe(self.now_ms(), token, ok),
+                None => state.breaker.record(self.now_ms(), ok),
+            }
         }
     }
 
@@ -250,17 +269,26 @@ impl UpstreamPool {
 
     /// Claim a slot on a backend for as long as the origin is working on it.
     pub fn enter(self: &Arc<Self>, id: usize) -> InFlightGuard {
+        self.enter_attempt(id, None)
+    }
+
+    pub fn enter_selected(self: &Arc<Self>, selected: SelectedBackend<'_>) -> InFlightGuard {
+        self.enter_attempt(selected.id, selected.probe)
+    }
+
+    fn enter_attempt(self: &Arc<Self>, id: usize, probe: Option<ProbeToken>) -> InFlightGuard {
         if let Some(state) = self.state(id) {
             state.in_flight.fetch_add(1, Ordering::Relaxed);
         }
         InFlightGuard {
             pool: self.clone(),
             id,
+            probe,
         }
     }
 
     /// Pick a backend for this path.
-    pub fn select(&self, path: &str) -> Option<&Backend> {
+    pub fn select(&self, path: &str) -> Option<SelectedBackend<'_>> {
         self.select_at(path, self.now_ms())
     }
 
@@ -272,7 +300,7 @@ impl UpstreamPool {
     /// `max_ejected_percent` of the pool — past that, every backend is failing
     /// and "failing" has stopped being a reason to prefer one over another.
     /// Both filters collapse to the full pool rather than to nothing.
-    pub fn select_at(&self, path: &str, now_ms: u64) -> Option<&Backend> {
+    pub fn select_at(&self, path: &str, now_ms: u64) -> Option<SelectedBackend<'_>> {
         if self.backends.is_empty() {
             return None;
         }
@@ -284,35 +312,62 @@ impl UpstreamPool {
         // Nothing healthy: serve anyway rather than converting a degraded
         // origin into a guaranteed outage.
         if healthy.is_empty() {
-            return self.pick(&self.backends.iter().collect::<Vec<_>>(), path);
+            return self
+                .pick(&self.backends.iter().collect::<Vec<_>>(), path)
+                .map(|backend| SelectedBackend {
+                    backend,
+                    probe: None,
+                });
         }
 
         if self.max_ejected == 0 {
-            return self.pick(&healthy, path);
+            return self.pick(&healthy, path).map(|backend| SelectedBackend {
+                backend,
+                probe: None,
+            });
         }
-        let ejected: Vec<&&Backend> = healthy
+        let ejected: Vec<&Backend> = healthy
             .iter()
             .filter(|b| self.breaker_state(b.id) == BreakerState::Open)
+            .copied()
             .collect();
         // The outlier-ejection cap. When an origin-wide dependency fails,
         // every backend fails, every breaker trips, and a proxy that honoured
         // all of them would have nowhere left to send anything.
-        if ejected.len() > self.max_ejected {
-            return self.pick(&healthy, path);
-        }
-
         // Spend a recovery probe if one is due. This is checked before normal
         // selection, and it has to be: an ejected backend that is never picked
         // never produces the observation that would close its breaker, so a
         // pool with one good backend left would eject the rest permanently.
         // The cost is one request per `open_for` per ejected backend.
         for backend in &ejected {
-            if self
-                .state(backend.id)
-                .is_some_and(|s| s.breaker.allows(now_ms))
-            {
-                return Some(backend);
+            if let Some(state) = self.state(backend.id) {
+                match state.breaker.allowance(now_ms) {
+                    BreakerAllowance::Probe(token) => {
+                        return Some(SelectedBackend {
+                            backend,
+                            probe: Some(token),
+                        });
+                    }
+                    // It closed concurrently with the ejected snapshot. It is
+                    // safe to use immediately as ordinary traffic.
+                    BreakerAllowance::Normal => {
+                        return Some(SelectedBackend {
+                            backend,
+                            probe: None,
+                        });
+                    }
+                    BreakerAllowance::Denied => {}
+                }
             }
+        }
+
+        if ejected.len() > self.max_ejected {
+            return self.pick(&healthy, path).map(|backend| SelectedBackend {
+                backend,
+                // This is cap fallback traffic, not the one request that won a
+                // recovery token above. Its result cannot decide the breaker.
+                probe: None,
+            });
         }
 
         let available: Vec<&Backend> = healthy
@@ -321,9 +376,15 @@ impl UpstreamPool {
             .copied()
             .collect();
         if available.is_empty() {
-            return self.pick(&healthy, path);
+            return self.pick(&healthy, path).map(|backend| SelectedBackend {
+                backend,
+                probe: None,
+            });
         }
-        self.pick(&available, path)
+        self.pick(&available, path).map(|backend| SelectedBackend {
+            backend,
+            probe: None,
+        })
     }
 
     /// Apply the configured strategy to a set of candidates.
@@ -401,11 +462,16 @@ impl UpstreamPool {
 pub struct InFlightGuard {
     pool: Arc<UpstreamPool>,
     id: usize,
+    probe: Option<ProbeToken>,
 }
 
 impl InFlightGuard {
     pub fn backend_id(&self) -> usize {
         self.id
+    }
+
+    pub(crate) fn probe_token(&self) -> Option<ProbeToken> {
+        self.probe
     }
 }
 
@@ -478,7 +544,7 @@ mod tests {
     fn round_robin_cycles_through_every_backend() {
         let p = pool(LoadBalancing::RoundRobin);
         let picks: Vec<&str> = (0..6)
-            .map(|_| p.select("/x").unwrap().address.as_str())
+            .map(|_| p.select("/x").unwrap().backend.address.as_str())
             .collect();
         assert_eq!(
             picks,
@@ -610,7 +676,7 @@ mod tests {
     fn a_backend_failing_real_traffic_is_ejected_even_while_it_probes_healthy() {
         let p = pool_of(3, LoadBalancing::RoundRobin, &breaker_on(4, 50));
         for _ in 0..4 {
-            p.record_outcome(1, false);
+            p.record_outcome(1, None, false);
         }
         assert_eq!(p.breaker_state(1), BreakerState::Open);
         assert!(p.is_healthy(1), "health checking still says it is fine");
@@ -625,7 +691,7 @@ mod tests {
     fn breakers_are_inert_until_they_are_turned_on() {
         let p = pool_of(3, LoadBalancing::RoundRobin, &breaker_off());
         for _ in 0..100 {
-            p.record_outcome(1, false);
+            p.record_outcome(1, None, false);
         }
         assert_eq!(p.breaker_state(1), BreakerState::Closed);
         let ids: std::collections::HashSet<usize> =
@@ -641,7 +707,7 @@ mod tests {
         let p = pool_of(4, LoadBalancing::RoundRobin, &breaker_on(4, 50));
         for id in 0..4 {
             for _ in 0..4 {
-                p.record_outcome(id, false);
+                p.record_outcome(id, None, false);
             }
         }
         assert_eq!(p.ejected_count(), 4);
@@ -662,7 +728,7 @@ mod tests {
         let p = pool_of(4, LoadBalancing::RoundRobin, &breaker_on(4, 50));
         for id in [0, 1] {
             for _ in 0..4 {
-                p.record_outcome(id, false);
+                p.record_outcome(id, None, false);
             }
         }
         assert_eq!(p.ejected_count(), 2);
@@ -679,7 +745,7 @@ mod tests {
     fn an_ejected_backend_gets_one_probe_per_period_and_can_come_back() {
         let p = pool_of(4, LoadBalancing::RoundRobin, &breaker_on(4, 50));
         for _ in 0..4 {
-            p.record_outcome(1, false);
+            p.record_outcome(1, None, false);
         }
         let opened_at = p.now_ms();
 
@@ -690,13 +756,14 @@ mod tests {
 
         // Once it expires exactly one request does.
         let probe_at = opened_at + 500;
-        assert_eq!(p.select_at("/x", probe_at).unwrap().id, 1);
+        let probe = p.select_at("/x", probe_at).unwrap();
+        assert_eq!(probe.id, 1);
         for _ in 0..20 {
             assert_ne!(p.select_at("/x", probe_at).unwrap().id, 1);
         }
 
         // And a good result puts it back in rotation.
-        p.record_outcome(1, true);
+        p.record_outcome(1, probe.probe, true);
         assert_eq!(p.breaker_state(1), BreakerState::Closed);
         let ids: std::collections::HashSet<usize> = (0..12)
             .map(|_| p.select_at("/x", probe_at).unwrap().id)
@@ -709,7 +776,7 @@ mod tests {
         let p = pool_of(3, LoadBalancing::RoundRobin, &breaker_on(4, 50));
         p.set_healthy(2, false);
         for _ in 0..4 {
-            p.record_outcome(0, false);
+            p.record_outcome(0, None, false);
         }
         let now = p.now_ms();
         for _ in 0..20 {

@@ -115,7 +115,7 @@ impl AdmissionController {
         &self.tiers
     }
 
-    fn tier(&self, priority: Priority) -> Option<&Arc<Limiter>> {
+    pub fn tier_limiter(&self, priority: Priority) -> Option<&Arc<Limiter>> {
         Priority::ALL
             .iter()
             .position(|p| *p == priority)
@@ -219,7 +219,7 @@ impl AdmissionController {
             return Admission::Exempt;
         }
 
-        let tier = self.tier(priority);
+        let tier = self.tier_limiter(priority);
         let budget = std::iter::once(self.global.queue_timeout())
             .chain(route.map(|limiter| limiter.queue_timeout()))
             .chain(tier.map(|limiter| limiter.queue_timeout()))
@@ -481,7 +481,7 @@ mod tests {
                 .await,
             Admission::Shed(_)
         ));
-        let low = c.tier(Priority::Low).unwrap();
+        let low = c.tier_limiter(Priority::Low).unwrap();
         assert_eq!(
             low.available(),
             low.limit(),
@@ -492,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn reload_resizes_the_tiers_along_with_the_global_ceiling() {
         let c = tiered(10, 100, 100, 50);
-        assert_eq!(c.tier(Priority::Low).unwrap().limit(), 5);
+        assert_eq!(c.tier_limiter(Priority::Low).unwrap().limit(), 5);
         c.apply_limits(
             100,
             0,
@@ -504,9 +504,9 @@ mod tests {
             },
             &[],
         );
-        assert_eq!(c.tier(Priority::High).unwrap().limit(), 100);
-        assert_eq!(c.tier(Priority::Normal).unwrap().limit(), 90);
-        assert_eq!(c.tier(Priority::Low).unwrap().limit(), 20);
+        assert_eq!(c.tier_limiter(Priority::High).unwrap().limit(), 100);
+        assert_eq!(c.tier_limiter(Priority::Normal).unwrap().limit(), 90);
+        assert_eq!(c.tier_limiter(Priority::Low).unwrap().limit(), 20);
     }
 
     #[tokio::test]
@@ -514,7 +514,7 @@ mod tests {
         // Validation refuses this combination; if it ever gets through, a
         // ceiling of zero would be a silent outage for that tier.
         let c = tiered(5, 100, 100, 10);
-        assert_eq!(c.tier(Priority::Low).unwrap().limit(), 1);
+        assert_eq!(c.tier_limiter(Priority::Low).unwrap().limit(), 1);
         assert!(matches!(
             c.admit(RequestClass::PublicDocument, None, Priority::Low, 1)
                 .await,
@@ -551,7 +551,7 @@ mod tests {
             .admit(RequestClass::PublicDynamic, Some(&route), Priority::Low, 3)
             .await;
         assert_eq!(route.available(), 3);
-        assert_eq!(c.tier(Priority::Low).unwrap().available(), 17);
+        assert_eq!(c.tier_limiter(Priority::Low).unwrap().available(), 17);
         assert_eq!(c.global().available(), 17);
     }
 
@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(route.available(), 3);
         drop(held);
         assert_eq!(route.available(), 6);
-        assert_eq!(c.tier(Priority::Low).unwrap().available(), 20);
+        assert_eq!(c.tier_limiter(Priority::Low).unwrap().available(), 20);
         assert_eq!(c.global().available(), 20);
     }
 

@@ -13,6 +13,7 @@
 //! clock, so a state machine made entirely of minute-long deadlines is
 //! testable in microseconds.
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::window::{RollingRatio, millis};
@@ -26,6 +27,19 @@ pub enum BreakerState {
     /// Ejected. Only the routing fallbacks in [`super::UpstreamPool::select`]
     /// can still send it work.
     Open,
+}
+
+/// Identity of the one recovery request currently allowed through an open
+/// breaker. Results carry this token back so an older or ordinary request
+/// cannot decide the state of a newer probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeToken(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerAllowance {
+    Denied,
+    Normal,
+    Probe(ProbeToken),
 }
 
 impl BreakerState {
@@ -45,14 +59,21 @@ pub struct Breaker {
     window: RollingRatio,
     /// Milliseconds until which this backend is ejected. `0` means closed.
     ///
-    /// One atomic carries the whole state machine, which is what makes the
-    /// half-open transition race-free: the thread that wins the
-    /// compare-exchange past the deadline is the one probe, and it re-arms the
-    /// deadline in the same operation. A probe whose result never arrives —
+    /// The deadline is atomic on the ordinary request path. Once it expires, a
+    /// short transition lock assigns one probe token and re-arms this deadline
+    /// before the request is admitted. A probe whose result never arrives —
     /// the client hung up, the process is shutting down — therefore cannot
-    /// leave the gate open, because the gate closed again the moment it was
-    /// let through.
+    /// leave the gate open, because the deadline was re-armed as it entered.
     open_until_ms: AtomicU64,
+    /// Monotonic identity source and the identity currently entitled to decide
+    /// whether an open breaker closes. They are separate from the deadline so
+    /// probes from overlapping periods cannot be confused.
+    next_probe: AtomicU64,
+    active_probe: AtomicU64,
+    /// Serialises the rare half-open claim/result transition. Closed/open reads
+    /// remain atomic on the request path; the lock is touched only once an open
+    /// deadline expires or its probe completes.
+    probe_lock: Mutex<()>,
     /// How many times this backend has been ejected, for the status document.
     trips: AtomicU64,
 }
@@ -66,6 +87,9 @@ impl Breaker {
             open_for_ms: millis(cfg.open_for.as_duration()),
             window: RollingRatio::new(cfg.window.as_duration()),
             open_until_ms: AtomicU64::new(0),
+            next_probe: AtomicU64::new(0),
+            active_probe: AtomicU64::new(0),
+            probe_lock: Mutex::new(()),
             trips: AtomicU64::new(0),
         }
     }
@@ -84,9 +108,9 @@ impl Breaker {
         (total - failed.min(total), failed)
     }
 
-    /// Ejected right now, for reporting. Unlike [`Breaker::allows`] this never
-    /// consumes the half-open probe, so a metrics scrape cannot spend the one
-    /// request that was going to test recovery.
+    /// Ejected right now, for reporting. Unlike [`Breaker::allowance`] this
+    /// never consumes the half-open probe, so a metrics scrape cannot spend the
+    /// one request that was going to test recovery.
     pub fn state(&self) -> BreakerState {
         if self.open_until_ms.load(Ordering::Acquire) == 0 {
             BreakerState::Closed
@@ -97,34 +121,33 @@ impl Breaker {
 
     /// May this backend be picked?
     ///
-    /// Answering `true` past the open deadline is the half-open probe, and it
-    /// re-arms the deadline as it goes, so exactly one request per `open_for`
-    /// is spent finding out whether the backend came back.
-    pub fn allows(&self, now_ms: u64) -> bool {
+    /// Returning [`BreakerAllowance::Probe`] past the open deadline re-arms the
+    /// deadline as it goes, so exactly one request per `open_for` is spent
+    /// finding out whether the backend came back.
+    pub fn allowance(&self, now_ms: u64) -> BreakerAllowance {
         if !self.enabled {
-            return true;
+            return BreakerAllowance::Normal;
         }
-        loop {
-            let until = self.open_until_ms.load(Ordering::Acquire);
-            if until == 0 {
-                return true;
-            }
-            if now_ms < until {
-                return false;
-            }
-            match self.open_until_ms.compare_exchange_weak(
-                until,
-                self.deadline(now_ms),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                // This request is the probe.
-                Ok(_) => return true,
-                // Someone else took the probe, or closed the breaker outright.
-                // Re-read rather than guessing which.
-                Err(_) => continue,
-            }
+        let until = self.open_until_ms.load(Ordering::Acquire);
+        if until == 0 {
+            return BreakerAllowance::Normal;
         }
+        if now_ms < until {
+            return BreakerAllowance::Denied;
+        }
+        let _transition = self.probe_lock.lock();
+        let until = self.open_until_ms.load(Ordering::Acquire);
+        if until == 0 {
+            return BreakerAllowance::Normal;
+        }
+        if now_ms < until {
+            return BreakerAllowance::Denied;
+        }
+        self.open_until_ms
+            .store(self.deadline(now_ms), Ordering::Release);
+        let token = self.next_probe.fetch_add(1, Ordering::AcqRel) + 1;
+        self.active_probe.store(token, Ordering::Release);
+        BreakerAllowance::Probe(ProbeToken(token))
     }
 
     /// Fold one origin outcome into the window.
@@ -132,25 +155,38 @@ impl Breaker {
         if !self.enabled {
             return;
         }
+        // An ordinary attempt may have started before another request tripped
+        // the breaker, or may be fallback traffic admitted past the ejection
+        // cap. Neither is the explicitly selected recovery probe, so neither
+        // may close or extend an open breaker.
         if self.open_until_ms.load(Ordering::Acquire) != 0 {
-            // This was the half-open probe: one result decides, because there
-            // is by construction only one request in flight to decide it.
-            if ok {
-                // Start the recovery clean. Without this, the failures that
-                // tripped the breaker are still inside the window, and the
-                // first failure afterwards re-trips it immediately.
-                self.window.reset();
-                self.open_until_ms.store(0, Ordering::Release);
-            } else {
-                self.open_until_ms
-                    .store(self.deadline(now_ms), Ordering::Release);
-            }
             return;
         }
 
         self.window.record(now_ms, !ok);
         if !ok {
             self.trip_if_over_threshold(now_ms);
+        }
+    }
+
+    /// Fold the outcome of a specifically identified recovery probe into the
+    /// state machine. A stale token is ignored: a slow result from the previous
+    /// probe period must not override the result of the current one.
+    pub fn record_probe(&self, now_ms: u64, token: ProbeToken, ok: bool) {
+        if !self.enabled {
+            return;
+        }
+        let _transition = self.probe_lock.lock();
+        if self.active_probe.load(Ordering::Acquire) != token.0 {
+            return;
+        }
+        self.active_probe.store(0, Ordering::Release);
+        if ok {
+            self.window.reset();
+            self.open_until_ms.store(0, Ordering::Release);
+        } else {
+            self.open_until_ms
+                .store(self.deadline(now_ms), Ordering::Release);
         }
     }
 
@@ -213,7 +249,7 @@ mod tests {
         for _ in 0..100 {
             b.record(0, false);
         }
-        assert!(b.allows(0));
+        assert_eq!(b.allowance(0), BreakerAllowance::Normal);
         assert_eq!(b.state(), BreakerState::Closed);
     }
 
@@ -223,9 +259,17 @@ mod tests {
         for _ in 0..19 {
             b.record(0, false);
         }
-        assert!(b.allows(0), "tripped below min_requests");
+        assert_eq!(
+            b.allowance(0),
+            BreakerAllowance::Normal,
+            "tripped below min_requests"
+        );
         b.record(0, false);
-        assert!(!b.allows(0), "20 failures out of 20 is not noise");
+        assert_eq!(
+            b.allowance(0),
+            BreakerAllowance::Denied,
+            "20 failures out of 20 is not noise"
+        );
     }
 
     #[test]
@@ -234,7 +278,11 @@ mod tests {
         for i in 0..99 {
             b.record(0, i % 3 != 0); // two thirds succeed, a third fail
         }
-        assert!(b.allows(0), "a third failing is under the 50% threshold");
+        assert_eq!(
+            b.allowance(0),
+            BreakerAllowance::Normal,
+            "a third failing is under the 50% threshold"
+        );
         assert_eq!(b.counts(0), (66, 33));
     }
 
@@ -245,7 +293,7 @@ mod tests {
         for i in 0..12 {
             b.record(0, i % 3 == 0);
         }
-        assert!(!b.allows(0));
+        assert_eq!(b.allowance(0), BreakerAllowance::Denied);
         assert_eq!(b.trips(), 1);
     }
 
@@ -262,7 +310,7 @@ mod tests {
             b.record(later, true);
         }
         assert_eq!(b.counts(later), (9, 0));
-        assert!(b.allows(later));
+        assert_eq!(b.allowance(later), BreakerAllowance::Normal);
     }
 
     #[test]
@@ -270,16 +318,30 @@ mod tests {
         let b = Breaker::new(&cfg(2, 50));
         b.record(0, false);
         b.record(0, false);
-        assert!(!b.allows(0));
-        assert!(!b.allows(499), "still inside open_for");
+        assert_eq!(b.allowance(0), BreakerAllowance::Denied);
+        assert_eq!(
+            b.allowance(499),
+            BreakerAllowance::Denied,
+            "still inside open_for"
+        );
 
-        assert!(b.allows(500), "the probe is admitted once open_for elapses");
         assert!(
-            !b.allows(500),
+            matches!(b.allowance(500), BreakerAllowance::Probe(_)),
+            "the probe is admitted once open_for elapses"
+        );
+        assert!(
+            matches!(b.allowance(500), BreakerAllowance::Denied),
             "a second request in the same instant must not also be a probe"
         );
-        assert!(!b.allows(999), "the probe re-armed the deadline");
-        assert!(b.allows(1000), "and the next period gets its own probe");
+        assert_eq!(
+            b.allowance(999),
+            BreakerAllowance::Denied,
+            "the probe re-armed the deadline"
+        );
+        assert!(
+            matches!(b.allowance(1000), BreakerAllowance::Probe(_)),
+            "and the next period gets its own probe"
+        );
     }
 
     #[test]
@@ -289,10 +351,12 @@ mod tests {
         b.record(0, false);
         assert_eq!(b.state(), BreakerState::Open);
 
-        assert!(b.allows(500));
-        b.record(500, true);
+        let BreakerAllowance::Probe(token) = b.allowance(500) else {
+            panic!("probe not admitted")
+        };
+        b.record_probe(500, token, true);
         assert_eq!(b.state(), BreakerState::Closed);
-        assert!(b.allows(500));
+        assert_eq!(b.allowance(500), BreakerAllowance::Normal);
     }
 
     #[test]
@@ -301,11 +365,13 @@ mod tests {
         b.record(0, false);
         b.record(0, false);
 
-        assert!(b.allows(500));
-        b.record(500, false);
+        let BreakerAllowance::Probe(token) = b.allowance(500) else {
+            panic!("probe not admitted")
+        };
+        b.record_probe(500, token, false);
         assert_eq!(b.state(), BreakerState::Open);
-        assert!(!b.allows(999));
-        assert!(b.allows(1000));
+        assert_eq!(b.allowance(999), BreakerAllowance::Denied);
+        assert!(matches!(b.allowance(1000), BreakerAllowance::Probe(_)));
     }
 
     /// The flap this guards against: the breaker closes, the failures that
@@ -317,13 +383,15 @@ mod tests {
         for _ in 0..4 {
             b.record(0, false);
         }
-        assert!(b.allows(500));
-        b.record(500, true);
+        let BreakerAllowance::Probe(token) = b.allowance(500) else {
+            panic!("probe not admitted")
+        };
+        b.record_probe(500, token, true);
         assert_eq!(b.counts(500), (0, 0), "the old failures survived recovery");
 
         b.record(500, false);
         assert!(
-            b.allows(500),
+            b.allowance(500) == BreakerAllowance::Normal,
             "one failure after recovery re-tripped the breaker"
         );
     }
@@ -338,5 +406,36 @@ mod tests {
         // Still open: further failures are the same trip, not new ones.
         b.record(10, false);
         assert_eq!(b.trips(), 1);
+    }
+
+    #[test]
+    fn an_ordinary_response_in_flight_before_the_trip_cannot_close_it() {
+        let b = Breaker::new(&cfg(2, 50));
+        b.record(0, false);
+        b.record(0, false);
+        assert_eq!(b.state(), BreakerState::Open);
+
+        b.record(10, true);
+        assert_eq!(b.state(), BreakerState::Open);
+        assert_eq!(b.allowance(499), BreakerAllowance::Denied);
+    }
+
+    #[test]
+    fn a_stale_probe_result_cannot_override_the_current_probe() {
+        let b = Breaker::new(&cfg(2, 50));
+        b.record(0, false);
+        b.record(0, false);
+        let BreakerAllowance::Probe(old) = b.allowance(500) else {
+            panic!("first probe not admitted")
+        };
+        let BreakerAllowance::Probe(current) = b.allowance(1_000) else {
+            panic!("second probe not admitted")
+        };
+
+        b.record_probe(1_001, old, true);
+        assert_eq!(b.state(), BreakerState::Open);
+        b.record_probe(1_002, current, false);
+        assert_eq!(b.state(), BreakerState::Open);
+        assert_eq!(b.allowance(1_501), BreakerAllowance::Denied);
     }
 }
