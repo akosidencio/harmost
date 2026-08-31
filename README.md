@@ -62,6 +62,7 @@ Reference documentation:
 | [`docs/RELEASE-GATES.md`](./docs/RELEASE-GATES.md) | What has to pass before a tag, and what is deliberately not gated |
 | [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) | What is protected, from whom, and what is not defended |
 | [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) | A brief for the independent review that has not yet happened |
+| [`docs/ROADMAP.md`](./docs/ROADMAP.md) | Active work, current limitations, and framework expansion plans |
 | [`ops/`](./ops) | Example Prometheus alerts and a Grafana dashboard |
 | [`CHANGELOG.md`](./CHANGELOG.md) | What changed in each release, and what to do when upgrading |
 
@@ -69,7 +70,8 @@ Everything described below as a benefit is a **design goal supported by local
 tests**, not an outcome observed under real traffic. If you deploy it, do so
 behind something you can fail back to, and read
 [Slow readers and render capacity](#slow-readers-and-render-capacity) and
-[Roadmap](#roadmap) for the parts that are known to be incomplete.
+[the roadmap and current limitations](./docs/ROADMAP.md) for the parts that are
+known to be incomplete.
 
 ## Contents
 
@@ -90,8 +92,7 @@ behind something you can fail back to, and read
 **Where it stands**
 [Project maturity](#project-maturity-and-expectations) ·
 [Project status](#project-status) ·
-[Current limitations and non-goals](#current-limitations-and-non-goals) ·
-[Roadmap](#roadmap) ·
+[Roadmap and limitations](./docs/ROADMAP.md) ·
 [Security](#security)
 
 ## The problem
@@ -149,7 +150,7 @@ Any origin whose responses are expensive to produce has the same shape, so
 other React Server Components frameworks — and non-JavaScript SSR origins — are
 plausible targets. **None are supported today.** Additional adapters land only
 once the generic contract is stable enough that adding one cannot bend it; see
-[Roadmap](#roadmap) phase 4.
+[roadmap phase 4](./docs/ROADMAP.md#4-complete-the-cache-lifecycle-and-framework-integration).
 
 ## Is Harmost for you?
 
@@ -1066,6 +1067,11 @@ asserts that fifteen requests still complete promptly.
 [`ops/grafana/dashboard.json`](./ops/grafana/dashboard.json). The four signals
 worth understanding before an incident:
 
+The dashboard uses a Prometheus data-source variable. After importing it into
+Grafana Cloud, select the hosted Prometheus/Metrics source from the **Metrics
+data source** dropdown at the top. The local Compose demo selects its
+provisioned `Prometheus` source by default.
+
 Run the complete local observability demo with Docker Compose:
 
 ```bash
@@ -1261,146 +1267,20 @@ boundary, which is where the key finally becomes opaque.
 
 ## Project status
 
-What is built, and how far it has been verified. "done, tested" means
-unit-tested and, where a `bench/` script exists, verified end to end against a
-local test origin — never production-validated; see
-[Project maturity](#project-maturity-and-expectations).
+The core proxy, admission, cache, coalescing, protocol, observability, and
+restart paths are implemented and exercised against local fixtures. The full
+workspace test suite includes unit, property, fuzz, browser, adversarial, soak,
+memory-pressure, restart, and chaos coverage. This is still synthetic evidence,
+not production validation.
 
-| Area | State |
-| --- | --- |
-| Config schema, units, validation | done, tested |
-| Route matching and policy snapshot | done, tested |
-| Request classification (generic + Next.js) | done, tested |
-| Cache key construction | done, tested |
-| Response shareability rules | done, tested |
-| Admission control, queueing, load shedding | done, tested |
-| Cache store | implemented with Pingora `Storage` ([spike](./spike/pingora-cache/FINDINGS.md)) |
-| Request coalescing | implemented with `pingora-cache` cache locks |
-| Pingora proxy layer | proxy, routing, admission, upstream selection wired |
-| Cache and coalescing wiring | implemented; experimental |
-| Prometheus metrics, JSON/text access logs | done |
-| Active health checks | done |
-| Graceful reload (SIGHUP) | done |
-| Stale-while-revalidate, stale-if-error | done |
-| Real Next.js fixture (App Router + Pages Router) | done; local Docker integration tested |
-| Browser-driven prefetch and Server Action checks | done (Chromium, [`bench/nextjs-browser.sh`](./bench/nextjs-browser.sh)) |
-| Property tests and fuzz targets | done ([`fuzz/`](./fuzz)); 7 targets run in CI |
-| HTTP/2 downstream (h2c and ALPN) and upstream | done, tested ([`bench/http2.sh`](./bench/http2.sh)) |
-| `HEAD`, `Range`, conditional requests, disconnects, malformed bodies | done, tested ([`bench/protocol.sh`](./bench/protocol.sh)) |
-| `Upgrade`/WebSocket proxying, bounded separately from renders | done, tested, off by default ([`bench/websocket.sh`](./bench/websocket.sh)) |
-| Native TLS, downstream and upstream (`--features tls`) | done, tested ([`bench/tls.sh`](./bench/tls.sh)); [Pingora labels its rustls backend experimental](https://github.com/cloudflare/pingora#feature-highlights), so external TLS termination remains recommended |
-| Trusted proxies, forwarded scheme and client IP | done, tested ([`bench/forwarded.sh`](./bench/forwarded.sh)) |
-| Bounded response spool | done, tested ([`bench/spool.sh`](./bench/spool.sh)) |
-| Threat model | [written](./docs/THREAT-MODEL.md); **not independently reviewed** |
-| Independent review of cache keys and shareability | **not obtained**; brief prepared at [`docs/CACHE-KEY-REVIEW.md`](./docs/CACHE-KEY-REVIEW.md) |
-| Sustained adversarial testing | 20s in CI ([`bench/adversarial.sh`](./bench/adversarial.sh)); a smoke test, not a campaign |
-| Readiness, liveness and status endpoints | done, tested ([`bench/admin.sh`](./bench/admin.sh)) |
-| Drain state, `SIGUSR1`, graceful restart | done, tested ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
-| Pingora zero-downtime socket handover | done, tested ([`bench/upgrade.sh`](./bench/upgrade.sh)) |
-| W3C trace-context correlation | done, tested; unconditional ([`bench/tracing.sh`](./bench/tracing.sh)) |
-| OpenTelemetry span export | done, tested — OTLP/HTTP JSON, **plaintext only** ([`bench/tracing.sh`](./bench/tracing.sh)) |
-| Config schema version and migration notes | done ([`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md)) |
-| Soak, memory-pressure, restart and chaos tests | done ([`soak.sh`](./bench/soak.sh), [`memory.sh`](./bench/memory.sh), [`upgrade.sh`](./bench/upgrade.sh), [`chaos.sh`](./bench/chaos.sh)); CI-sized on every push, full size before a tag ([gates](./docs/RELEASE-GATES.md)) |
-| Example Prometheus alerts and Grafana dashboard | done ([`ops/`](./ops)) |
-| Release binary, checksums, SBOM, reproducible builds | workflow written ([`scripts/reproducible-build.sh`](./scripts/reproducible-build.sh)); **no release has been cut yet**, so the reproducibility claim is untested by anyone but its author |
-| Circuit breaking, least-loaded balancing | not started ([roadmap](#roadmap)) |
-| Cache purge API | not started ([roadmap](#roadmap)) |
+The two most important open validation gaps are the independent cache-key and
+shareability review and an end-to-end exercise of published release artifacts.
+Completed work is recorded in [`CHANGELOG.md`](./CHANGELOG.md); active work and
+operational limitations are kept in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
-The security- and correctness-sensitive parts — cache-key construction, response
-shareability, and bounded admission — remain isolated as testable logic beneath
-the Pingora proxy layer. The full workspace test suite (276 tests, including
-property tests over generated inputs) runs without external network services.
-
-Configuration options that are accepted but not yet implemented are rejected at
-startup rather than silently ignored, so a config can never claim a protection
-that is not running.
-
-## Current limitations and non-goals
-
-- **On a route without `spool.enabled`, a slow reader still delays observed
-  origin end-of-stream and occupies a render slot,** bounded only by
-  `timeouts.downstream_write`. The spool fixes this and is off by default
-  because it costs progressive rendering; see
-  [Slow readers and render capacity](#slow-readers-and-render-capacity).
-- Cache, coalescing and admission state are process-local. Replicas multiply
-  origin ceilings unless their limits are partitioned, and one key can render
-  once per replica.
-- The only cache backend is bounded in-process memory. Restarting clears it,
-  and FIFO eviction is intentionally simple rather than production-tuned. There
-  is no purge API, so an entry that turns out to be wrong can only be waited out.
-- **There is no rate limiting of any kind.** Harmost bounds origin *work*, not
-  bytes, connections per source, or requests per second. Keep an edge in front.
-- **A `SIGTERM` costs `drain_period + shutdown_timeout` even when nothing is in
-  flight**, because Pingora's shutdown waits out its timeout rather than
-  finishing early. Size your supervisor's stop timeout above that sum.
-- **The OTLP exporter is plaintext-only.** It is hand-written to avoid a gRPC
-  or HTTP-client dependency tree larger than the rest of the binary, and an
-  `https://` endpoint is refused at startup rather than silently downgraded.
-  Run an OpenTelemetry Collector as a sidecar.
-- **No release has been cut yet.** The release workflow, checksums, SBOM and
-  reproducible-build instructions are written but unexercised end to end.
-- `origin.tls.ca` is rejected: Pingora 0.8's rustls connector does not read a
-  per-peer CA store. Use `SSL_CERT_FILE` / `SSL_CERT_DIR`.
-- Several settings are startup-bound and a SIGHUP reload **refuses** rather than
-  silently ignores them: listeners, TLS, `trusted_proxies`, `origin.http_version`,
-  `spool.max_memory`, `upgrade.max_concurrent`, the cache budget and
-  `timeouts.origin`.
-- `serde_yaml`, which is deprecated, still enters the dependency tree through
-  `pingora-core`'s own config parsing. Harmost's config is parsed with
-  `serde-saphyr`.
-
-## Roadmap
-
-Ordered by dependency and risk rather than novelty. Later phases depend on the
-evidence and safety work before them.
-
-### Phases 0–2 — done
-
-Evidence, protocol and security gaps, and operability are complete. Each phase
-found real bugs; those, and the dependency limitations each one refused to paper
-over, are recorded in [`CHANGELOG.md`](./CHANGELOG.md).
-
-| Phase | Delivered |
-| --- | --- |
-| **0. Make the evidence trustworthy** | Per-run pid and port tracking in [`bench/lib.sh`](./bench/lib.sh); every script asserts rather than prints; render counts read from the fixture origin's own `/__stats` rather than the proxy's account of itself; a Pages Router surface alongside the App Router; Chromium-driven prefetch and Server Action checks; property tests and seven [fuzz targets](./fuzz/fuzz_targets) in CI |
-| **1. Close protocol and security gaps** | HTTP/2 downstream (h2c and ALPN) and upstream; `HEAD`, `Range`, conditional requests, disconnects and malformed bodies; `Upgrade`/WebSocket, bounded separately from renders and off by default; rustls TLS in both directions; `server.trusted_proxies`; the bounded [response spool](#slow-readers-and-render-capacity); a [threat model](./docs/THREAT-MODEL.md) and an [adversarial suite](./bench/adversarial.sh) |
-| **2. Become operable as a service** | Release workflow with checksums, SBOM and provenance; `/health/live`, `/health/ready` and `/status`; unconditional W3C correlation plus OTLP span export; `--upgrade`, `--test` and `SIGUSR1` drain; config schema versioning; soak, memory-pressure, restart and chaos gates; example alerts and a Grafana dashboard in [`ops/`](./ops) |
-
-Two things neither phase can close by writing more code — the independent
-review, and the fact that no release has been cut — are in
-[Project status](#project-status) and
-[Current limitations](#current-limitations-and-non-goals).
-
-### 3. Improve origin resilience
-
-- Add passive failure observation, per-backend circuit breakers and outlier
-  ejection alongside active health checks.
-- Add retry budgets for eligible idempotent requests only; never retry
-  mutations blindly.
-- Add least-loaded selection using in-flight work and latency observations.
-- Add weighted admission, route priorities and reserved capacity so a slow,
-  expensive route cannot starve cheap critical work.
-
-### 4. Complete cache lifecycle and framework integration
-
-- Add a purge API and cache tags, including deployment-safe invalidation and a
-  path from Next.js `revalidateTag()`/`revalidatePath()` events.
-- Replace FIFO eviction with a measured production policy and evaluate optional
-  disk or external storage without making it required for admission control.
-- Build a versioned `@harmost/next` integration that exports route hints,
-  deployment ids and invalidation events; maintain a tested Next.js
-  compatibility matrix.
-- Add adapters only after the generic policy contract is stable, starting with
-  frameworks that expose reliable route and privacy metadata.
-
-### 5. Adapt and scale deliberately
-
-- Evaluate adaptive concurrency only after latency and failure signals are
-  trustworthy; retain hard operator-defined ceilings as safety rails.
-- Define a multi-instance capacity model so replicas cannot accidentally
-  multiply the intended origin ceiling.
-- Keep distributed coalescing optional. Path-stable ingress routing remains the
-  simpler default; a distributed lock is justified only by measured need.
+Configuration options that are accepted but not implemented are rejected at
+startup, so a configuration cannot silently claim a protection that is not
+running.
 
 ## Security
 

@@ -34,3 +34,4 @@ docs/*
 !docs/OPERATIONS.md
 !docs/CONFIG-SCHEMA.md
 !docs/RELEASE-GATES.md
+!docs/ROADMAP.md

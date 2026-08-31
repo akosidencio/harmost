@@ -40,7 +40,7 @@
       "description": "Readiness answers 503 while an instance drains, and it keeps serving normally throughout. Non-zero is expected during a deploy; non-zero for longer than a deploy means one was withdrawn and never replaced.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 4,
@@ -89,7 +89,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum(harmost_draining)",
@@ -106,7 +106,7 @@
       "description": "Backends passing their health check, across the fleet. Zero does not stop Harmost serving \u2014 refusing to pick would turn a degraded origin into a guaranteed outage \u2014 but it means users are on stale_if_error.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 4,
@@ -155,7 +155,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum(harmost_upstream_healthy)",
@@ -172,7 +172,7 @@
       "description": "Distinct effective-configuration fingerprints across the fleet. More than one means replicas do not agree, regardless of restart or reload counts.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 4,
@@ -221,7 +221,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "count(count_values(\"fingerprint\", harmost_config_fingerprint))",
@@ -235,10 +235,10 @@
       "id": 5,
       "type": "stat",
       "title": "Origin work avoided",
-      "description": "The headline ratio. Denominator is harmost_reuse_eligible_requests_total, counted only where reuse was genuinely possible \u2014 so it cannot be improved by narrowing eligibility.",
+      "description": "Confirmed cache reuse: HIT and STALE responses divided by requests where reuse was genuinely possible. This conservative ratio never mixes private or bypassed origin calls into the numerator.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 4,
@@ -283,10 +283,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "1 - (sum(rate(harmost_origin_requests_total[5m])) / clamp_min(sum(rate(harmost_reuse_eligible_requests_total[5m])), 0.001))",
+          "expr": "sum(rate(harmost_cache_total{status=~\"hit|stale\"}[5m])) / clamp_min(sum(rate(harmost_reuse_eligible_requests_total[5m])), 0.001)",
           "legendFormat": "",
           "range": true,
           "refId": "A"
@@ -300,7 +300,7 @@
       "description": "Everything arriving at the traffic listener, served or shed.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 4,
@@ -345,7 +345,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum(rate(harmost_requests_total[5m]))",
@@ -375,7 +375,7 @@
       "description": "Both series are a count of permits, so they share one axis. In flight pinned at the limit means saturated: check render latency before raising the ceiling, because a higher ceiling against a slower origin makes it slower still.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -471,7 +471,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum by (limiter) (harmost_origin_in_flight)",
@@ -482,7 +482,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum by (limiter) (harmost_concurrency_limit)",
@@ -499,7 +499,7 @@
       "description": "Shedding is the mechanism working and users receiving 503 at the same time. Both readings are true; act on the origin, not on the proxy.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -625,7 +625,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum by (decision) (rate(harmost_admission_total[5m]))",
@@ -642,7 +642,7 @@
       "description": "Measured from Harmost's side, so it includes the origin's own queueing. Three quantiles on one seconds axis.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -753,7 +753,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by (le) (rate(harmost_origin_latency_seconds_bucket[5m])))",
@@ -764,7 +764,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le) (rate(harmost_origin_latency_seconds_bucket[5m])))",
@@ -775,7 +775,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le) (rate(harmost_origin_latency_seconds_bucket[5m])))",
@@ -792,7 +792,7 @@
       "description": "Requests waiting for origin capacity. A queue that never empties is latency added to every request rather than capacity being smoothed.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -857,7 +857,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum by (limiter) (harmost_queue_depth)",
@@ -887,7 +887,7 @@
       "description": "hit and stale cost no origin work. bypass is the policy refusing to share a response, which is a correct outcome and not an error.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -1028,7 +1028,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum by (status) (rate(harmost_cache_total[5m]))",
@@ -1045,7 +1045,7 @@
       "description": "A closed set of reasons. Watching which one dominates is how a route that looks cacheable but never is gets diagnosed.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -1110,7 +1110,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum by (reason) (rate(harmost_cache_bypass_reason_total[5m]))",
@@ -1127,7 +1127,7 @@
       "description": "Both in bytes, one axis. Full is fine; full with a low hit ratio means the working set does not fit and entries are being evicted before they are reused.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 7,
@@ -1223,7 +1223,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum(harmost_cache_bytes)",
@@ -1234,7 +1234,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum(harmost_cache_max_bytes)",
@@ -1251,7 +1251,7 @@
       "description": "The bounded buffer that lets an origin permit come back when the origin finishes rather than when the client finishes reading.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 7,
@@ -1347,7 +1347,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum(harmost_spool_bytes)",
@@ -1358,7 +1358,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum(harmost_spool_max_bytes)",
@@ -1375,7 +1375,7 @@
       "description": "What the classifier decided each request was. static and streaming consume no origin permit by design.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 7,
@@ -1440,7 +1440,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum by (class) (rate(harmost_requests_total[5m]))",
@@ -1470,7 +1470,7 @@
       "description": "dropped means the queue is too small for the traffic; spans are dropped rather than buffered on purpose, because a telemetry queue that grows under load fails during the incident you wanted the traces for. export_failed means the collector is unreachable. Neither ever costs a request.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 7,
@@ -1596,7 +1596,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum by (outcome) (rate(harmost_spans_total[5m]))",
@@ -1613,7 +1613,7 @@
       "description": "budget_exhausted responses fall back to the old behaviour: the permit is held until the client finishes reading, bounded by timeouts.downstream_write.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 7,
@@ -1724,7 +1724,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
           "expr": "sum by (reason) (rate(harmost_spool_total[5m]))",
@@ -1743,7 +1743,27 @@
     "ssr"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "prometheus"
+        },
+        "description": "Prometheus-compatible data source containing Harmost metrics.",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Metrics data source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
   },
   "time": {
     "from": "now-3h",
