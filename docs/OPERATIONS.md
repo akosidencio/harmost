@@ -312,12 +312,25 @@ or reload counts.
 
 Some settings are **startup-bound and a reload refuses rather than ignores
 them**: listeners, TLS, `trusted_proxies`, `origin.upstreams`,
-`origin.http_version`, `spool.max_memory`, `upgrade.max_concurrent`, the cache
-budget, `timeouts.origin`, `server.graceful`, `telemetry.admin`, and
+`origin.load_balancing`, `origin.http_version`, `origin.breaker`,
+`origin.retry`, `spool.max_memory`, `upgrade.max_concurrent`, the cache budget,
+`timeouts.origin`, `server.graceful`, `telemetry.admin`, and
 `telemetry.tracing.otlp`. A reload that reported success while the old trust
 policy stayed in force would be the worst version of this, so it says so
-instead. `telemetry.tracing.sample` and `trust_incoming` **do** reload, because
-turning sampling down is something you want to do during an incident.
+instead.
+
+`origin.breaker` and `origin.retry` are on that list because each carries a
+rolling window built at startup. Swapping one while requests are in flight
+would leave two windows disagreeing about what has been observed or spent,
+which is not a threshold and not a budget.
+
+What **does** reload is the set you actually reach for mid-incident:
+`origin.concurrency`, per-route `concurrency`, `origin.priorities`,
+`route.priority` and `route.weight`, every cache and coalescing setting,
+`spool.enabled`, `telemetry.tracing.sample` and `trust_incoming`. Raising a
+ceiling or moving a priority share is an incident action, so it happens without
+a restart. Limiters are **resized** rather than replaced, so in-flight permits
+are never double-counted across the change.
 
 ---
 
@@ -387,3 +400,27 @@ Two that are easy to miss:
 - `harmost_cache_bytes` at `cache.max_memory` **with a low hit ratio** — the
   working set does not fit and eviction is destroying entries before they are
   reused. More memory, or a shorter TTL and a narrower key.
+
+### Origin resilience
+
+Only meaningful with `origin.breaker` or `origin.retry` enabled.
+
+| Signal | Means |
+|---|---|
+| `harmost_upstream_ejected == 1` **while** `harmost_upstream_healthy == 1` | The case passive observation exists for: the backend answers its probe and fails real requests. Look at that backend's logs, not at Harmost's. |
+| `harmost_upstream_breaker_trips_total` climbing steadily | Flapping. The backend recovers enough to pass its probe and fails again. Usually worse than a backend that stays down, because each cycle sends live traffic at it. |
+| `sum(harmost_upstream_ejected) == count(harmost_upstream_ejected)` | Every backend is ejected, so the ejection cap has taken over and breaker state is being ignored. This is an origin-wide failure, not a backend one. |
+| `harmost_origin_retries_total{outcome="budget_exhausted"}` rising | Requests are failing faster than the budget absorbs. Raising the budget makes it worse; the origin is the problem. |
+| `harmost_upstream_failures_total{kind="connect"}` rising | Processes are gone or refusing connections. Distinct from `kind="status"`, which is a process that is up and cannot render. |
+
+Two things worth knowing before you trust these:
+
+- **Read `harmost_upstream_failures_total` before enabling `origin.retry`.**
+  Retries added to a misdiagnosed problem make it worse, and the budget is
+  designed to make that failure *bounded*, not impossible.
+- **`least_loaded` publishes what it decides on.**
+  `harmost_upstream_in_flight` and
+  `harmost_upstream_latency_ewma_microseconds` are the two inputs to the score,
+  so a routing decision that looks wrong can be checked rather than guessed at.
+  A backend with a much higher EWMA and much less traffic is the strategy
+  working.

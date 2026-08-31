@@ -152,6 +152,7 @@ mod tests {
             UpstreamPool::new(
                 &["127.0.0.1:1".to_string(), "127.0.0.2:1".to_string()],
                 LoadBalancing::RoundRobin,
+                &crate::config::schema::Breaker::default(),
             )
             .unwrap(),
         );

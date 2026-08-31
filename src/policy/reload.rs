@@ -126,6 +126,18 @@ impl Reloader {
                 "origin.tls or origin.http_version changed; that needs a restart".to_string(),
             );
         }
+        if cfg.origin.breaker != current.config.origin.breaker {
+            return Err(
+                "origin.breaker changed; each backend's failure window and its open/closed state                  are built once at startup, so a reload would report success while the old                  thresholds stayed in force; that needs a restart"
+                    .to_string(),
+            );
+        }
+        if cfg.origin.retry != current.config.origin.retry {
+            return Err(
+                "origin.retry changed; the retry budget's window is bound once at startup, and                  swapping it while retries are in flight would leave two windows disagreeing                  about what has been spent; that needs a restart"
+                    .to_string(),
+            );
+        }
         if cfg.spool.max_memory != current.config.spool.max_memory {
             return Err(
                 "spool.max_memory changed; the spool budget is allocated once at startup and that \
@@ -198,8 +210,23 @@ impl Reloader {
             global.max,
             global.queue.max,
             global.queue.timeout.as_duration(),
+            &snapshot.config.origin.priorities,
             &route_limits,
         );
+        for tier in self.admission.tier_limiters() {
+            crate::telemetry::metrics::LIMIT
+                .with_label_values(&[tier.name()])
+                .set(i64::try_from(tier.limit()).unwrap_or(i64::MAX));
+            crate::telemetry::metrics::QUEUE_DEPTH
+                .with_label_values(&[tier.name()])
+                .set(i64::try_from(tier.queue_depth()).unwrap_or(i64::MAX));
+            crate::telemetry::metrics::IN_FLIGHT
+                .with_label_values(&[tier.name()])
+                .set(
+                    i64::try_from(tier.limit().saturating_sub(tier.available()))
+                        .unwrap_or(i64::MAX),
+                );
+        }
         self.policy.store(snapshot);
         // Published only after the swap succeeded, so the gauge answers "which
         // config is actually serving" rather than "which one was attempted".
@@ -275,7 +302,12 @@ routes:
         let path = write_config(body);
         let cfg = crate::config::load(&path.0).unwrap();
         let snapshot = PolicySnapshot::build(cfg, 1).unwrap();
-        let admission = Arc::new(AdmissionController::new(100, 0, std::time::Duration::ZERO));
+        let admission = Arc::new(AdmissionController::new(
+            100,
+            0,
+            std::time::Duration::ZERO,
+            &crate::config::schema::Priorities::default(),
+        ));
         let policy = Arc::new(ArcSwap::from(snapshot));
         let reloader = Reloader::new(path.0.clone(), policy.clone(), admission);
         (path, reloader, policy)
@@ -338,6 +370,24 @@ routes:
         assert!(err.contains("needs a restart"), "{err}");
     }
 
+    /// Priority shares are the one resilience knob an operator is likely to
+    /// reach for mid-incident, so unlike the breaker and the retry budget they
+    /// reload in place.
+    #[test]
+    fn changing_priority_shares_reloads_in_place() {
+        let (path, reloader, policy) = setup(BASE);
+        std::fs::write(
+            &path.0,
+            BASE.replace(
+                "  concurrency:\n    max: 100",
+                "  concurrency:\n    max: 100\n  priorities:\n    low: 40",
+            ),
+        )
+        .unwrap();
+        reloader.reload().unwrap();
+        assert_eq!(policy.load().config.origin.priorities.low, 40);
+    }
+
     #[test]
     fn changing_upstreams_is_refused_with_an_explanation() {
         let (path, reloader, _policy) = setup(BASE);
@@ -378,6 +428,19 @@ routes:
             ),
             format!("{BASE}spool:\n  max_memory: 16MiB\n"),
             format!("{BASE}upgrade:\n  max_concurrent: 7\n"),
+            // Each backend's failure window and its open/closed state are
+            // built with the pool. A reload cannot rebuild them without
+            // discarding everything observed so far.
+            BASE.replace(
+                "upstreams: [\"a:3000\"]",
+                "upstreams: [\"a:3000\"]\n  breaker:\n    window: 20s",
+            ),
+            // The retry budget's window is bound once; two windows
+            // disagreeing about what has been spent is not a budget.
+            BASE.replace(
+                "upstreams: [\"a:3000\"]",
+                "upstreams: [\"a:3000\"]\n  retry:\n    window: 20s",
+            ),
             // The upgrade socket is what two processes coordinate a
             // zero-downtime handoff on. A reload that reported success while
             // the old path stayed in force would break the next restart.

@@ -120,13 +120,16 @@ pub fn validate(cfg: &Config) -> Result<()> {
     check_unimplemented(cfg)?;
     check_coalesce_wait(cfg)?;
     check_queue(&cfg.origin.concurrency, "origin.concurrency")?;
+    validate_breaker(cfg)?;
+    validate_retry(cfg)?;
+    validate_priorities(cfg)?;
 
     let mut seen: HashSet<&str> = HashSet::new();
     for route in &cfg.routes {
         if !seen.insert(route.id.as_str()) {
             return Err(err(format!("duplicate route id `{}`", route.id)));
         }
-        check_route(route)?;
+        check_route(route, cfg)?;
     }
     Ok(())
 }
@@ -540,9 +543,183 @@ fn check_queue(c: &Concurrency, path: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_route(route: &Route) -> Result<()> {
+fn priority_name(priority: Priority) -> &'static str {
+    match priority {
+        Priority::High => "high",
+        Priority::Normal => "normal",
+        Priority::Low => "low",
+    }
+}
+
+/// A breaker that cannot eject anything is a protection somebody believes they
+/// turned on. Every check here exists because the setting parses cleanly while
+/// describing something inert or self-defeating.
+fn validate_breaker(cfg: &Config) -> Result<()> {
+    let b = &cfg.origin.breaker;
+    if !b.enabled {
+        return Ok(());
+    }
+    if cfg.origin.upstreams.len() < 2 {
+        return Err(err(format!(
+            "origin.breaker.enabled is true with {} upstream; ejecting the only backend would \
+             turn a partial failure into a total outage, so the ejection cap keeps it in \
+             rotation and the breaker never does anything. Add a backend, or remove the block",
+            cfg.origin.upstreams.len()
+        )));
+    }
+    if b.window == super::units::Dur::ZERO || b.open_for == super::units::Dur::ZERO {
+        return Err(err(
+            "origin.breaker.window and origin.breaker.open_for must be greater than zero",
+        ));
+    }
+    if b.min_requests == 0 {
+        return Err(err(
+            "origin.breaker.min_requests is 0; a backend would be ejected on its first failure, \
+             which is noise rather than a signal",
+        ));
+    }
+    if !(1..=100).contains(&b.failure_percent) {
+        return Err(err(format!(
+            "origin.breaker.failure_percent is {}; it is a percentage of the requests in the \
+             window and must be between 1 and 100",
+            b.failure_percent
+        )));
+    }
+    if b.max_ejected_percent > 100 {
+        return Err(err(format!(
+            "origin.breaker.max_ejected_percent is {}; it is a percentage of the pool and cannot \
+             exceed 100",
+            b.max_ejected_percent
+        )));
+    }
+    // `len * percent / 100` floored. Zero means the first ejection already
+    // exceeds the cap, so breakers are consulted and then ignored forever.
+    if cfg.origin.upstreams.len() * b.max_ejected_percent as usize / 100 == 0 {
+        return Err(err(format!(
+            "origin.breaker.max_ejected_percent is {} across {} upstreams, which allows 0 \
+             backends to be ejected at once; the breaker would observe failures and never act \
+             on them. Raise it to at least {}%",
+            b.max_ejected_percent,
+            cfg.origin.upstreams.len(),
+            100_usize.div_ceil(cfg.origin.upstreams.len())
+        )));
+    }
+    Ok(())
+}
+
+fn validate_retry(cfg: &Config) -> Result<()> {
+    let r = &cfg.origin.retry;
+    if !r.enabled {
+        return Ok(());
+    }
+    if r.max_attempts < 2 {
+        return Err(err(format!(
+            "origin.retry.enabled is true but max_attempts is {}; attempts include the first \
+             try, so anything below 2 never retries",
+            r.max_attempts
+        )));
+    }
+    if r.window == super::units::Dur::ZERO {
+        return Err(err(
+            "origin.retry.window must be greater than zero; the budget is measured over it",
+        ));
+    }
+    if r.budget_percent > 100 {
+        return Err(err(format!(
+            "origin.retry.budget_percent is {}; a budget above 100% would let retries outnumber \
+             the requests that caused them, which is the amplification the budget exists to \
+             prevent",
+            r.budget_percent
+        )));
+    }
+    if r.budget_percent == 0 && r.budget_min == 0 {
+        return Err(err(
+            "origin.retry.enabled is true but both budget_percent and budget_min are 0, so no \
+             retry can ever be afforded",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_priorities(cfg: &Config) -> Result<()> {
+    let p = &cfg.origin.priorities;
+    let max = cfg.origin.concurrency.max;
+    for (name, percent) in [("high", p.high), ("normal", p.normal), ("low", p.low)] {
+        if !(1..=100).contains(&percent) {
+            return Err(err(format!(
+                "origin.priorities.{name} is {percent}; it is a percentage of \
+                 origin.concurrency.max and must be between 1 and 100"
+            )));
+        }
+        if max.saturating_mul(percent as usize) / 100 == 0 {
+            return Err(err(format!(
+                "origin.priorities.{name} is {percent}% of an origin.concurrency.max of {max}, \
+                 which rounds to a ceiling of 0 and would refuse every request at that priority. \
+                 Raise the share to at least {}%, or raise concurrency.max",
+                100_usize.div_ceil(max.max(1))
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A weight larger than a ceiling it is charged against can never be
+/// satisfied: the request waits out its queue deadline and is shed, every
+/// time, on a route that looks correctly configured.
+fn check_route_weight(route: &Route, cfg: &Config) -> Result<()> {
+    let id = &route.id;
+    let weight = route.weight;
+    if weight == 0 {
+        return Err(err(format!(
+            "route `{id}`: weight is 0, which would take no capacity and bound nothing; omit the \
+             key to take the default of 1"
+        )));
+    }
+    let weight = weight as usize;
+    let global = cfg.origin.concurrency.max;
+    if weight > global {
+        return Err(err(format!(
+            "route `{id}`: weight {weight} exceeds origin.concurrency.max ({global}), so no \
+             request on this route could ever be admitted"
+        )));
+    }
+    let percent = cfg.origin.priorities.percent_for(route.priority);
+    let tier = (global.saturating_mul(percent as usize) / 100).max(1);
+    if weight > tier {
+        return Err(err(format!(
+            "route `{id}`: weight {weight} exceeds the ceiling of its `{}` priority tier \
+             ({tier} = {percent}% of origin.concurrency.max), so no request on this route could \
+             ever be admitted",
+            priority_name(route.priority)
+        )));
+    }
+    if let Some(c) = &route.concurrency
+        && weight > c.max
+    {
+        return Err(err(format!(
+            "route `{id}`: weight {weight} exceeds its own concurrency.max ({}), so no request \
+             on this route could ever be admitted",
+            c.max
+        )));
+    }
+    Ok(())
+}
+
+fn check_route(route: &Route, cfg: &Config) -> Result<()> {
     let id = &route.id;
     let is_private = route.class == Some(ClassOverride::PrivateDynamic);
+
+    check_route_weight(route, cfg)?;
+    if route.priority != Priority::Normal && cfg.origin.priorities.is_uniform() {
+        return Err(err(format!(
+            "route `{id}` sets priority: {} but origin.priorities leaves every tier at 100%, so \
+             every priority competes for the same ceiling and the setting does nothing. Lower \
+             the share of the tiers this route should outrank — for example \
+             `origin.priorities: {{ low: 50 }}` to keep half the origin ceiling away from \
+             low-priority work",
+            priority_name(route.priority)
+        )));
+    }
 
     if let Some(c) = &route.concurrency {
         if c.max == 0 {
@@ -663,6 +840,177 @@ origin:
     #[test]
     fn accepts_a_minimal_config() {
         validate(&parse(BASE)).unwrap();
+    }
+
+    // ------------------------------------------------- origin resilience
+
+    /// Two upstreams, so a breaker has somewhere to eject to.
+    const PAIR: &str = r#"
+version: 1
+origin:
+  upstreams: ["next-1:3000", "next-2:3000"]
+"#;
+
+    #[test]
+    fn accepts_a_configured_breaker_retry_budget_and_priorities() {
+        validate(&parse(&format!(
+            "{PAIR}  breaker:\n    enabled: true\n  retry:\n    enabled: true\n  \
+             priorities:\n    low: 50\n"
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn accepts_least_loaded_selection() {
+        validate(&parse(&format!("{PAIR}  load_balancing: least_loaded\n"))).unwrap();
+    }
+
+    /// The ejection cap keeps the only backend in rotation, so the breaker
+    /// would observe failures and never act on one.
+    #[test]
+    fn a_breaker_with_one_upstream_is_refused_rather_than_left_inert() {
+        let e = validate(&parse(&format!("{BASE}  breaker:\n    enabled: true\n"))).unwrap_err();
+        assert!(e.0.contains("total outage"), "{e}");
+    }
+
+    #[test]
+    fn an_ejection_cap_that_rounds_to_no_backends_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}  breaker:\n    enabled: true\n    max_ejected_percent: 10\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("allows 0"), "{e}");
+        assert!(
+            e.0.contains("50%"),
+            "names the smallest cap that works: {e}"
+        );
+    }
+
+    #[test]
+    fn a_failure_threshold_outside_a_percentage_is_refused() {
+        for percent in ["0", "101"] {
+            let e = validate(&parse(&format!(
+                "{PAIR}  breaker:\n    enabled: true\n    failure_percent: {percent}\n"
+            )))
+            .unwrap_err();
+            assert!(e.0.contains("failure_percent"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_breaker_that_trips_on_the_first_failure_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}  breaker:\n    enabled: true\n    min_requests: 0\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("noise"), "{e}");
+    }
+
+    #[test]
+    fn a_retry_setting_that_can_never_retry_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}  retry:\n    enabled: true\n    max_attempts: 1\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("never retries"), "{e}");
+    }
+
+    #[test]
+    fn a_retry_budget_above_one_hundred_percent_is_refused() {
+        // A budget that allows more retries than there were requests is the
+        // amplification the budget exists to prevent.
+        let e = validate(&parse(&format!(
+            "{PAIR}  retry:\n    enabled: true\n    budget_percent: 150\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("amplification"), "{e}");
+    }
+
+    #[test]
+    fn a_retry_budget_of_nothing_at_all_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}  retry:\n    enabled: true\n    budget_percent: 0\n    budget_min: 0\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("no retry can ever be afforded"), "{e}");
+    }
+
+    #[test]
+    fn a_priority_share_that_rounds_to_no_capacity_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}  concurrency:\n    max: 5\n  priorities:\n    low: 10\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("refuse every request"), "{e}");
+        assert!(e.0.contains("20%"), "names a share that would work: {e}");
+    }
+
+    #[test]
+    fn a_priority_share_outside_a_percentage_is_refused() {
+        let e = validate(&parse(&format!("{PAIR}  priorities:\n    high: 0\n"))).unwrap_err();
+        assert!(e.0.contains("priorities.high"), "{e}");
+    }
+
+    /// The accepted-and-ignored failure this project refuses everywhere else:
+    /// routes labelled by priority while every tier may use the whole ceiling.
+    #[test]
+    fn a_route_priority_with_no_tier_shares_set_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}routes:\n  - id: reports\n    match: \"/reports/**\"\n    priority: low\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("origin.priorities"), "{e}");
+        assert!(e.0.contains("does nothing"), "{e}");
+    }
+
+    #[test]
+    fn a_route_priority_is_accepted_once_the_tiers_differ() {
+        validate(&parse(&format!(
+            "{PAIR}  priorities:\n    low: 50\nroutes:\n  - id: reports\n    \
+             match: \"/reports/**\"\n    priority: low\n"
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_weight_larger_than_the_global_ceiling_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}  concurrency:\n    max: 4\nroutes:\n  - id: search\n    \
+             match: \"/search\"\n    weight: 5\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("origin.concurrency.max (4)"), "{e}");
+        assert!(e.0.contains("could ever be admitted"), "{e}");
+    }
+
+    #[test]
+    fn a_weight_larger_than_its_own_route_ceiling_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}routes:\n  - id: search\n    match: \"/search\"\n    weight: 5\n    \
+             concurrency:\n      max: 4\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("concurrency.max (4)"), "{e}");
+    }
+
+    #[test]
+    fn a_weight_larger_than_its_priority_tier_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}  concurrency:\n    max: 10\n  priorities:\n    low: 20\nroutes:\n  \
+             - id: reports\n    match: \"/reports/**\"\n    priority: low\n    weight: 3\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("`low` priority tier"), "{e}");
+        assert!(e.0.contains("(2 = 20%"), "{e}");
+    }
+
+    #[test]
+    fn a_zero_weight_is_refused() {
+        let e = validate(&parse(&format!(
+            "{PAIR}routes:\n  - id: search\n    match: \"/search\"\n    weight: 0\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("bound nothing"), "{e}");
     }
 
     // ------------------------------------------------- schema versioning

@@ -205,6 +205,78 @@ groups:
             Traffic is unaffected — export failure is counted and logged, never
             propagated to a request. Check the collector.
 
+  # Only fires when origin.breaker or origin.retry is enabled; with both off
+  # the series exist and stay flat, so these rules are inert rather than
+  # broken.
+  - name: harmost-origin-resilience
+    rules:
+      # The case passive observation exists for, and the one an active health
+      # check cannot express: the backend answers its probe and fails real
+      # requests.
+      - alert: HarmostUpstreamEjectedWhileHealthy
+        expr: harmost_upstream_ejected == 1 and on (job, instance, upstream) harmost_upstream_healthy == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.upstream }} passes its health check and fails real requests"
+          description: >-
+            Its circuit breaker is open while its health probe still passes.
+            That is not a contradiction — it is an origin answering a static
+            health path in a millisecond while its renders throw. Read that
+            backend's own logs; harmost_upstream_failures_total says whether
+            the failures are connect-level or status-level.
+
+      # Every breaker open means the ejection cap has taken over and breaker
+      # state is being ignored entirely, which is the correct behaviour and a
+      # much bigger problem than one bad backend.
+      - alert: HarmostAllUpstreamsEjected
+        expr: >-
+          sum by (job, instance) (harmost_upstream_ejected)
+            == count by (job, instance) (harmost_upstream_ejected)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Every backend behind {{ $labels.instance }} is ejected"
+          description: >-
+            Past origin.breaker.max_ejected_percent Harmost ignores breaker
+            state and routes on health alone, because if everything is broken
+            then "broken" has stopped being a reason to prefer one backend
+            over another. This is an origin-wide failure — a shared database,
+            a dependency, a bad deploy — not a backend one.
+
+      # A backend that recovers enough to pass and then fails again is usually
+      # worse than one that stays down: each cycle sends live traffic at it.
+      - alert: HarmostUpstreamFlapping
+        expr: increase(harmost_upstream_breaker_trips_total[30m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.upstream }} has been ejected repeatedly in the last 30 minutes"
+          description: >-
+            Its breaker keeps opening, recovering on a probe, and opening
+            again. Take the backend out of the pool rather than letting it
+            keep half-recovering, or raise origin.breaker.open_for so each
+            recovery attempt is spaced further apart.
+
+      # Retries are failing to be affordable, which means requests are failing
+      # faster than the budget will absorb. Raising the budget makes it worse.
+      - alert: HarmostRetryBudgetExhausted
+        expr: >-
+          sum by (job, instance) (rate(harmost_origin_retries_total{outcome="budget_exhausted"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} is refusing retries for lack of budget"
+          description: >-
+            More requests want retrying than origin.retry.budget_percent
+            allows. The budget is doing its job: retries at this rate would be
+            amplifying an origin failure rather than absorbing a blip. Fix the
+            origin; do not raise the budget.
+
   - name: harmost-configuration
     rules:
       # Replicas of one deployment should agree on their effective

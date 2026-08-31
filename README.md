@@ -962,6 +962,100 @@ Both are off by default and both are documented where their trade-offs are:
 `spool`, and [Using Harmost with Next.js](#using-harmost-with-nextjs) for
 `upgrade`.
 
+### Origin resilience
+
+Four settings for what to do when the origin itself is the thing going wrong.
+All are off or inert by default, so nothing here changes an existing config.
+
+```yaml
+origin:
+  upstreams: ["next-1:3000", "next-2:3000"]
+
+  # round_robin (default), hash_by_path, or least_loaded.
+  load_balancing: least_loaded
+
+  # Eject a backend that is failing real traffic.
+  breaker:
+    enabled: true
+    window: 10s
+    min_requests: 20        # never trip on a handful of requests
+    failure_percent: 50
+    open_for: 30s
+    max_ejected_percent: 50 # past this cap, breaker state is ignored
+
+  # Retry a failed request, without amplifying an outage.
+  retry:
+    enabled: true
+    max_attempts: 2         # attempts include the first try
+    window: 10s
+    budget_percent: 10      # retries as a share of origin requests
+    budget_min: 3
+
+  # Reserved capacity, as a percentage of origin.concurrency.max.
+  priorities:
+    high: 100
+    normal: 90
+    low: 50
+
+routes:
+  - id: checkout
+    match: "/checkout/**"
+    priority: high
+  - id: search
+    match: "/search"
+    weight: 3               # one search costs three units of the ceiling
+```
+
+**Circuit breakers see what a health check cannot.** An active probe asks one
+question, on one path, at one interval — that is what keeps it cheap, and it is
+also why it misses the failure that matters most for server rendering: an
+origin that answers `/healthz` in a millisecond while every render throws. The
+breaker watches the requests Harmost is already sending, so it needs no extra
+traffic to notice. `/status` and the metrics report health and ejection
+separately, because a backend that is healthy *and* ejected is not a
+contradiction — it is the entire signal.
+
+**The ejection cap stops a breaker causing the outage it exists to contain.**
+When an origin-wide dependency fails, every backend fails and every breaker
+trips. Past `max_ejected_percent`, Harmost ignores breaker state and returns to
+health-based routing: if everything is broken, "broken" has stopped being a
+reason to prefer one backend over another. This is the same rule the health
+path already follows — a pool with nothing healthy still serves, because
+refusing to route turns a degraded origin into a guaranteed outage.
+
+**The retry budget is the part that matters.** Capping retries per request does
+nothing for an origin: a hundred thousand requests each allowed one retry is
+still a doubling of load at the worst possible moment. The budget caps them as
+a percentage of the traffic actually flowing, so a total outage affords almost
+none while a single backend dying is absorbed. Two further bounds are not
+configurable, because getting them wrong is not a tuning mistake: only **safe**
+methods are retried (Harmost does not buffer request bodies and so cannot
+replay one), and only **before the origin has answered**.
+
+**`least_loaded` scores in-flight work multiplied by observed latency** — the
+product, not either half. Depth alone treats a backend answering in 5ms and one
+answering in 5s as equally busy; latency alone ignores the queue that has
+already formed. This is the strategy that routes around a backend which is up,
+passing its probe, and slow.
+
+**Priorities are ceilings, not reservations.** Leaving `low: 50` keeps half the
+origin ceiling away from low-priority routes however many of them arrive. It is
+stated this way round because a ceiling is checked before the work starts, when
+refusing is still free, whereas defending a reservation would mean preempting a
+render already in flight. What it does *not* do is reorder the queue: waiting is
+FIFO within a tier, and the isolation is between tiers.
+
+**`weight` makes a ceiling count work rather than requests.** A limit of 50
+admits fifty requests of wildly different cost; a search page that fans out to
+three services and a near-static marketing page are not the same load on an
+origin. The weight is charged against the route, tier and global limiters
+alike.
+
+Every one of these is refused at startup if it would silently do nothing — a
+breaker with one upstream, `max_attempts: 1`, a priority share that rounds to a
+ceiling of zero, a `route.priority` with no tier shares set. See
+[`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md).
+
 ## Operating Harmost
 
 Full procedures — systemd and Kubernetes definitions, the restart sequences,
@@ -1109,6 +1203,14 @@ docker compose -f compose.observability.yaml down
 | `harmost_origin_in_flight` at `harmost_concurrency_limit` | Saturated. |
 | `harmost_upstream_healthy == 0` | No backend is passing. Harmost still serves, on `stale_if_error`. |
 | `harmost_draining == 1` for longer than a deploy | An instance drained and was never replaced. |
+
+With `origin.breaker` or `origin.retry` enabled, three more:
+
+| Signal | Means |
+|---|---|
+| `harmost_upstream_ejected == 1` while `harmost_upstream_healthy == 1` | The backend passes its probe and fails real requests. Read that backend's logs, not Harmost's. |
+| `harmost_upstream_breaker_trips_total` climbing steadily | Flapping — it recovers enough to pass, then fails again. Usually worse than staying down. |
+| `harmost_origin_retries_total{outcome="budget_exhausted"}` rising | Requests are failing faster than the budget absorbs. Raising the budget makes it worse. |
 
 ## Design and internals
 

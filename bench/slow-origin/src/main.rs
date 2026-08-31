@@ -18,9 +18,16 @@
 //!   phases without a restart clouding the numbers.
 //! * `GET /healthz`  — liveness, deliberately excluded from the counters so an
 //!   active health check cannot inflate a render count.
+//! * `GET /__fail` / `GET /__heal` — make every *render* answer `502` while
+//!   leaving `/healthz` answering `200`. That combination is the whole point:
+//!   it is what an origin looks like when its health endpoint is a static
+//!   route and its renders are the thing that is broken, and it is the case no
+//!   active health check can express. Renders are still counted while failing,
+//!   so a benchmark can prove traffic stopped arriving rather than inferring
+//!   it from the proxy's own metrics.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -35,6 +42,8 @@ struct Stats {
     /// two numbers to be independently readable.
     sockets_open: AtomicUsize,
     sockets_total: AtomicUsize,
+    /// Answer every render with `502` while `/healthz` keeps saying `ok`.
+    failing: AtomicBool,
 }
 
 #[tokio::main]
@@ -49,6 +58,7 @@ async fn main() -> std::io::Result<()> {
         total: AtomicUsize::new(0),
         sockets_open: AtomicUsize::new(0),
         sockets_total: AtomicUsize::new(0),
+        failing: AtomicBool::new(false),
     });
 
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
@@ -324,8 +334,15 @@ async fn main() -> std::io::Result<()> {
                 format!("<html><body>rendered {path}</body></html>")
             };
             let peak = stats.peak.load(Ordering::SeqCst);
+            // Counted before this point, so a benchmark can tell "the proxy
+            // stopped sending here" from "the proxy sent and got a 502".
+            let status = if stats.failing.load(Ordering::SeqCst) {
+                "502 Bad Gateway"
+            } else {
+                "200 OK"
+            };
             let resp = format!(
-                "HTTP/1.1 200 OK\r\n\
+                "HTTP/1.1 {status}\r\n\
                  Content-Type: text/html\r\n\
                  Content-Length: {}\r\n\
                  Cache-Control: private, no-cache, no-store, max-age=0, must-revalidate\r\n\
@@ -366,6 +383,18 @@ fn control_response(path: &str, stats: &Stats) -> Option<String> {
             stats.total.store(0, Ordering::SeqCst);
             stats.sockets_total.store(0, Ordering::SeqCst);
             "reset".to_string()
+        }
+        // Deliberately does not touch `/healthz`. An origin whose probe passes
+        // and whose renders fail is the exact case passive observation exists
+        // for, and a fixture that failed both would be testing the health
+        // checker instead.
+        "/__fail" => {
+            stats.failing.store(true, Ordering::SeqCst);
+            "failing".to_string()
+        }
+        "/__heal" => {
+            stats.failing.store(false, Ordering::SeqCst);
+            "healed".to_string()
         }
         _ => return None,
     };

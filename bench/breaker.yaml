@@ -1,0 +1,55 @@
+# Passive failure observation, with two backends and an active health check
+# that cannot see the problem.
+#
+# The health path is `/healthz`, which bench/slow-origin answers `200` even
+# while `/__fail` is making every render answer `502`. That combination is the
+# point of this configuration: the probe passes, the renders fail, and only the
+# breaker notices.
+#
+# `@LISTEN@`, `@ORIGIN_A@`, `@ORIGIN_B@` and `@METRICS@` are substituted by
+# bench/lib.sh with ports allocated for this run.
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+origin:
+  upstreams:
+    - "127.0.0.1:@ORIGIN_A@"
+    - "127.0.0.1:@ORIGIN_B@"
+  load_balancing: round_robin
+  concurrency:
+    max: 50
+    queue:
+      max: 500
+      timeout: 20s
+  breaker:
+    enabled: true
+    window: 10s
+    # Low enough that a short benchmark can reach it, high enough that a
+    # single unlucky request cannot.
+    min_requests: 6
+    failure_percent: 50
+    open_for: 3s
+    # One of two backends, which is the interesting boundary: ejecting one is
+    # allowed, ejecting both is not.
+    max_ejected_percent: 50
+
+health:
+  path: "/healthz"
+  interval: 1s
+  timeout: 500ms
+
+# Nothing may be reused, so every request is a real origin request and the
+# counts below are renders rather than cache hits.
+cache:
+  enabled: false
+coalesce:
+  enabled: false
+
+timeouts:
+  origin: 20s
+
+telemetry:
+  prometheus:
+    listen: "127.0.0.1:@METRICS@"
+  admin:
+    listen: "127.0.0.1:@ADMIN@"

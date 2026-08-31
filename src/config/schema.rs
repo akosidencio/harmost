@@ -231,6 +231,235 @@ pub struct Origin {
     /// Which HTTP version to speak to the origin.
     #[serde(default)]
     pub http_version: OriginHttpVersion,
+    /// Passive failure observation and per-backend circuit breaking.
+    #[serde(default)]
+    pub breaker: Breaker,
+    /// Bounded retries for requests that are safe to send twice.
+    #[serde(default)]
+    pub retry: Retry,
+    /// How much of the global ceiling each route priority may occupy.
+    #[serde(default)]
+    pub priorities: Priorities,
+}
+
+/// Reserved capacity, expressed as what each priority is *allowed* rather
+/// than what it is promised.
+///
+/// Each tier gets a ceiling of its own, as a percent of
+/// `origin.concurrency.max`, and a request is admitted only if its tier has
+/// room as well as the global limiter. Reserved capacity is the complement:
+/// setting `low: 50` reserves half the origin ceiling for `normal` and
+/// `high` work, because low-priority requests can never occupy more than the
+/// other half no matter how many of them arrive.
+///
+/// Stating it as a ceiling rather than a reservation is what makes it
+/// enforceable. A reservation has to be defended against work that already
+/// holds the slot, which means preempting a render that is mid-flight; a
+/// ceiling is checked before the work starts, when refusing is still free.
+///
+/// The default is 100 for every tier, which is the same behaviour as having
+/// no tiers at all. Nothing changes until someone lowers one.
+///
+/// This does **not** reorder the queue. Within a tier, waiting is FIFO, and a
+/// high-priority request that arrives behind a queue of its own peers waits
+/// its turn. The isolation is between tiers, not inside one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Priorities {
+    #[serde(default = "hundred")]
+    pub high: u32,
+    #[serde(default = "hundred")]
+    pub normal: u32,
+    #[serde(default = "hundred")]
+    pub low: u32,
+}
+
+impl Default for Priorities {
+    fn default() -> Self {
+        Priorities {
+            high: hundred(),
+            normal: hundred(),
+            low: hundred(),
+        }
+    }
+}
+
+impl Priorities {
+    /// Is this the inert default, where every tier may use the whole ceiling?
+    pub fn is_uniform(&self) -> bool {
+        self.high == 100 && self.normal == 100 && self.low == 100
+    }
+
+    pub fn percent_for(&self, priority: Priority) -> u32 {
+        match priority {
+            Priority::High => self.high,
+            Priority::Normal => self.normal,
+            Priority::Low => self.low,
+        }
+    }
+}
+
+/// Which tier's ceiling a route's requests are admitted against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    High,
+    #[default]
+    Normal,
+    Low,
+}
+
+impl Priority {
+    /// Stable label for metrics and the status document. Prefixed because it
+    /// shares the `limiter` label space with `global` and route ids.
+    pub fn limiter_name(self) -> &'static str {
+        match self {
+            Priority::High => "tier:high",
+            Priority::Normal => "tier:normal",
+            Priority::Low => "tier:low",
+        }
+    }
+
+    /// Every tier, in the order a status document should print them.
+    pub const ALL: [Priority; 3] = [Priority::High, Priority::Normal, Priority::Low];
+}
+
+/// Eject a backend that is failing *real* traffic.
+///
+/// An active health probe asks a backend whether it is alive on one path, at
+/// one interval, with one request. It is deliberately cheap, and that is
+/// exactly why it misses the failures that matter: a Node origin that answers
+/// `/healthz` in a millisecond while every render 500s, a pod whose upstream
+/// database connection died, a container that lost its CPU share. Passive
+/// observation watches the requests Harmost is *already* sending and needs no
+/// extra traffic to see any of that.
+///
+/// The breaker is per backend and additive: a backend must be passing its
+/// health check **and** have a closed breaker to be preferred. Off by default
+/// — with a single-backend origin there is nowhere to eject to, and ejecting
+/// the only backend would convert a partial failure into a total one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Breaker {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The rolling window failures are counted over.
+    #[serde(default = "d_10s")]
+    pub window: Dur,
+    /// Never trip on a handful of requests. A backend that saw three
+    /// requests and failed two of them is a 67% failure rate and also
+    /// nothing but noise.
+    #[serde(default = "twenty")]
+    pub min_requests: u32,
+    /// Percent of requests in the window that must have failed. Integer
+    /// percent rather than a ratio so the threshold means the same thing on
+    /// every platform and reads the same in a config review.
+    #[serde(default = "fifty")]
+    pub failure_percent: u32,
+    /// How long a tripped backend stays out. When it expires, exactly one
+    /// request is allowed through as a probe; a success closes the breaker
+    /// and a failure starts the window again.
+    #[serde(default = "d_30s")]
+    pub open_for: Dur,
+    /// The outlier-ejection cap: the most of the pool that may be ejected at
+    /// once, as a percent.
+    ///
+    /// This is the check that keeps a breaker from causing the outage it
+    /// exists to contain. When an origin-wide dependency fails, *every*
+    /// backend starts failing, every breaker trips, and a proxy that honoured
+    /// all of them would have nowhere to send anything. Past this cap Harmost
+    /// ignores breaker state entirely and goes back to health-based routing:
+    /// if everything is broken, "broken" is no longer a reason to prefer one
+    /// backend over another.
+    #[serde(default = "fifty")]
+    pub max_ejected_percent: u32,
+}
+
+impl Default for Breaker {
+    fn default() -> Self {
+        Breaker {
+            enabled: false,
+            window: d_10s(),
+            min_requests: twenty(),
+            failure_percent: fifty(),
+            open_for: d_30s(),
+            max_ejected_percent: fifty(),
+        }
+    }
+}
+
+/// Retrying a failed origin request, without amplifying an outage.
+///
+/// A retry is extra origin load applied at exactly the moment the origin is
+/// least able to absorb it, so every part of this is a bound. Two of them are
+/// not configurable because getting them wrong is not a tuning mistake:
+///
+/// * Only **safe** methods are ever retried — `GET`, `HEAD`, `OPTIONS`,
+///   `TRACE`. `PUT` and `DELETE` are idempotent on paper, but Harmost does not
+///   buffer request bodies and cannot replay one; and an origin that treats
+///   `POST` as idempotent is not a bet a proxy gets to make on its behalf.
+/// * A retry is only ever attempted **before the origin has answered** — a
+///   connect failure, or an error on a reused keepalive connection where
+///   nothing was written downstream. Once a byte of the response has been
+///   sent, the request is finished whatever happens next.
+///
+/// The budget is what stops a retrying proxy from doubling the load on a
+/// struggling origin: retries are capped as a fraction of the traffic
+/// actually flowing, so a total outage — where every request fails — allows
+/// almost no retries at all, while a single blip is absorbed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Retry {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Total tries for one request, the first included. `2` means one retry.
+    #[serde(default = "two")]
+    pub max_attempts: u32,
+    /// The rolling window the budget is measured over.
+    #[serde(default = "d_10s")]
+    pub window: Dur,
+    /// Retries allowed as a percent of origin requests in the window.
+    ///
+    /// 10% is Envoy's default and a good starting point: it absorbs an
+    /// individual backend dying while making it arithmetically impossible for
+    /// retries to be more than a tenth of the load the origin sees.
+    #[serde(default = "ten")]
+    pub budget_percent: u32,
+    /// Retries always allowed in a window regardless of the percentage, so a
+    /// low-traffic deployment is not left with a budget that rounds to zero.
+    #[serde(default = "three_usize")]
+    pub budget_min: usize,
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Retry {
+            enabled: false,
+            max_attempts: two(),
+            window: d_10s(),
+            budget_percent: ten(),
+            budget_min: three_usize(),
+        }
+    }
+}
+
+fn twenty() -> u32 {
+    20
+}
+fn fifty() -> u32 {
+    50
+}
+fn ten() -> u32 {
+    10
+}
+fn two() -> u32 {
+    2
+}
+fn three_usize() -> usize {
+    3
+}
+fn hundred() -> u32 {
+    100
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -280,12 +509,6 @@ pub enum OriginHttpVersion {
     Auto,
 }
 
-/// v0.1 ships round-robin and hash-by-path only.
-///
-/// `least_loaded` is deliberately absent: it belongs with the latency
-/// observations and circuit breaking that arrive together later, and
-/// round-robin is indistinguishable from it once admission control is already
-/// bounding in-flight work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalancing {
@@ -295,6 +518,14 @@ pub enum LoadBalancing {
     /// the *origin's* own warmth — its in-process render cache, module graph
     /// and JIT state are all path-correlated.
     HashByPath,
+    /// Send each request to the backend with the least outstanding work,
+    /// scored as in-flight requests against observed latency.
+    ///
+    /// Only worth choosing once there is something to observe. It is the
+    /// strategy that notices a backend which is *answering* but slow — a
+    /// Node process in a GC death spiral, a container that lost its CPU
+    /// share — which neither a health probe nor round-robin can see.
+    LeastLoaded,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -611,6 +842,22 @@ pub struct Route {
     pub matcher: Matcher,
     #[serde(default)]
     pub class: Option<ClassOverride>,
+    /// Which share of the origin ceiling this route's requests compete for.
+    /// See [`Priorities`].
+    #[serde(default)]
+    pub priority: Priority,
+    /// How many permits one request on this route consumes, everywhere it is
+    /// counted: the tier ceiling, the global ceiling, and this route's own.
+    ///
+    /// The default of 1 says every request costs the same, which is the
+    /// assumption a plain concurrency limit makes and is wrong in the usual
+    /// direction: a search page that fans out to three services and a
+    /// statically-shaped marketing page are not the same load on an origin,
+    /// yet a ceiling of 50 lets 50 of either through. Giving the expensive
+    /// route a weight makes the ceiling mean units of origin work rather than
+    /// units of request.
+    #[serde(default = "one_u32")]
+    pub weight: u32,
     #[serde(default)]
     pub cache: Option<RouteCache>,
     #[serde(default)]
@@ -864,6 +1111,9 @@ impl Default for Sample {
 }
 
 fn one_usize() -> usize {
+    1
+}
+fn one_u32() -> u32 {
     1
 }
 

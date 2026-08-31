@@ -124,6 +124,17 @@ fn unknown_run_flag(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Pingora's limit counts total upstream tries, the same unit exposed by
+/// `origin.retry.max_attempts`. Bind the framework ceiling to the policy rather
+/// than leaving Pingora's independent default of 16 in force.
+fn proxy_max_attempts(retry: &harmost::config::schema::Retry) -> usize {
+    if retry.enabled {
+        usize::try_from(retry.max_attempts).unwrap_or(usize::MAX)
+    } else {
+        1
+    }
+}
+
 fn run(path: &str, flags: RunFlags) -> ExitCode {
     use harmost::admin::Admin;
     use harmost::admin::drain::{DrainShutdownSignalWatch, DrainState, DrainWatcher};
@@ -159,6 +170,8 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
     let admin_cfg = cfg.telemetry.admin.clone();
     let graceful = cfg.server.graceful.clone();
     let concurrency = cfg.origin.concurrency.clone();
+    let priorities = cfg.origin.priorities.clone();
+    let max_attempts = proxy_max_attempts(&cfg.origin.retry);
 
     // Span export, if it is configured. Built before the server so a bad
     // endpoint is a startup failure rather than a background service that
@@ -209,6 +222,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         concurrency.max,
         concurrency.queue.max,
         concurrency.queue.timeout.as_duration(),
+        &priorities,
     ));
     // Create every configured route limiter now rather than on the route's
     // first request. Reload already does this, and without it the admin
@@ -236,8 +250,23 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
             concurrency.max,
             concurrency.queue.max,
             concurrency.queue.timeout.as_duration(),
+            &priorities,
             &route_limits,
         );
+    }
+    // Create every tier series before traffic arrives. The request path only
+    // updates the tier it actually changes, avoiding nine registry lookups per
+    // request while keeping an idle tier visible as zero.
+    for tier in admission.tier_limiters() {
+        harmost::telemetry::metrics::LIMIT
+            .with_label_values(&[tier.name()])
+            .set(i64::try_from(tier.limit()).unwrap_or(i64::MAX));
+        harmost::telemetry::metrics::QUEUE_DEPTH
+            .with_label_values(&[tier.name()])
+            .set(0);
+        harmost::telemetry::metrics::IN_FLIGHT
+            .with_label_values(&[tier.name()])
+            .set(0);
     }
 
     harmost::telemetry::metrics::CONFIG_GENERATION.set(1);
@@ -264,6 +293,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         pid_file: graceful.pid_file.clone(),
         upgrade_sock: graceful.upgrade_socket.clone(),
         daemon: flags.daemon,
+        max_retries: max_attempts,
         graceful_shutdown_timeout_seconds: Some(pingora_seconds(
             graceful.shutdown_timeout.as_duration(),
         )),
@@ -311,6 +341,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
     let upstreams = match UpstreamPool::new(
         &snapshot.config.origin.upstreams,
         snapshot.config.origin.load_balancing,
+        &snapshot.config.origin.breaker,
     ) {
         Ok(pool) => Arc::new(pool),
         Err(error) => {
@@ -331,6 +362,15 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         harmost::telemetry::metrics::UPSTREAM_HEALTHY
             .with_label_values(&[&backend.address])
             .set(i64::from(upstreams.is_healthy(backend.id)));
+        harmost::telemetry::metrics::UPSTREAM_EJECTED
+            .with_label_values(&[&backend.address])
+            .set(0);
+        harmost::telemetry::metrics::UPSTREAM_IN_FLIGHT
+            .with_label_values(&[&backend.address])
+            .set(0);
+        harmost::telemetry::metrics::UPSTREAM_LATENCY_EWMA
+            .with_label_values(&[&backend.address])
+            .set(0);
     }
 
     server.add_service(pingora_core::services::background::background_service(
@@ -399,6 +439,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         store: harmost.store(),
         spool: harmost.spool_budget(),
         upgrades: harmost.upgrade_limiter(),
+        retry: harmost.retry_budget(),
         drain: drain.clone(),
         require_healthy_upstream: admin_cfg.require_healthy_upstream,
     });
@@ -558,6 +599,45 @@ fn check(path: &str) -> ExitCode {
                     println!("  route `{}` overrides origin cache directives", r.id);
                 }
             }
+            // Origin resilience. Each of these changes where requests go or
+            // how many of them the origin sees, so `check` says what is on
+            // and what the consequence is rather than leaving it in the file.
+            if !cfg.origin.priorities.is_uniform() {
+                let p = &cfg.origin.priorities;
+                let max = cfg.origin.concurrency.max;
+                // Saturating: `concurrency.max` is bounded only by tokio's
+                // semaphore maximum, which is large enough that `max * 100`
+                // is not obviously in range.
+                let share = |percent: u32| max.saturating_mul(percent as usize) / 100;
+                println!(
+                    "  priority ceilings: high {} of {max}, normal {}, low {} — the rest of the \
+                     ceiling is reserved for higher tiers",
+                    share(p.high),
+                    share(p.normal),
+                    share(p.low),
+                );
+            }
+            if cfg.origin.breaker.enabled {
+                println!(
+                    "  circuit breakers on: a backend failing {}% of at least {} requests in {:?} \
+                     is ejected for {:?}, up to {}% of the pool at once",
+                    cfg.origin.breaker.failure_percent,
+                    cfg.origin.breaker.min_requests,
+                    cfg.origin.breaker.window.as_duration(),
+                    cfg.origin.breaker.open_for.as_duration(),
+                    cfg.origin.breaker.max_ejected_percent,
+                );
+            }
+            if cfg.origin.retry.enabled {
+                println!(
+                    "  retries on: safe methods only, up to {} attempts, capped at {}% of origin \
+                     requests in {:?} (never fewer than {})",
+                    cfg.origin.retry.max_attempts,
+                    cfg.origin.retry.budget_percent,
+                    cfg.origin.retry.window.as_duration(),
+                    cfg.origin.retry.budget_min,
+                );
+            }
             // Everything below trades a safety property for convenience.
             // `check` is the last place someone reads before deploying, so it
             // says so out loud rather than leaving it in the file.
@@ -703,6 +783,15 @@ mod tests {
         assert_eq!(pingora_seconds(std::time::Duration::from_millis(500)), 1);
         assert_eq!(pingora_seconds(std::time::Duration::from_secs(1)), 1);
         assert_eq!(pingora_seconds(std::time::Duration::from_millis(1500)), 2);
+    }
+
+    #[test]
+    fn pingora_attempt_ceiling_tracks_the_retry_policy_instead_of_its_default() {
+        let mut retry = harmost::config::schema::Retry::default();
+        assert_eq!(proxy_max_attempts(&retry), 1);
+        retry.enabled = true;
+        retry.max_attempts = 23;
+        assert_eq!(proxy_max_attempts(&retry), 23);
     }
 
     #[test]

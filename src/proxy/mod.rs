@@ -41,7 +41,7 @@ use crate::admission::{Admission, AdmissionController};
 use crate::cache::policy::{Disposition, Shareability, evaluate_request, evaluate_response};
 use crate::cache::{BoundedStore, KeyBuilder};
 use crate::classifier::{FrameworkAdapter, RequestClass, RequestMetadata, nextjs::NextJs};
-use crate::config::schema::{LogFormat, OriginHttpVersion, RouteCache, Timeouts};
+use crate::config::schema::{LogFormat, OriginHttpVersion, Priority, RouteCache, Timeouts};
 use crate::net::forwarded::{ClientFacts, ListenerScheme, TrustPolicy};
 use crate::policy::PolicySnapshot;
 use crate::proxy::spool::{Spool, SpoolBudget, SpoolOutcome};
@@ -49,7 +49,9 @@ use crate::telemetry::logging::AccessLog;
 use crate::telemetry::metrics;
 use crate::telemetry::otlp::{Attr, SpanKind, SpanRecord, SpanSink, unix_nanos};
 use crate::telemetry::trace::{RequestTrace, SpanId, TRACEPARENT, TRACESTATE, believe_inbound};
-use crate::upstream::UpstreamPool;
+use crate::upstream::breaker::BreakerState;
+use crate::upstream::retry::{self, RetryBudget, RetryDecision};
+use crate::upstream::{InFlightGuard, UpstreamPool};
 
 /// Per-request state.
 pub struct Ctx {
@@ -75,6 +77,24 @@ pub struct Ctx {
     pub upstream: Option<String>,
     pub origin_started: Option<Instant>,
     pub origin_finished_ms: Option<u128>,
+
+    /// Which share of the origin ceiling this request competes for, and how
+    /// many units of it one request costs. Resolved from the route in
+    /// `request_filter` and read back in `proxy_upstream_filter`.
+    pub priority: Priority,
+    pub weight: u32,
+
+    /// This request's occupancy of a backend, released when the origin
+    /// finishes. Replacing it on a retry releases the previous backend's slot,
+    /// which is what keeps a retried request from being counted on two
+    /// backends at once.
+    pub origin_slot: Option<InFlightGuard>,
+    /// How many times this request has been sent upstream, the first included.
+    pub attempts: u32,
+    /// Whether this attempt has already told the breaker how it went. Exactly
+    /// one outcome is recorded per attempt, decided by the response header or
+    /// by whatever prevented one.
+    pub outcome_recorded: bool,
 
     /// The connection facts, resolved once in `early_request_filter`.
     ///
@@ -129,6 +149,11 @@ impl Ctx {
             upstream: None,
             origin_started: None,
             origin_finished_ms: None,
+            priority: Priority::default(),
+            weight: 1,
+            origin_slot: None,
+            attempts: 0,
+            outcome_recorded: false,
             client: ClientFacts {
                 client_ip: None,
                 scheme: "http",
@@ -178,6 +203,9 @@ pub struct Harmost {
     /// are never built — correlation ids still are, because they cost nothing
     /// and the access log carries them regardless.
     spans: Option<SpanSink>,
+    /// The origin-wide retry budget. One per process, because the thing it
+    /// protects — the origin — is also one per process.
+    retry: Arc<RetryBudget>,
 }
 
 impl Harmost {
@@ -205,6 +233,11 @@ impl Harmost {
             0,
             std::time::Duration::ZERO,
         );
+        // Bound once at startup like the trust policy and the cache lock. A
+        // reload that changed the budget while retries were in flight would
+        // have two windows disagreeing about how much has been spent, so a
+        // change is refused rather than half-applied.
+        let retry = Arc::new(RetryBudget::new(&initial.config.origin.retry));
         drop(initial);
 
         Ok(Harmost {
@@ -218,6 +251,7 @@ impl Harmost {
             spool_budget,
             upgrades,
             spans,
+            retry,
         })
     }
 
@@ -235,6 +269,13 @@ impl Harmost {
     /// The upgrade limiter, for the same reason.
     pub fn upgrade_limiter(&self) -> Arc<Limiter> {
         self.upgrades.clone()
+    }
+
+    /// The retry budget, for the same reason: what it has spent is live state,
+    /// and a status document assembled from configuration would only ever
+    /// report the ceiling.
+    pub fn retry_budget(&self) -> Arc<RetryBudget> {
+        self.retry.clone()
     }
 
     /// Build and enqueue this request's spans.
@@ -321,6 +362,119 @@ impl Harmost {
                 ),
             ],
         });
+    }
+
+    /// Tell the backend's breaker how one origin attempt went.
+    ///
+    /// Exactly one outcome per attempt, decided by the first definitive thing
+    /// that happens: the response header, or whatever prevented one. A body
+    /// error after a successful header is therefore counted as the success it
+    /// began as — by then the origin has demonstrably produced a response, and
+    /// what went wrong afterwards is as likely to be the client as the origin.
+    fn record_origin_outcome(&self, ctx: &mut Ctx, ok: bool, kind: &'static str) {
+        if ctx.outcome_recorded {
+            return;
+        }
+        let Some((id, probe)) = ctx
+            .origin_slot
+            .as_ref()
+            .map(|slot| (slot.backend_id(), slot.probe_token()))
+        else {
+            return;
+        };
+        ctx.outcome_recorded = true;
+
+        let was = self.upstreams.breaker_state(id);
+        self.upstreams.record_outcome(id, probe, ok);
+        let now = self.upstreams.breaker_state(id);
+
+        let Some(address) = ctx.upstream.as_deref() else {
+            return;
+        };
+        if !ok {
+            metrics::UPSTREAM_FAILURES
+                .with_label_values(&[address, kind])
+                .inc();
+        }
+        if was == BreakerState::Closed && now == BreakerState::Open {
+            metrics::UPSTREAM_TRIPS.with_label_values(&[address]).inc();
+            log::warn!("upstream {address} ejected: too many recent failures");
+        }
+        if was == BreakerState::Open && now == BreakerState::Closed {
+            log::info!("upstream {address} back in rotation: recovery probe succeeded");
+        }
+        metrics::UPSTREAM_EJECTED
+            .with_label_values(&[address])
+            .set(i64::from(now == BreakerState::Open));
+    }
+
+    /// Publish the one tier this request can have changed. The other tiers are
+    /// independent, so scanning and touching all three on every request only
+    /// adds metric-registry work without making their values fresher.
+    fn publish_tier_state(&self, priority: Priority) {
+        let Some(tier) = self.admission.tier_limiter(priority) else {
+            return;
+        };
+        metrics::LIMIT
+            .with_label_values(&[tier.name()])
+            .set(tier.limit() as i64);
+        metrics::QUEUE_DEPTH
+            .with_label_values(&[tier.name()])
+            .set(tier.queue_depth() as i64);
+        metrics::IN_FLIGHT
+            .with_label_values(&[tier.name()])
+            .set((tier.limit().saturating_sub(tier.available())) as i64);
+    }
+
+    /// Publish only the backend whose state this request touched.
+    fn publish_backend_state(&self, id: usize, address: &str) {
+        metrics::UPSTREAM_IN_FLIGHT
+            .with_label_values(&[address])
+            .set(i64::try_from(self.upstreams.in_flight(id)).unwrap_or(i64::MAX));
+        metrics::UPSTREAM_LATENCY_EWMA
+            .with_label_values(&[address])
+            .set(i64::try_from(self.upstreams.ewma_micros(id)).unwrap_or(i64::MAX));
+        metrics::UPSTREAM_EJECTED
+            .with_label_values(&[address])
+            .set(i64::from(
+                self.upstreams.breaker_state(id) == BreakerState::Open,
+            ));
+    }
+
+    /// Release and publish one attempt's backend occupancy. This is also used
+    /// before a retry replaces the attempt, so both the old and new backend
+    /// gauges remain exact without an O(backends) completion scan.
+    fn release_origin_slot(&self, ctx: &mut Ctx) {
+        let Some(slot) = ctx.origin_slot.take() else {
+            return;
+        };
+        let id = slot.backend_id();
+        let address = ctx.upstream.clone();
+        drop(slot);
+        if let Some(address) = address {
+            self.publish_backend_state(id, &address);
+        }
+    }
+
+    /// May this request be sent upstream again, and is there budget for it?
+    ///
+    /// Called from both error hooks, and it charges the budget, so it runs
+    /// once per failed attempt and not once per question asked about one.
+    fn decide_retry(&self, session: &Session, ctx: &mut Ctx) -> RetryDecision {
+        if !self.retry.enabled() {
+            return RetryDecision::Ineligible;
+        }
+        let decision = if retry::eligible(&session.req_header().method, ctx.class) {
+            self.retry.charge(self.upstreams.now_ms(), ctx.attempts)
+        } else {
+            RetryDecision::Ineligible
+        };
+        metrics::RETRIES
+            .with_label_values(&[ctx.route_id.as_deref().unwrap_or("-"), decision.as_str()])
+            .inc();
+        metrics::RETRY_BUDGET
+            .set(i64::try_from(self.retry.allowance(self.upstreams.now_ms())).unwrap_or(i64::MAX));
+        decision
     }
 
     /// Route limiter for this request, created on first use.
@@ -451,6 +605,11 @@ impl ProxyHttp for Harmost {
         ctx.class =
             resolved_request_class(&meta, route.and_then(|r| r.declared_class()), hints.class);
         ctx.route_id = route.map(|r| r.id.clone());
+        // Resolved here, where the route is in hand, and read back in
+        // `proxy_upstream_filter`, which runs after the cache has had its say
+        // and no longer has it.
+        ctx.priority = route.map_or(Priority::Normal, |r| r.config.priority);
+        ctx.weight = route.map_or(1, |r| r.config.weight);
 
         ctx.route_cache = route.and_then(|r| r.config.cache.clone());
         ctx.key_headers = resolved_key_headers(&hints.key_headers, ctx.route_cache.as_ref());
@@ -603,7 +762,7 @@ impl ProxyHttp for Harmost {
         if ctx.class == RequestClass::Upgrade {
             // No queue: `acquire` with no deadline either takes a slot now or
             // refuses now.
-            match self.upgrades.acquire(None).await {
+            match self.upgrades.acquire(None, 1).await {
                 Ok(permit) => {
                     ctx.upgrade_permit = Some(permit);
                     metrics::UPGRADES
@@ -636,7 +795,7 @@ impl ProxyHttp for Harmost {
             .and_then(|id| self.limiter_for(&ctx.policy, id));
         let outcome = self
             .admission
-            .admit(ctx.class, route_limiter.as_ref())
+            .admit(ctx.class, route_limiter.as_ref(), ctx.priority, ctx.weight)
             .await;
 
         // Publish limiter state on the way through rather than from a timer:
@@ -663,6 +822,7 @@ impl ProxyHttp for Harmost {
                 .with_label_values(&[l.name()])
                 .set((l.limit().saturating_sub(l.available())) as i64);
         }
+        self.publish_tier_state(ctx.priority);
 
         match outcome {
             Admission::Admitted(permits) => {
@@ -810,7 +970,19 @@ impl ProxyHttp for Harmost {
             .upstreams
             .select(path)
             .ok_or_else(|| Error::explain(ErrorType::InternalError, "no upstream configured"))?;
+        // Called again for every retry, which is the point: a retried request
+        // goes back through selection and so lands wherever the breakers and
+        // the load signal now say it should, rather than back on the backend
+        // that just failed it.
+        ctx.attempts = ctx.attempts.saturating_add(1);
+        ctx.outcome_recorded = false;
+        self.retry.record_attempt(self.upstreams.now_ms());
+        // Assigning replaces any slot held from a previous attempt, and
+        // dropping the old guard hands that backend's slot back.
+        self.release_origin_slot(ctx);
+        ctx.origin_slot = Some(self.upstreams.enter_selected(backend));
         ctx.upstream = Some(backend.address.clone());
+        self.publish_backend_state(backend.id, &backend.address);
         ctx.origin_started = Some(Instant::now());
         ctx.origin_wall_started = Some(std::time::SystemTime::now());
         // The origin fetch gets its own span id, minted here so that the
@@ -842,6 +1014,49 @@ impl ProxyHttp for Harmost {
         };
         configure_peer_timeouts(&mut peer, &ctx.policy.config.timeouts);
         Ok(Box::new(peer))
+    }
+
+    /// A connect failure: nothing was written upstream, nothing was written
+    /// downstream, and the backend is demonstrably not answering.
+    ///
+    /// This is the one error where Harmost turns a retry *on*. Everywhere
+    /// else it can only narrow, because Pingora knows things this layer does
+    /// not — chiefly whether a response byte has already been sent.
+    fn fail_to_connect(
+        &self,
+        session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Ctx,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        self.record_origin_outcome(ctx, false, "connect");
+        e.set_retry(self.decide_retry(session, ctx).allowed());
+        e
+    }
+
+    /// An error after the connection was established.
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        session: &mut Session,
+        e: Box<Error>,
+        ctx: &mut Ctx,
+        client_reused: bool,
+    ) -> Box<Error> {
+        self.record_origin_outcome(ctx, false, "proxy");
+        let mut e = e.more_context(format!("Peer: {peer}"));
+        // The default implementation's decision, reproduced rather than
+        // skipped: only a reused connection may be retried, and only while the
+        // retry buffer is intact. It also has to happen before anything reads
+        // `retry()`, which panics on an error whose retry is still undecided.
+        e.retry
+            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+        // From here Harmost only ever narrows. A `false` is never turned into
+        // a `true`.
+        if e.retry() && !self.decide_retry(session, ctx).allowed() {
+            e.set_retry(false);
+        }
+        e
     }
 
     async fn upstream_request_filter(
@@ -899,9 +1114,26 @@ impl ProxyHttp for Harmost {
     async fn upstream_response_filter(
         &self,
         _session: &mut Session,
-        _upstream: &mut ResponseHeader,
+        upstream: &mut ResponseHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
+        // Time to first byte, not total response time: it is what reflects the
+        // origin's own queueing, and it does not make a backend that served a
+        // large body look slow.
+        if let (Some(slot), Some(started)) = (&ctx.origin_slot, ctx.origin_started) {
+            let id = slot.backend_id();
+            self.upstreams.observe_latency(
+                id,
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+            if let Some(address) = ctx.upstream.as_deref() {
+                self.publish_backend_state(id, address);
+            }
+        }
+        // Any 5xx is the origin saying it could not do its job, which is the
+        // signal a health probe on a static path cannot see. A 4xx is not: the
+        // origin answered correctly about a request it was right to refuse.
+        self.record_origin_outcome(ctx, !upstream.status.is_server_error(), "status");
         check_origin_deadline(ctx)
     }
 
@@ -942,6 +1174,11 @@ impl ProxyHttp for Harmost {
                 });
             }
             ctx.permit = None;
+            // The backend's slot goes back on exactly the same argument, and
+            // it has to: least-loaded selection reads this count, and holding
+            // it until the client finished reading would make a backend
+            // serving slow readers look permanently busy.
+            self.release_origin_slot(ctx);
         }
         Ok(None)
     }
@@ -1108,6 +1345,11 @@ impl ProxyHttp for Harmost {
                 .with_label_values(&[l.name()])
                 .set(l.queue_depth() as i64);
         }
+        self.publish_tier_state(ctx.priority);
+        // Republish what least-loaded selection reads, so the routing decision
+        // is auditable rather than a black box. `release_origin_slot` drops the
+        // guard before publishing, so the gauge is the post-release value.
+        self.release_origin_slot(ctx);
     }
 }
 
