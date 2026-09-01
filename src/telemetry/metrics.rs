@@ -23,8 +23,8 @@
 )]
 
 use prometheus::{
-    HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, register_histogram_vec,
-    register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
+    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, register_histogram_vec,
+    register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
 };
 use std::sync::LazyLock;
 
@@ -380,8 +380,8 @@ pub static CACHE_PURGED: LazyLock<IntCounterVec> = LazyLock::new(|| {
 /// Read against `harmost_cache_bytes` and the hit ratio: eviction rising while
 /// the cache is at its ceiling and the hit ratio is falling is the signal that
 /// the working set does not fit.
-pub static CACHE_EVICTED: LazyLock<IntGauge> = LazyLock::new(|| {
-    register_int_gauge!(
+pub static CACHE_EVICTED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "harmost_cache_evicted_total",
         "Cache entries discarded to stay inside the byte budget"
     )
@@ -447,6 +447,19 @@ mod tests {
         // Duplicate registration panics at runtime; catch it here instead.
         preregister();
         preregister();
+    }
+
+    #[test]
+    fn monotonic_evictions_are_exported_as_a_counter() {
+        preregister();
+        let family = prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == "harmost_cache_evicted_total")
+            .unwrap();
+        assert_eq!(
+            family.get_field_type(),
+            prometheus::proto::MetricType::COUNTER
+        );
     }
 
     #[test]

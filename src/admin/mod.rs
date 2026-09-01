@@ -39,6 +39,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use http::{Response, StatusCode};
+use percent_encoding::percent_decode_str;
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
 
@@ -444,10 +445,9 @@ fn secret_eq(provided: &[u8], expected: &[u8]) -> bool {
 
 /// Parse `?tag=…&tag=…` / `?all=1` out of a query string.
 ///
-/// Percent-decoding is deliberately *not* performed. A cache tag is an opaque
-/// identifier the origin chose, and decoding here would mean a tag containing
-/// `%2C` could be stored under one name and purged under another — a purge
-/// that silently matches nothing is worse than one that is refused.
+/// Values are percent-decoded exactly once. A cache tag is opaque, so a literal
+/// `%` is represented as `%25`; decoding is what also lets reserved bytes such
+/// as `&` and `#` be named without turning them into query syntax.
 fn parse_purge_query(query: Option<&str>) -> Result<PurgeRequest, PurgeRefusal> {
     let Some(query) = query.filter(|q| !q.is_empty()) else {
         return Err(PurgeRefusal::Malformed(
@@ -459,6 +459,10 @@ fn parse_purge_query(query: Option<&str>) -> Result<PurgeRequest, PurgeRefusal> 
     let mut all = false;
     for pair in query.split('&') {
         let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let value = percent_decode_str(value)
+            .decode_utf8()
+            .map_err(|_| PurgeRefusal::Malformed("parameter values must be valid UTF-8"))?;
+        let value = value.as_ref();
         match name {
             "tag" if !value.is_empty() => {
                 if tags.len() >= MAX_PURGE_TAGS {
@@ -857,18 +861,31 @@ mod tests {
         ));
     }
 
-    /// Percent-decoding here would mean a tag stored as `a%2Cb` could be
-    /// purged under a name it was never stored under, so a purge would
-    /// silently match nothing.
     #[test]
-    fn purge_tags_are_not_percent_decoded() {
+    fn purge_values_are_percent_decoded_once() {
         assert_eq!(
-            parse_purge_query(Some("tag=a%2Cb")),
+            parse_purge_query(Some("tag=sale%26clearance&path=%2Fproducts%2Fred%26blue")),
+            Ok(PurgeRequest::Selective {
+                tags: vec!["sale&clearance".into()],
+                paths: vec!["/products/red&blue".into()]
+            })
+        );
+        assert_eq!(
+            parse_purge_query(Some("tag=a%252Cb")),
             Ok(PurgeRequest::Selective {
                 tags: vec!["a%2Cb".into()],
                 paths: vec![]
-            })
+            }),
+            "a literal percent must be decoded exactly once"
         );
+    }
+
+    #[test]
+    fn purge_refuses_percent_decoded_values_that_are_not_utf8() {
+        assert!(matches!(
+            parse_purge_query(Some("tag=%ff")),
+            Err(PurgeRefusal::Malformed(_))
+        ));
     }
 
     #[test]

@@ -379,9 +379,10 @@ Four things worth knowing before you rely on it:
   endpoint, so a purge has to reach all of them. Fan out from your deploy
   pipeline, or accept that invalidation is eventually consistent within one
   TTL.
-- **In-flight renders are left alone.** A purge concerns responses that have
-  been stored; cancelling a render already streaming to a client would turn an
-  invalidation into a user-visible error.
+- **In-flight renders keep streaming, but are not admitted afterward.** A
+  matching render already streaming to a client is allowed to finish, while
+  its temporary fill is marked invalid so it cannot repopulate the cache after
+  the purge has reported success.
 
 ### Purging by path
 
@@ -396,9 +397,11 @@ Four constraints worth knowing:
   `/products/iphone`. There is no equivalent of
   `revalidatePath('/products/[slug]', 'page')` — matching a dynamic route
   pattern needs route metadata Harmost does not have until phase 6.
-- **Absolute, and not percent-decoded.** The stored value is the request path
-  as it arrived, so `?path=` must present the same encoding. A relative path is
-  a `400` rather than a purge that silently matches nothing.
+- **Absolute and query-encoded.** Parameter values are percent-decoded exactly
+  once. The decoded value must equal the stored request path, including that
+  path's own encoding. For example, purging a stored `/products/a%2Fb` uses
+  `?path=/products/a%252Fb`. A relative path is a `400` rather than a purge
+  that silently matches nothing.
 - **Across hosts.** A path purge matches that path on every virtual host this
   instance serves. It over-purges rather than under-purges: the cost is origin
   work, never stale content.

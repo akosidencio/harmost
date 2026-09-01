@@ -1336,7 +1336,6 @@ impl ProxyHttp for Harmost {
         // spike that caused the incident someone is reading it during.
         metrics::CACHE_BYTES.set(self.store.bytes_used() as i64);
         metrics::CACHE_ENTRIES.set(self.store.entries() as i64);
-        metrics::CACHE_EVICTED.set(i64::try_from(self.store.evicted()).unwrap_or(i64::MAX));
         metrics::CACHE_TAGS.set(self.store.tags() as i64);
         if ctx.upgrade_permit.take().is_some() {
             metrics::UPGRADES_ACTIVE.set(

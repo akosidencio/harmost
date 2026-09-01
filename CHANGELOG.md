@@ -3,27 +3,12 @@
 All notable changes to Harmost. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning.** Harmost is pre-1.0 and follows Cargo's pre-1.0 SemVer
-convention: `0.x.y` may change behaviour in a `y` bump, and every such change
-is listed here. It is a binary rather than a library, so the surface that
-matters is the **configuration file** and the **operator interface** — the
-config schema version, the CLI, the signals, the metric names and the admin
-endpoints. Changes to those are called out explicitly.
-
-**Configuration schema.** Separate from the release version and currently
-**version 1**, unchanged since the first release. The rules for what may change
-without a schema bump are in [`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md).
-
-**Maturity.** No release has been run in production by anyone. "Done, tested"
-throughout this file means unit-tested and, where a `bench/` script exists,
-asserted end to end against a local fixture origin. See
-[Project maturity](./README.md#project-maturity-and-expectations).
 
 ---
 
 ## [0.1.2] — unreleased
 
-Two roadmap phases: origin resilience, and the cache lifecycle. Almost
+Origin resilience, and the cache lifecycle. Almost
 everything here is off or inert by default — the single exception is
 `cache.eviction`, whose new default changes which entry is discarded when the
 cache is full.

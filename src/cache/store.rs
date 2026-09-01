@@ -115,6 +115,9 @@ struct Temp {
     transient: bool,
     tags: Vec<String>,
     path: String,
+    /// A purge matched this fill while it was in progress. Existing followers
+    /// may still drain the body, but it must not be admitted afterward.
+    invalidated: bool,
 }
 
 impl Temp {
@@ -127,6 +130,7 @@ impl Temp {
             transient,
             tags,
             path,
+            invalidated: false,
         }
     }
 }
@@ -165,6 +169,10 @@ fn parse_tags(value: &str) -> Vec<String> {
 /// bounded is a memory-exhaustion vector in a component whose job is to absorb
 /// traffic spikes.
 pub struct BoundedStore {
+    /// Makes registering and completing a fill atomic with respect to purge.
+    /// The read side is held only for those short state transitions, never
+    /// while response bytes stream.
+    lifecycle: RwLock<()>,
     cached: RwLock<HashMap<String, Stored>>,
     /// Eviction queue. Front is the next candidate; under
     /// [`Eviction::Clock`] an entry that has been read gets requeued at the
@@ -208,6 +216,7 @@ impl BoundedStore {
         // `Storage` takes `&'static self` throughout (upstream marks this a
         // TODO). Leaking once at startup is the intended shape.
         Box::leak(Box::new(BoundedStore {
+            lifecycle: RwLock::new(()),
             cached: RwLock::new(HashMap::new()),
             order: RwLock::new(VecDeque::new()),
             tag_index: RwLock::new(HashMap::new()),
@@ -301,6 +310,7 @@ impl BoundedStore {
                 *used = used.saturating_sub(entry.size());
                 unindex_tags(&mut tag_index, &victim, &entry.tags);
                 self.evicted.fetch_add(1, Ordering::Relaxed);
+                crate::telemetry::metrics::CACHE_EVICTED.inc();
             }
         }
         *used += additional;
@@ -318,17 +328,21 @@ impl BoundedStore {
         let mut cached = self.cached.write();
         let mut order = self.order.write();
         let mut tag_index = self.tag_index.write();
+        // Remove before indexing the replacement. If both revisions carry the
+        // same tag, doing this in the opposite order removes the new mapping
+        // along with the old one.
+        if let Some(old) = cached.remove(&key) {
+            *used = used.saturating_sub(old.size());
+            unindex_tags(&mut tag_index, &key, &old.tags);
+            order.retain(|existing| existing != &key);
+        }
         for tag in &obj.tags {
             tag_index
                 .entry(tag.clone())
                 .or_default()
                 .insert(key.clone());
         }
-        if let Some(old) = cached.insert(key.clone(), obj) {
-            *used = used.saturating_sub(old.size());
-            unindex_tags(&mut tag_index, &key, &old.tags);
-            order.retain(|existing| existing != &key);
-        }
+        cached.insert(key.clone(), obj);
         order.push_back(key);
     }
 
@@ -340,19 +354,31 @@ impl BoundedStore {
     /// several. Purging by tag is the operation that stays correct when the
     /// routing changes.
     pub fn purge_tags<'a>(&self, tags: impl IntoIterator<Item = &'a str>) -> Purged {
+        let wanted: HashSet<&str> = tags.into_iter().filter(|tag| !tag.is_empty()).collect();
+        if wanted.is_empty() {
+            return Purged::default();
+        }
+        let _lifecycle = self.lifecycle.write();
         let mut victims: HashSet<String> = HashSet::new();
         {
             let tag_index = self.tag_index.read();
-            for tag in tags {
-                if let Some(keys) = tag_index.get(tag) {
+            for tag in &wanted {
+                if let Some(keys) = tag_index.get(*tag) {
                     victims.extend(keys.iter().cloned());
                 }
             }
         }
-        if victims.is_empty() {
-            return Purged::default();
+        {
+            let mut temp = self.temp.write();
+            for writes in temp.values_mut() {
+                for fill in writes.values_mut() {
+                    if fill.tags.iter().any(|tag| wanted.contains(tag.as_str())) {
+                        fill.invalidated = true;
+                    }
+                }
+            }
         }
-        self.purge_matching(|key, _| victims.contains(key))
+        self.purge_matching_locked(|key, _| victims.contains(key))
     }
 
     /// Drop every completed entry.
@@ -363,7 +389,16 @@ impl BoundedStore {
     /// and a cache still holding a whole build's worth of dead responses has
     /// that much less room for the one now serving traffic.
     pub fn purge_all(&self) -> Purged {
-        self.purge_matching(|_, _| true)
+        let _lifecycle = self.lifecycle.write();
+        {
+            let mut temp = self.temp.write();
+            for writes in temp.values_mut() {
+                for fill in writes.values_mut() {
+                    fill.invalidated = true;
+                }
+            }
+        }
+        self.purge_matching_locked(|_, _| true)
     }
 
     /// Drop every entry answering any of these exact paths.
@@ -388,16 +423,27 @@ impl BoundedStore {
         if wanted.is_empty() {
             return Purged::default();
         }
-        self.purge_matching(|_, entry| wanted.contains(entry.path.as_str()))
+        let _lifecycle = self.lifecycle.write();
+        {
+            let mut temp = self.temp.write();
+            for writes in temp.values_mut() {
+                for fill in writes.values_mut() {
+                    if wanted.contains(fill.path.as_str()) {
+                        fill.invalidated = true;
+                    }
+                }
+            }
+        }
+        self.purge_matching_locked(|_, entry| wanted.contains(entry.path.as_str()))
     }
 
     /// The one place entries leave the cache for a reason other than eviction.
     ///
-    /// In-progress fills are deliberately left alone. A purge concerns
-    /// responses that have been stored, and cancelling a render that is
-    /// already streaming to a client would turn an invalidation into a
-    /// user-visible error.
-    fn purge_matching(&self, matches: impl Fn(&str, &Stored) -> bool) -> Purged {
+    /// The caller holds the write side of `lifecycle`, so no persistent fill
+    /// can move between `temp` and `cached` while the match is evaluated.
+    /// Matching temporary fills are marked separately: their clients finish
+    /// normally, but the response is not admitted afterward.
+    fn purge_matching_locked(&self, matches: impl Fn(&str, &Stored) -> bool) -> Purged {
         let mut used = self.used.lock();
         let mut cached = self.cached.write();
         let mut order = self.order.write();
@@ -567,6 +613,9 @@ impl Storage for BoundedStore {
         meta: &CacheMeta,
         _t: &SpanHandle,
     ) -> Result<MissHandler> {
+        // A purge either sees this fill in `temp` or completes before the fill
+        // is registered; there is no gap in which both can miss each other.
+        let _lifecycle = self.lifecycle.read();
         let hash = key.combined();
         let transient = meta
             .response_header()
@@ -624,7 +673,15 @@ impl Storage for BoundedStore {
         // that arrives this way cannot leave the tag index pointing at an
         // entry that no longer exists.
         let hash = key.combined();
-        Ok(self.purge_matching(|key, _| key == hash).entries > 0)
+        let _lifecycle = self.lifecycle.write();
+        let temp_invalidated = self.temp.write().get_mut(&hash).is_some_and(|writes| {
+            for fill in writes.values_mut() {
+                fill.invalidated = true;
+            }
+            !writes.is_empty()
+        });
+        let completed = self.purge_matching_locked(|key, _| key == hash).entries > 0;
+        Ok(temp_invalidated || completed)
     }
 
     async fn update_meta(
@@ -633,15 +690,27 @@ impl Storage for BoundedStore {
         meta: &CacheMeta,
         _t: &SpanHandle,
     ) -> Result<bool> {
+        let _lifecycle = self.lifecycle.read();
         let hash = key.combined();
         let replacement = meta.serialize()?;
-        let replacement_size = replacement.0.len() + replacement.1.len();
+        let replacement_tags = meta
+            .response_header()
+            .headers
+            .get(&self.tag_header)
+            .and_then(|value| value.to_str().ok())
+            .map(parse_tags)
+            .unwrap_or_default();
+        let replacement_size = replacement.0.len()
+            + replacement.1.len()
+            + replacement_tags.iter().map(String::len).sum::<usize>();
         let mut used = self.used.lock();
         let mut cached = self.cached.write();
+        let mut tag_index = self.tag_index.write();
         let Some(obj) = cached.get_mut(&hash) else {
             return Ok(false);
         };
-        let old_size = obj.meta.0.len() + obj.meta.1.len();
+        let old_size =
+            obj.meta.0.len() + obj.meta.1.len() + obj.tags.iter().map(String::len).sum::<usize>();
         if replacement_size > old_size {
             let growth = replacement_size - old_size;
             if used.saturating_add(growth) > self.max_bytes {
@@ -651,7 +720,15 @@ impl Storage for BoundedStore {
         } else {
             *used = used.saturating_sub(old_size - replacement_size);
         }
+        unindex_tags(&mut tag_index, &hash, &obj.tags);
+        for tag in &replacement_tags {
+            tag_index
+                .entry(tag.clone())
+                .or_default()
+                .insert(hash.clone());
+        }
         obj.meta = replacement;
+        obj.tags = replacement_tags;
         Ok(true)
     }
 
@@ -835,10 +912,17 @@ impl HandleMiss for FollowableMiss {
                 }
             });
         } else {
+            // A purge either marks this fill before this transition or waits
+            // until it has become a completed entry and removes it there.
+            let _lifecycle = self.store.lifecycle.read();
             let temp = self
                 .store
                 .remove_temp(&self.key, id)
                 .ok_or_else(|| Error::explain(ErrorType::InternalError, "write vanished"))?;
+            if temp.invalidated {
+                self.store.release(self.accounted);
+                return Ok(MissFinishType::Created(size));
+            }
             let body = temp.body;
             self.store.admit(
                 self.key.clone(),
@@ -1040,6 +1124,27 @@ mod tests {
         assert_eq!(store.entries(), 2);
     }
 
+    #[tokio::test]
+    async fn a_path_purge_prevents_a_matching_in_progress_fill_from_being_admitted() {
+        let store = store_of(1 << 20);
+        let key = CacheKey::new("", "path-fill", "/purged-path");
+        let mut writer = store
+            .get_miss_handler(&key, &meta(), &Span::inactive().handle())
+            .await
+            .unwrap();
+        writer
+            .write_body(Bytes::from_static(b"partial"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(store.purge_paths(["/purged-path"]), Purged::default());
+        writer.write_body(Bytes::new(), true).await.unwrap();
+        writer.finish().await.unwrap();
+
+        assert!(!is_key_cached(store, "path-fill").await);
+        assert_eq!(store.bytes_used(), 0);
+    }
+
     /// An entry whose path was too long to remember has an empty path, and an
     /// empty purge target must never match it — otherwise one over-long URL
     /// makes every such entry collateral damage.
@@ -1166,6 +1271,94 @@ mod tests {
         assert_eq!(store.purge_tags(["v1"]), Purged::default());
         assert!(is_cached(store, "/p/1").await);
         assert_eq!(store.purge_tags(["v2"]).entries, 1);
+    }
+
+    #[tokio::test]
+    async fn a_re_stored_entry_keeps_tags_shared_by_both_revisions() {
+        let store = store_of(1 << 20);
+        fill(store, "/p/1", &["product-1", "v1"], 64).await;
+        fill(store, "/p/1", &["product-1", "v2"], 64).await;
+
+        assert_eq!(store.purge_tags(["v1"]), Purged::default());
+        assert_eq!(
+            store.purge_tags(["product-1"]).entries,
+            1,
+            "replacing the entry removed its still-current tag from the index"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_updates_replace_the_tag_index_membership() {
+        let store = store_of(1 << 20);
+        fill(store, "/p/1", &["old-tag"], 64).await;
+
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header
+            .insert_header("x-harmost-cache-tags", "new-tag")
+            .unwrap();
+        let now = SystemTime::now();
+        let replacement = CacheMeta::new(now + Duration::from_secs(600), now, 0, 0, header);
+        assert!(
+            store
+                .update_meta(
+                    &CacheKey::new("", "/p/1", ""),
+                    &replacement,
+                    &Span::inactive().handle(),
+                )
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(store.purge_tags(["old-tag"]), Purged::default());
+        assert_eq!(store.purge_tags(["new-tag"]).entries, 1);
+    }
+
+    #[tokio::test]
+    async fn a_tag_purge_prevents_a_matching_in_progress_fill_from_being_admitted() {
+        let store = store_of(1 << 20);
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header
+            .insert_header("x-harmost-cache-tags", "purged-tag")
+            .unwrap();
+        let now = SystemTime::now();
+        let meta = CacheMeta::new(now + Duration::from_secs(600), now, 0, 0, header);
+        let key = CacheKey::new("", "/in-progress", "/in-progress");
+        let mut writer = store
+            .get_miss_handler(&key, &meta, &Span::inactive().handle())
+            .await
+            .unwrap();
+        writer
+            .write_body(Bytes::from_static(b"partial"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(store.purge_tags(["purged-tag"]), Purged::default());
+        writer.write_body(Bytes::new(), true).await.unwrap();
+        writer.finish().await.unwrap();
+
+        assert!(!is_key_cached(store, "/in-progress").await);
+        assert_eq!(store.bytes_used(), 0);
+    }
+
+    #[tokio::test]
+    async fn purge_all_prevents_old_deployment_fills_from_being_admitted_late() {
+        let store = store_of(1 << 20);
+        let key = CacheKey::new("", "/old-build", "/old-build");
+        let mut writer = store
+            .get_miss_handler(&key, &meta(), &Span::inactive().handle())
+            .await
+            .unwrap();
+        writer
+            .write_body(Bytes::from_static(b"partial"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(store.purge_all(), Purged::default());
+        writer.write_body(Bytes::new(), true).await.unwrap();
+        writer.finish().await.unwrap();
+
+        assert!(!is_key_cached(store, "/old-build").await);
+        assert_eq!(store.bytes_used(), 0);
     }
 
     #[test]
