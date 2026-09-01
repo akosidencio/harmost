@@ -3,19 +3,47 @@
 All notable changes to Harmost. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-
 ---
 
 ## [0.1.2] — unreleased
 
-Origin resilience, and the cache lifecycle. Almost
+Origin resilience, the cache lifecycle, and the first framework adapter. Almost
 everything here is off or inert by default — the single exception is
 `cache.eviction`, whose new default changes which entry is discarded when the
 cache is full.
 
 ### Added
 
-**Cache lifecycle** 
+**Next.js integration**
+
+- **[`@harmost/next`](./packages/harmost-next)**, a zero-dependency package that
+  takes from the Next.js build the two things Harmost cannot work out on its
+  own.
+- **`harmost-next generate`** turns `next build` output into a Harmost config:
+  the build id becomes `deployment.id`, prerendered routes become `public_ssr`
+  with `override_origin` and a TTL from `initialRevalidateSeconds`, Route
+  Handlers and dynamically rendered pages become `private_dynamic`, and
+  `/_next/image` is generated with the `vary: [Accept]` that makes it cache at
+  all. **Anything the build does not prove is shareable is generated private** —
+  a prerendered route is proof, a dynamic one is not, and a generator that
+  guessed would be one bad guess away from serving one user's page to another.
+- **`revalidateTag()` / `revalidatePath()` wrappers** that invalidate Next's
+  incremental cache and then Harmost's copy. Values are sent verbatim, because
+  Harmost matches them verbatim; one that cannot survive a query string is
+  refused rather than encoded into one that purges nothing. The token travels in
+  an `Authorization` header and redirects are refused, so it cannot be bounced
+  to another host. A failed purge throws — stale content served silently is
+  worse than a failed deploy hook.
+- **A compatibility matrix that is asserted rather than transcribed.** Next's
+  build manifests carry their own version numbers and an unknown one is refused,
+  on the same reasoning as an unknown config schema version. The matrix is
+  checked against a real build in the test suite, and a further test runs the
+  generated config through `harmost check`.
+- **Node and Bun**, both verified: the package uses only `node:` builtins and
+  web standards, and its `node:test` suite runs unmodified under `bun test`. CI
+  runs both.
+
+**Cache lifecycle**
 
 - **Cache tags and a purge API.** An origin tags a response with a header
   (`cache.tag_header`, default `x-harmost-cache-tags`); `POST /purge?tag=...`

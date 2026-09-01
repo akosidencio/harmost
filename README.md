@@ -986,6 +986,32 @@ Both are off by default and both are documented where their trade-offs are:
 `spool`, and [Using Harmost with Next.js](#using-harmost-with-nextjs) for
 `upgrade`.
 
+### Generating configuration from a Next.js build
+
+[`@harmost/next`](./packages/harmost-next) takes from the build the two things
+Harmost cannot work out by watching traffic:
+
+```bash
+next build
+npx harmost-next generate --upstream next-1:3000 --out harmost.yaml
+harmost check --config harmost.yaml
+```
+
+The build id becomes `deployment.id`; prerendered routes become `public_ssr`
+with a TTL from their `initialRevalidateSeconds`; Route Handlers and
+dynamically rendered pages become `private_dynamic`; `/_next/image` is
+generated with the `vary: [Accept]` it needs to cache at all.
+
+**Anything the build does not prove is shareable is generated private.** A
+prerendered route is proof — Next produced one response for everybody. A
+dynamic one is not, so opting it into `public_ssr` stays a decision a person
+makes. The same package routes `revalidateTag()` and `revalidatePath()` to the
+purge API below.
+
+This is the difference between Harmost inferring route policy from headers and
+being *told* it by the build — the gap that made hand-written route config
+necessary in the first place.
+
 ### Cache invalidation
 
 Two things beyond a TTL: tags, and an endpoint to purge them.

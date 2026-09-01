@@ -70,14 +70,16 @@ the measurements and the conditions that would reopen the question in
 
 ## 6. Framework integration and production-ready examples
 
-Deliberately last, and deliberately after phase 4. An adapter contract designed
-before the cache lifecycle it has to drive would be a guess; designed after, it
-is a description of something that already works.
+Deliberately after phase 4. An adapter contract designed before the cache
+lifecycle it has to drive would be a guess; designed after, it is a description
+of something that already works.
 
-- Build a versioned `@harmost/next` integration for route hints, deployment ids,
-  and invalidation events — the path from Next.js `revalidateTag()` and
-  `revalidatePath()` to the phase 4 purge API — with a tested compatibility
-  matrix.
+The first adapter has shipped: [`@harmost/next`](../packages/harmost-next)
+generates route configuration and a deployment id from a Next.js build, and
+routes `revalidateTag()` / `revalidatePath()` to the phase 4 purge API. What
+remains here is the generalisation — a contract other frameworks can implement
+— and the examples.
+
 - Ship working, production-shaped Next.js examples rather than fixtures: a real
   deployment topology, a deployment-id rollover, and an invalidation flow
   someone can copy instead of infer.
