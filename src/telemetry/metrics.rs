@@ -360,6 +360,45 @@ pub static RETRY_BUDGET: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("metric registration")
 });
 
+/// Entries removed by an explicit purge, by `scope`: `tags` or `all`.
+///
+/// Deliberately separate from eviction. An evicted entry means the cache is
+/// doing its job inside its budget; a purged one means somebody invalidated
+/// something. A single counter covering both makes "why did our hit ratio
+/// fall off a cliff" unanswerable.
+pub static CACHE_PURGED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "harmost_cache_purged_total",
+        "Cache entries removed by an explicit purge, by scope",
+        &["scope"]
+    )
+    .expect("metric registration")
+});
+
+/// Entries discarded to stay inside `cache.max_memory`.
+///
+/// Read against `harmost_cache_bytes` and the hit ratio: eviction rising while
+/// the cache is at its ceiling and the hit ratio is falling is the signal that
+/// the working set does not fit.
+pub static CACHE_EVICTED: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_cache_evicted_total",
+        "Cache entries discarded to stay inside the byte budget"
+    )
+    .expect("metric registration")
+});
+
+/// Distinct invalidation tags currently indexed. The tag index is bounded by
+/// the entries pointing at it, so this is the number that shows whether an
+/// origin's tagging scheme is as small as its author thinks.
+pub static CACHE_TAGS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "harmost_cache_tags",
+        "Distinct invalidation tags currently indexed"
+    )
+    .expect("metric registration")
+});
+
 /// Touch every metric family so a fresh scrape shows zeros rather than absent
 /// series. A dashboard that renders "no data" during an incident is worse than
 /// one that renders zero.
@@ -394,6 +433,9 @@ pub fn preregister() {
     LazyLock::force(&UPSTREAM_LATENCY_EWMA);
     LazyLock::force(&RETRIES);
     LazyLock::force(&RETRY_BUDGET);
+    LazyLock::force(&CACHE_PURGED);
+    LazyLock::force(&CACHE_EVICTED);
+    LazyLock::force(&CACHE_TAGS);
 }
 
 #[cfg(test)]
@@ -413,7 +455,7 @@ mod tests {
         // config-derived, like `route`.
         let allowed = [
             "route", "class", "status", "reason", "decision", "upstream", "limiter", "outcome",
-            "kind",
+            "kind", "scope",
         ];
         preregister();
         for family in prometheus::gather() {

@@ -66,6 +66,8 @@ pub struct Admin {
     pub spool: Arc<SpoolBudget>,
     pub upgrades: Arc<Limiter>,
     pub retry: Arc<RetryBudget>,
+    /// Shared secret for `POST /purge`. `None` disables the endpoint outright.
+    pub purge_token: Option<String>,
     pub drain: Arc<DrainState>,
     /// Report not-ready when no upstream is passing its health check. Off by
     /// default; see [`crate::config::schema::Admin`].
@@ -136,6 +138,65 @@ impl Admin {
             StatusCode::SERVICE_UNAVAILABLE
         };
         (status, s)
+    }
+
+    /// Authorise and perform a purge, returning the JSON body on success.
+    ///
+    /// Authorisation happens before parsing, so an unauthenticated caller
+    /// cannot use error messages to learn which parameters this build accepts.
+    fn purge(
+        &self,
+        authorization: Option<&[u8]>,
+        query: Option<&str>,
+    ) -> Result<String, PurgeRefusal> {
+        let Some(token) = self.purge_token.as_deref() else {
+            return Err(PurgeRefusal::Disabled);
+        };
+        let presented = authorization
+            .and_then(|value| value.strip_prefix(b"Bearer "))
+            .ok_or(PurgeRefusal::Unauthorized)?;
+        if !secret_eq(presented, token.as_bytes()) {
+            return Err(PurgeRefusal::Unauthorized);
+        }
+
+        let request = parse_purge_query(query)?;
+        let (purged, scope, tags, paths) = match &request {
+            PurgeRequest::All => (self.store.purge_all(), "all", 0, 0),
+            PurgeRequest::Selective { tags, paths } => {
+                // Two passes over one request, and the counts are summed
+                // rather than the sets unioned first: an entry carrying a
+                // purged tag *and* answering a purged path is removed once,
+                // because the second pass no longer finds it.
+                let mut purged = self.store.purge_tags(tags.iter().map(String::as_str));
+                let by_path = self.store.purge_paths(paths.iter().map(String::as_str));
+                purged.entries += by_path.entries;
+                purged.bytes += by_path.bytes;
+                (purged, "selective", tags.len(), paths.len())
+            }
+        };
+        crate::telemetry::metrics::CACHE_PURGED
+            .with_label_values(&[scope])
+            .inc_by(purged.entries as u64);
+        crate::telemetry::metrics::CACHE_BYTES.set(self.store.bytes_used() as i64);
+        crate::telemetry::metrics::CACHE_ENTRIES.set(self.store.entries() as i64);
+        crate::telemetry::metrics::CACHE_TAGS.set(self.store.tags() as i64);
+        log::info!(
+            "purge scope={scope} tags={tags} paths={paths} entries={} bytes={}",
+            purged.entries,
+            purged.bytes
+        );
+
+        let mut body = String::from("{\"purged\":true,");
+        field_str(&mut body, "scope", scope);
+        let _ = write!(
+            body,
+            "\"tags\":{tags},\"paths\":{paths},\"entries\":{},\"bytes\":{},\
+             \"remaining_entries\":{}}}",
+            purged.entries,
+            purged.bytes,
+            self.store.entries()
+        );
+        Ok(body)
     }
 
     /// The full status document.
@@ -234,11 +295,28 @@ impl Admin {
         }
         let _ = write!(
             s,
-            "],\"cache\":{{\"enabled\":{},\"bytes_used\":{},\"max_bytes\":{},\"entries\":{}}},",
+            "],\"cache\":{{\"enabled\":{},\"bytes_used\":{},\"max_bytes\":{},\"entries\":{},",
             cfg.cache.enabled,
             self.store.bytes_used(),
             self.store.limit(),
             self.store.entries()
+        );
+        field_str(
+            &mut s,
+            "eviction",
+            match self.store.eviction() {
+                crate::config::schema::Eviction::Clock => "clock",
+                crate::config::schema::Eviction::Fifo => "fifo",
+            },
+        );
+        field_str(&mut s, "tag_header", self.store.tag_header());
+        let _ = write!(
+            s,
+            "\"tags\":{},\"evicted\":{},\"purged\":{},\"purge_enabled\":{}}},",
+            self.store.tags(),
+            self.store.evicted(),
+            self.store.purged(),
+            self.purge_token.is_some()
         );
 
         let _ = write!(
@@ -306,18 +384,171 @@ const INDEX: &str = concat!(
     "harmost ",
     env!("CARGO_PKG_VERSION"),
     " admin\n\n",
-    "GET /health/live   always 200 while the process is running\n",
-    "GET /health/ready  503 while draining or, if configured, while no upstream is healthy\n",
-    "GET /status        configuration generation, backend state, cache and spool usage\n",
+    "GET  /health/live   always 200 while the process is running\n",
+    "GET  /health/ready  503 while draining or, if configured, while no upstream is healthy\n",
+    "GET  /status        configuration generation, backend state, cache and spool usage\n",
+    "POST /purge         invalidate cache entries by tag or path, or all of them\n",
+    "                    ?tag=<name> and/or ?path=</url> (repeatable) | ?all=1\n",
+    "                    requires: Authorization: Bearer <cache.purge.token>\n",
 );
+
+/// The most `?tag=` and `?path=` parameters one purge may name, each.
+///
+/// The request line is already bounded by Pingora's header limit, so this is
+/// not the only bound — it is the one that says what the limit is on purpose
+/// rather than leaving it to be discovered.
+const MAX_PURGE_TAGS: usize = 128;
+
+/// What a purge request asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum PurgeRequest {
+    /// Tags and paths may be combined: a deploy hook that calls both
+    /// `revalidateTag()` and `revalidatePath()` should be one request, not two
+    /// round trips and two chances to half-apply.
+    Selective {
+        tags: Vec<String>,
+        paths: Vec<String>,
+    },
+    All,
+}
+
+/// Why a purge request was refused. Every variant is a response body, so none
+/// of them may echo anything the caller sent.
+#[derive(Debug, PartialEq, Eq)]
+enum PurgeRefusal {
+    /// No token configured, so the endpoint does not exist.
+    Disabled,
+    /// Missing or wrong credentials.
+    Unauthorized,
+    /// Nothing to do, or contradictory instructions.
+    Malformed(&'static str),
+}
+
+/// Compare two secrets without leaking their contents through timing.
+///
+/// `==` on a `str` short-circuits at the first differing byte, which over
+/// enough requests tells an attacker how much of a token prefix they have
+/// right. The lengths are compared first and unequal lengths are refused
+/// immediately: the length of a configured token is not the secret, and
+/// padding to hide it would be theatre.
+fn secret_eq(provided: &[u8], expected: &[u8]) -> bool {
+    if provided.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in provided.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Parse `?tag=…&tag=…` / `?all=1` out of a query string.
+///
+/// Percent-decoding is deliberately *not* performed. A cache tag is an opaque
+/// identifier the origin chose, and decoding here would mean a tag containing
+/// `%2C` could be stored under one name and purged under another — a purge
+/// that silently matches nothing is worse than one that is refused.
+fn parse_purge_query(query: Option<&str>) -> Result<PurgeRequest, PurgeRefusal> {
+    let Some(query) = query.filter(|q| !q.is_empty()) else {
+        return Err(PurgeRefusal::Malformed(
+            "say what to purge: ?tag=<name>, ?path=</url>, or ?all=1",
+        ));
+    };
+    let mut tags: Vec<String> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
+    let mut all = false;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match name {
+            "tag" if !value.is_empty() => {
+                if tags.len() >= MAX_PURGE_TAGS {
+                    return Err(PurgeRefusal::Malformed("too many tags in one request"));
+                }
+                if !tags.iter().any(|existing| existing == value) {
+                    tags.push(value.to_string());
+                }
+            }
+            // Absolute paths only. A relative one could never match a stored
+            // entry — the stored value is the request path, which always
+            // begins with `/` — so accepting it would be a purge that silently
+            // removed nothing.
+            "path" if value.starts_with('/') => {
+                if paths.len() >= MAX_PURGE_TAGS {
+                    return Err(PurgeRefusal::Malformed("too many paths in one request"));
+                }
+                if !paths.iter().any(|existing| existing == value) {
+                    paths.push(value.to_string());
+                }
+            }
+            "path" => {
+                return Err(PurgeRefusal::Malformed(
+                    "path must be absolute and begin with /",
+                ));
+            }
+            "all" if value == "1" || value == "true" => all = true,
+            // An unknown parameter is refused rather than ignored, on the same
+            // reasoning as `deny_unknown_fields` in the config: a typo'd
+            // `?tags=` that quietly purged nothing would look like a working
+            // invalidation for as long as nobody checked.
+            _ => {
+                return Err(PurgeRefusal::Malformed(
+                    "unrecognised parameter; expected tag or all",
+                ));
+            }
+        }
+    }
+    let selective = !tags.is_empty() || !paths.is_empty();
+    match (all, selective) {
+        (true, false) => Ok(PurgeRequest::All),
+        (false, true) => Ok(PurgeRequest::Selective { tags, paths }),
+        (true, true) => Err(PurgeRefusal::Malformed(
+            "all=1 cannot be combined with tag= or path=; pick one",
+        )),
+        (false, false) => Err(PurgeRefusal::Malformed(
+            "say what to purge: ?tag=<name>, ?path=</url>, or ?all=1",
+        )),
+    }
+}
 
 #[async_trait]
 impl ServeHttp for Admin {
     async fn response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
         let req = session.req_header();
+        let path = req.uri.path();
+
+        // Purge is the one endpoint here that changes anything, so it is the
+        // one endpoint that is not a `GET`. That is not decoration: a `GET`
+        // that invalidates a cache gets fetched by link prefilers, crawlers,
+        // browser history and `curl` in a shell loop, and every one of those
+        // becomes an origin stampede.
+        if path == "/purge" {
+            if req.method != http::Method::POST {
+                return text(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "purge is POST only; a GET that invalidates a cache is a stampede \
+                     waiting for a crawler\n",
+                );
+            }
+            let authorization = req
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .map(http::HeaderValue::as_bytes);
+            return match self.purge(authorization, req.uri.query()) {
+                Ok(body) => json(StatusCode::OK, body),
+                Err(PurgeRefusal::Disabled) => text(
+                    StatusCode::NOT_FOUND,
+                    "purge is not configured; set cache.purge.token to enable it\n",
+                ),
+                Err(PurgeRefusal::Unauthorized) => unauthorized(),
+                Err(PurgeRefusal::Malformed(why)) => {
+                    text(StatusCode::BAD_REQUEST, &format!("{why}\n"))
+                }
+            };
+        }
+
         // A `HEAD` is answered like a `GET` minus the body, which Pingora does
         // by way of the response it is handed; anything else is refused
-        // outright. This surface has no state to change.
+        // outright. Everything below has no state to change.
         if req.method != http::Method::GET && req.method != http::Method::HEAD {
             return text(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -327,7 +558,7 @@ impl ServeHttp for Admin {
         // Path only. A query string cannot change anything below, and is
         // ignored rather than rejected so that a `?v=1` cache-buster from a
         // dashboard does not read as an outage.
-        match req.uri.path() {
+        match path {
             "/health/live" | "/healthz" => json(StatusCode::OK, self.liveness_body()),
             "/health/ready" | "/readyz" => {
                 let (status, body) = self.readiness_body();
@@ -338,6 +569,20 @@ impl ServeHttp for Admin {
             _ => text(StatusCode::NOT_FOUND, "not found\n"),
         }
     }
+}
+
+/// A refusal that says how to authenticate without saying anything about the
+/// secret, and that a cache is never allowed to store.
+fn unauthorized() -> Response<Vec<u8>> {
+    let mut response = text(
+        StatusCode::UNAUTHORIZED,
+        "purge requires Authorization: Bearer <cache.purge.token>\n",
+    );
+    response.headers_mut().insert(
+        http::header::WWW_AUTHENTICATE,
+        http::HeaderValue::from_static("Bearer realm=\"harmost-purge\""),
+    );
+    response
 }
 
 fn json(status: StatusCode, body: String) -> Response<Vec<u8>> {
@@ -409,13 +654,238 @@ mod tests {
                 pool.assume_healthy();
                 pool
             }),
-            store: BoundedStore::new(64 * 1024 * 1024),
+            store: BoundedStore::new(&crate::config::schema::CacheDefaults {
+                max_memory: crate::config::units::Bytes(64 * 1024 * 1024),
+                ..Default::default()
+            }),
             spool: SpoolBudget::new(1024 * 1024),
             upgrades: Limiter::new("upgrade", 100, 0, Duration::ZERO),
             retry: Arc::new(RetryBudget::new(&crate::config::schema::Retry::default())),
+            purge_token: None,
             drain: Arc::new(DrainState::new()),
             require_healthy_upstream: require_healthy,
         }
+    }
+
+    // ------------------------------------------------------------- purge
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn admin_with_purge() -> Admin {
+        let mut a = admin(false);
+        a.purge_token = Some(TOKEN.to_string());
+        a
+    }
+
+    fn bearer(token: &str) -> Vec<u8> {
+        format!("Bearer {token}").into_bytes()
+    }
+
+    #[test]
+    fn purge_does_not_exist_without_a_token() {
+        // Not "unauthorized" — absent. An endpoint that advertises itself as
+        // present-but-locked is an invitation to guess at the lock.
+        let a = admin(false);
+        assert_eq!(
+            a.purge(Some(&bearer(TOKEN)), Some("all=1")),
+            Err(PurgeRefusal::Disabled)
+        );
+    }
+
+    #[test]
+    fn purge_refuses_a_missing_or_wrong_token() {
+        let a = admin_with_purge();
+        for authorization in [
+            None,
+            Some(bearer("")),
+            Some(bearer("wrong")),
+            // Right length, wrong content — the case a length check alone
+            // would wave through.
+            Some(bearer(&"f".repeat(TOKEN.len()))),
+            // Correct token, wrong scheme.
+            Some(format!("Basic {TOKEN}").into_bytes()),
+            // Correct token as a bare value with no scheme.
+            Some(TOKEN.as_bytes().to_vec()),
+        ] {
+            assert_eq!(
+                a.purge(authorization.as_deref(), Some("all=1")),
+                Err(PurgeRefusal::Unauthorized),
+                "a bad credential was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn purge_authorises_before_it_parses() {
+        // Otherwise the error messages become a free description of which
+        // parameters this build understands, for anyone with no credential.
+        let a = admin_with_purge();
+        assert_eq!(
+            a.purge(None, Some("nonsense=1")),
+            Err(PurgeRefusal::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn purge_accepts_a_correct_token() {
+        let a = admin_with_purge();
+        let body = a.purge(Some(&bearer(TOKEN)), Some("all=1")).unwrap();
+        assert!(body.contains(r#""purged":true"#), "{body}");
+        assert!(body.contains(r#""scope":"all""#), "{body}");
+        assert_balanced(&body);
+    }
+
+    #[test]
+    fn purge_needs_to_be_told_what_to_purge() {
+        let a = admin_with_purge();
+        for query in [None, Some(""), Some("tag=")] {
+            assert!(
+                matches!(
+                    a.purge(Some(&bearer(TOKEN)), query),
+                    Err(PurgeRefusal::Malformed(_))
+                ),
+                "an empty purge was accepted: {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_comparison_is_length_then_constant_time() {
+        assert!(secret_eq(b"abc", b"abc"));
+        assert!(!secret_eq(b"abc", b"abd"));
+        assert!(!secret_eq(b"ab", b"abc"));
+        assert!(!secret_eq(b"", b"a"));
+        assert!(secret_eq(b"", b""));
+    }
+
+    #[test]
+    fn purge_query_parsing_rejects_what_it_does_not_understand() {
+        assert_eq!(
+            parse_purge_query(Some("tag=a&tag=b")),
+            Ok(PurgeRequest::Selective {
+                tags: vec!["a".into(), "b".into()],
+                paths: vec![]
+            })
+        );
+        assert_eq!(
+            parse_purge_query(Some("tag=a&tag=a")),
+            Ok(PurgeRequest::Selective {
+                tags: vec!["a".into()],
+                paths: vec![]
+            }),
+            "repeats collapse"
+        );
+        assert_eq!(parse_purge_query(Some("all=1")), Ok(PurgeRequest::All));
+        assert_eq!(parse_purge_query(Some("all=true")), Ok(PurgeRequest::All));
+
+        // A typo that silently purged nothing would look like a working
+        // invalidation until somebody checked.
+        assert!(matches!(
+            parse_purge_query(Some("tags=a")),
+            Err(PurgeRefusal::Malformed(_))
+        ));
+        // Contradictory instructions are refused rather than guessed at.
+        assert!(matches!(
+            parse_purge_query(Some("all=1&tag=a")),
+            Err(PurgeRefusal::Malformed(_))
+        ));
+        assert!(matches!(
+            parse_purge_query(Some("all=1&path=/x")),
+            Err(PurgeRefusal::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn purge_accepts_paths_beside_tags() {
+        // One deploy hook that calls both `revalidateTag()` and
+        // `revalidatePath()` should be one request, not two chances to
+        // half-apply.
+        assert_eq!(
+            parse_purge_query(Some("tag=a&path=/products/iphone")),
+            Ok(PurgeRequest::Selective {
+                tags: vec!["a".into()],
+                paths: vec!["/products/iphone".into()],
+            })
+        );
+        assert_eq!(
+            parse_purge_query(Some("path=/a&path=/b&path=/a")),
+            Ok(PurgeRequest::Selective {
+                tags: vec![],
+                paths: vec!["/a".into(), "/b".into()],
+            }),
+            "repeats collapse"
+        );
+    }
+
+    /// A relative path could never match a stored entry, since the stored
+    /// value is the request path and always begins with `/`. Accepting one
+    /// would be a purge that silently removed nothing.
+    #[test]
+    fn purge_refuses_a_relative_path() {
+        for query in ["path=products", "path=", "path=./x"] {
+            assert!(
+                matches!(
+                    parse_purge_query(Some(query)),
+                    Err(PurgeRefusal::Malformed(_))
+                ),
+                "accepted {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn purge_bounds_how_many_paths_one_request_may_name() {
+        let query = (0..MAX_PURGE_TAGS + 5)
+            .map(|n| format!("path=/p/{n}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert!(matches!(
+            parse_purge_query(Some(&query)),
+            Err(PurgeRefusal::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn purge_bounds_how_many_tags_one_request_may_name() {
+        let query = (0..MAX_PURGE_TAGS + 5)
+            .map(|n| format!("tag=t{n}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert!(matches!(
+            parse_purge_query(Some(&query)),
+            Err(PurgeRefusal::Malformed(_))
+        ));
+    }
+
+    /// Percent-decoding here would mean a tag stored as `a%2Cb` could be
+    /// purged under a name it was never stored under, so a purge would
+    /// silently match nothing.
+    #[test]
+    fn purge_tags_are_not_percent_decoded() {
+        assert_eq!(
+            parse_purge_query(Some("tag=a%2Cb")),
+            Ok(PurgeRequest::Selective {
+                tags: vec!["a%2Cb".into()],
+                paths: vec![]
+            })
+        );
+    }
+
+    #[test]
+    fn the_status_document_says_whether_purge_is_enabled() {
+        assert!(
+            admin(false)
+                .status_body()
+                .contains(r#""purge_enabled":false"#)
+        );
+        let body = admin_with_purge().status_body();
+        assert!(body.contains(r#""purge_enabled":true"#), "{body}");
+        assert!(body.contains(r#""eviction":"clock""#), "{body}");
+        assert!(
+            body.contains(r#""tag_header":"x-harmost-cache-tags""#),
+            "{body}"
+        );
+        assert_balanced(&body);
     }
 
     #[test]

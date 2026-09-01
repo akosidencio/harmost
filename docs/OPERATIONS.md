@@ -314,6 +314,7 @@ Some settings are **startup-bound and a reload refuses rather than ignores
 them**: listeners, TLS, `trusted_proxies`, `origin.upstreams`,
 `origin.load_balancing`, `origin.http_version`, `origin.breaker`,
 `origin.retry`, `spool.max_memory`, `upgrade.max_concurrent`, the cache budget,
+`cache.eviction`, `cache.tag_header`, `cache.purge.token`,
 `timeouts.origin`, `server.graceful`, `telemetry.admin`, and
 `telemetry.tracing.otlp`. A reload that reported success while the old trust
 policy stayed in force would be the worst version of this, so it says so
@@ -331,6 +332,129 @@ What **does** reload is the set you actually reach for mid-incident:
 ceiling or moving a priority share is an incident action, so it happens without
 a restart. Limiters are **resized** rather than replaced, so in-flight permits
 are never double-counted across the change.
+
+---
+
+## Invalidating the cache
+
+`POST /purge` on the **admin listener**, authorised by `cache.purge.token`.
+Without a token the endpoint does not exist — a `404`, not a `401`. That is the
+only safe default: purging makes the origin re-render on demand, so an open
+purge endpoint is a stampede trigger anybody can pull.
+
+```bash
+# One tag, or several.
+curl -X POST -H "Authorization: Bearer $HARMOST_PURGE_TOKEN" \
+  "http://127.0.0.1:9091/purge?tag=product-42&tag=collection-sale"
+
+# One path, and every variant of it — query strings, Accept, the RSC payload
+# beside the HTML. This is what revalidatePath() means by a path.
+curl -X POST -H "Authorization: Bearer $HARMOST_PURGE_TOKEN" \
+  "http://127.0.0.1:9091/purge?path=/products/iphone"
+
+# Both at once, so a deploy hook is one call rather than two.
+curl -X POST -H "Authorization: Bearer $HARMOST_PURGE_TOKEN" \
+  "http://127.0.0.1:9091/purge?tag=collection-sale&path=/products/iphone"
+
+# Everything. Expect an origin load spike proportional to your traffic.
+curl -X POST -H "Authorization: Bearer $HARMOST_PURGE_TOKEN" \
+  "http://127.0.0.1:9091/purge?all=1"
+```
+
+It answers with what it removed:
+
+```json
+{"purged":true,"scope":"selective","tags":2,"paths":1,"entries":17,"bytes":410233,"remaining_entries":128}
+```
+
+Four things worth knowing before you rely on it:
+
+- **`POST` only.** A `GET` that invalidates a cache gets fetched by crawlers,
+  link prefetchers and browser history. A `GET /purge` answers `405`.
+- **A misspelled parameter is a `400`, not a silent success.** `?tags=x` is
+  refused rather than treated as "purge nothing", on the same reasoning as
+  unknown keys in the config file: an invalidation that quietly does nothing
+  looks like a working one until somebody checks.
+- **Purge is per process.** Every replica has its own cache and its own
+  endpoint, so a purge has to reach all of them. Fan out from your deploy
+  pipeline, or accept that invalidation is eventually consistent within one
+  TTL.
+- **In-flight renders are left alone.** A purge concerns responses that have
+  been stored; cancelling a render already streaming to a client would turn an
+  invalidation into a user-visible error.
+
+### Purging by path
+
+`?path=` matches the request path **exactly**, and matches every entry
+answering it. A single route is several cache entries — a query variant, an
+`Accept` variant, the RSC flight payload beside the HTML — and invalidating the
+page means invalidating all of them.
+
+Four constraints worth knowing:
+
+- **Exact, not a prefix.** `?path=/products` does not touch
+  `/products/iphone`. There is no equivalent of
+  `revalidatePath('/products/[slug]', 'page')` — matching a dynamic route
+  pattern needs route metadata Harmost does not have until phase 6.
+- **Absolute, and not percent-decoded.** The stored value is the request path
+  as it arrived, so `?path=` must present the same encoding. A relative path is
+  a `400` rather than a purge that silently matches nothing.
+- **Across hosts.** A path purge matches that path on every virtual host this
+  instance serves. It over-purges rather than under-purges: the cost is origin
+  work, never stale content.
+- **Paths over 512 bytes are not remembered**, and so are not purgeable by
+  path. They remain purgeable by tag and by `all`.
+
+Where the path is stored is worth one sentence, because it is the part that
+could have gone wrong: it rides in the cache key's `user_tag`, which Pingora
+hashes into nothing. The cache key — which decides what is shared with whom —
+is provably unchanged, and a test pins that.
+
+### Where tags come from
+
+An entry is tagged by whatever the origin puts in the header named by
+`cache.tag_header`, default `x-harmost-cache-tags`, comma-separated. Harmost
+strips that header from the downstream response: tag names describe an origin's
+internal content model and are nobody else's business.
+
+```
+X-Harmost-Cache-Tags: product-42, collection-sale
+```
+
+Any origin that can set a header can be purged by tag — no adapter, no
+JavaScript. At most 64 tags per response, 256 bytes each; extras are dropped.
+
+**Next.js** emits its own `x-next-cache-tags`, so pointing `cache.tag_header`
+at it makes `revalidateTag()` content reachable without an integration:
+
+```yaml
+cache:
+  tag_header: "x-next-cache-tags"
+```
+
+Know what that costs before you do it. The header is only set when the Next
+server runs with `NEXT_PRIVATE_MINIMAL_MODE=1`, and only for statically
+generated App Router routes — verified against Next 16.3.3. `NEXT_PRIVATE_*`
+is undocumented and unversioned, so this can break on a minor Next upgrade with
+no deprecation. Treat it as a useful shortcut with a compatibility risk, not as
+a supported contract; the supported one is phase 6's `@harmost/next`.
+
+### Deployment rollovers
+
+Nothing to call. The cache key already carries `deployment.id`, so the previous
+build's entries become unreachable the moment the id changes — and a `SIGHUP`
+that changes it also purges them, so their bytes go back to the budget instead
+of aging out. A reload that does *not* change the id leaves the cache alone;
+purging on every `SIGHUP` would turn a routine config change into a stampede.
+
+### What to watch
+
+| Signal | Means |
+|---|---|
+| `harmost_cache_purged_total{scope="tags"}` | Invalidations arriving. A flat line after a deploy that should have invalidated something is the failure to look for. |
+| `harmost_cache_purged_total{scope="all"}` rising | Somebody is purging everything, repeatedly. That is a stampede generator, not an invalidation strategy. |
+| `harmost_cache_evicted_total` rising while `harmost_cache_bytes` sits at its ceiling | The working set does not fit. More memory, a shorter TTL, or a narrower key. |
+| `harmost_cache_tags` growing without bound | The origin mints a tag per revision. The index is bounded by the entries pointing at it, but a tag per render means a tag index the size of the cache. |
 
 ---
 

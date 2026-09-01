@@ -1,0 +1,32 @@
+# Cache hit cost, for the storage evaluation in
+# docs/CACHE-STORAGE-EVALUATION.md.
+#
+# The origin answers `no-store`, so the route has to declare the responses
+# shareable before there is a hit to measure at all.
+#
+# `@LISTEN@`, `@ORIGIN@` and `@METRICS@` are substituted by bench/lib.sh.
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+origin:
+  upstreams: ["127.0.0.1:@ORIGIN@"]
+  concurrency:
+    max: 50
+cache:
+  enabled: true
+  max_memory: 256MiB
+  max_body_size: 8MiB
+timeouts:
+  origin: 20s
+debug_headers: true
+routes:
+  - id: pages
+    match: "/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 1h
+telemetry:
+  prometheus:
+    listen: "127.0.0.1:@METRICS@"
