@@ -59,6 +59,21 @@ so no existing config changes behaviour.
   [`bench/retry.sh`](./bench/retry.sh), both asserting on what the origin
   fixtures counted. `bench/slow-origin` gained `/__fail` and `/__heal`.
 - **Alerts** for the above in [`ops/prometheus/alerts.yml`](./ops/prometheus/alerts.yml).
+- **`bench/nextjs.sh` step 11**: the image optimiser is cached per negotiated
+  format. The fixture gained `public/bands.png` because Next's optimiser
+  refuses SVG and the fixture had no raster image, so `/_next/image` was never
+  exercised by the integration proof at all.
+
+### Fixed
+
+- **The documented `/_next/image` route never cached anything.** Next
+  content-negotiates the output format on `Accept` and answers
+  `Vary: Accept`, so a route keying only on `url`/`w`/`q` was refused storage
+  on every response (`bypass_reason=unsupported_vary`) — a 60s image cache
+  advertised in the README that delivered a 0% hit rate. Verified against a
+  real Next 16.3.3 origin. The route now lists `Accept` in `cache.vary` and
+  carries `priority: low` / `weight: 4`, and `bench/nextjs.sh` asserts both the
+  hit and that WebP and PNG clients never share an entry.
 
 ### Changed
 

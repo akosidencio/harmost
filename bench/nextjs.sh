@@ -62,7 +62,7 @@ wait_until_ready || fail "services did not become ready"
 RUN_ID="$(date +%s)-$$"
 
 echo
-echo "1/10 identical public SSR requests coalesce across the origin pool"
+echo "1/11 identical public SSR requests coalesce across the origin pool"
 BEFORE=$(metric_sum products)
 seq 1 "$CONCURRENCY" | xargs -P "$CONCURRENCY" -I{} \
   curl -sS -o "$RESULT_DIR/coalesce-{}.html" -w '%{http_code}\n' \
@@ -77,7 +77,7 @@ RENDER_IDS=$(sed -n 's/.*data-render-id="\([^"]*\)".*/\1/p' "$RESULT_DIR"/coales
 echo "PASS: $CONCURRENCY responses, one origin render, one shared render id"
 
 echo
-echo "2/10 distinct paths are distributed across all three Next.js origins"
+echo "2/11 distinct paths are distributed across all three Next.js origins"
 for index in $(seq 1 18); do
   curl -fsS "$PROXY_URL/products/spread-$RUN_ID-$index" > "$RESULT_DIR/spread-$index.html"
 done
@@ -87,7 +87,7 @@ INSTANCE_COUNT=$(echo "$INSTANCES" | sed '/^$/d' | wc -l | tr -d ' ')
 echo "PASS: observed $(echo "$INSTANCES" | tr '\n' ' ')"
 
 echo
-echo "3/10 HTML and React Server Component payloads use separate cache keys"
+echo "3/11 HTML and React Server Component payloads use separate cache keys"
 RSC_PATH="/products/rsc-$RUN_ID"
 RSC_URL="$PROXY_URL$RSC_PATH"
 # This is the router tree emitted by the fixture homepage. Next canonicalizes
@@ -122,7 +122,7 @@ cmp -s "$RESULT_DIR/rsc.body" "$RESULT_DIR/rsc-again.body" || fail "cached RSC r
 echo "PASS: HTML and canonical RSC variants cached independently without mixing"
 
 echo
-echo "4/10 Set-Cookie responses are never shared"
+echo "4/11 Set-Cookie responses are never shared"
 PRIVATE_COUNT=16
 BEFORE=$(metric_sum private-session)
 seq 1 "$PRIVATE_COUNT" | xargs -P "$PRIVATE_COUNT" -I{} \
@@ -138,7 +138,7 @@ SESSIONS=$(sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' "$RESULT_DIR"/private-*.
 echo "PASS: $PRIVATE_COUNT requests, $PRIVATE_COUNT renders, $PRIVATE_COUNT sessions"
 
 echo
-echo "5/10 Next-Action mutation requests bypass a deliberately public route"
+echo "5/11 Next-Action mutation requests bypass a deliberately public route"
 MUTATION_COUNT=12
 BEFORE=$(metric_sum action-probe)
 seq 1 "$MUTATION_COUNT" | xargs -P "$MUTATION_COUNT" -I{} \
@@ -155,7 +155,7 @@ MUTATIONS=$(sed -n 's/.*"mutation_id":"\([^"]*\)".*/\1/p' "$RESULT_DIR"/mutation
 echo "PASS: $MUTATION_COUNT mutations bypassed cache reuse and coalescing"
 
 echo
-echo "6/10 Draft Mode bypasses a cached public preview without contaminating it"
+echo "6/11 Draft Mode bypasses a cached public preview without contaminating it"
 BEFORE=$(metric_sum preview)
 curl -fsS -o "$RESULT_DIR/preview-public.html" "$PROXY_URL/preview"
 curl -sS -D "$RESULT_DIR/draft.headers" -o /dev/null "$PROXY_URL/api/draft"
@@ -171,7 +171,7 @@ cmp -s "$RESULT_DIR/preview-public.html" "$RESULT_DIR/preview-public-again.html"
 echo "PASS: draft content bypassed; the public cache entry remained unchanged"
 
 echo
-echo "7/10 coalescing preserves a real Suspense stream"
+echo "7/11 coalescing preserves a real Suspense stream"
 STREAM_COUNT=10
 STREAM_URL="$PROXY_URL/flash-sale?run=$RUN_ID"
 BEFORE=$(metric_sum flash-sale)
@@ -191,7 +191,7 @@ STREAMED=$(awk -v first="$MAX_TTFB" -v total="$MEDIAN_TOTAL" 'BEGIN { print (fir
 echo "PASS: one origin render; max TTFB ${MAX_TTFB}s, median total ${MEDIAN_TOTAL}s"
 
 echo
-echo "8/10 Pages Router getServerSideProps coalesces like the App Router"
+echo "8/11 Pages Router getServerSideProps coalesces like the App Router"
 LEGACY_COUNT=16
 LEGACY_URL="$PROXY_URL/legacy/coalesce-$RUN_ID"
 BEFORE=$(metric_sum legacy-pages)
@@ -209,7 +209,7 @@ grep -q 'data-route-kind="pages-router-ssr"' "$RESULT_DIR/legacy-1.html" || fail
 echo "PASS: $LEGACY_COUNT responses, one origin render, one shared render id"
 
 echo
-echo "9/10 the Pages Router data payload never mixes with its own document"
+echo "9/11 the Pages Router data payload never mixes with its own document"
 # A client-side navigation to a Pages Router route fetches JSON props from
 # /_next/data/<buildId>/<route>.json. Same page, different URL, different
 # content type — and a browser handed the wrong one renders nothing.
@@ -238,7 +238,7 @@ cmp -s "$RESULT_DIR/legacy-data.body" "$RESULT_DIR/legacy-data-again.body" || fa
 echo "PASS: document and data payload cached independently, one render each"
 
 echo
-echo "10/10 a Pages Router Set-Cookie is never shared either"
+echo "10/11 a Pages Router Set-Cookie is never shared either"
 # Same permissive route that just collapsed sixteen requests into one render.
 # `getServerSideProps` setting a cookie has to defeat it exactly as a Route
 # Handler does: the barrier is a property of the response, not of the API used
@@ -257,6 +257,62 @@ LEGACY_SESSIONS=$(sed -n 's/^[Ss]et-[Cc]ookie: legacy_session=\([^;]*\).*/\1/p' 
 [ "$ORIGIN_REQUESTS" -eq "$LEGACY_SESSION_COUNT" ] || fail "$LEGACY_SESSION_COUNT cookie-setting requests caused $ORIGIN_REQUESTS origin requests"
 [ "$LEGACY_SESSIONS" -eq "$LEGACY_SESSION_COUNT" ] || fail "$LEGACY_SESSION_COUNT requests returned only $LEGACY_SESSIONS distinct sessions"
 echo "PASS: $LEGACY_SESSION_COUNT requests, $LEGACY_SESSION_COUNT renders, $LEGACY_SESSION_COUNT sessions"
+
+echo
+echo "11/11 the image optimiser is cached per negotiated format, not per URL"
+# The failure this exists to catch shipped in the README for a while: Next
+# content-negotiates the output format on `Accept` and answers `Vary: Accept`,
+# so a route that keys only on url+w+q is refused storage entirely and quietly
+# gets a 0% hit rate. Both halves are asserted here — that it caches at all,
+# and that two clients with different `Accept` never share an entry.
+IMG="$PROXY_URL/_next/image?url=%2Fbands.png&w=640&q=75"
+WEBP_ACCEPT='image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+PNG_ACCEPT='image/png,image/*'
+
+BEFORE=$(metric_sum next-image)
+for n in 1 2; do
+  curl -fsS -D "$RESULT_DIR/img-webp-$n.headers" -o /dev/null -H "Accept: $WEBP_ACCEPT" "$IMG"
+done
+for n in 1 2; do
+  curl -fsS -D "$RESULT_DIR/img-png-$n.headers" -o /dev/null -H "Accept: $PNG_ACCEPT" "$IMG"
+done
+AFTER=$(metric_sum next-image)
+ORIGIN_REQUESTS=$((AFTER - BEFORE))
+
+harmost_status() { sed -n 's/^[Xx]-[Hh]armost: //p' "$1" | tr -d '\r'; }
+img_type() { sed -n 's/^[Cc]ontent-[Tt]ype: //p' "$1" | tr -d '\r'; }
+
+# The origin negotiated Vary: Accept, so Harmost must have honoured it.
+grep -qi '^vary:.*accept' "$RESULT_DIR/img-webp-1.headers" \
+  || fail "the image response carried no Vary: Accept; this assertion is no longer testing anything"
+
+# Four requests, two distinct formats, so exactly two renders.
+[ "$ORIGIN_REQUESTS" -eq 2 ] \
+  || fail "four image requests in two formats caused $ORIGIN_REQUESTS origin requests instead of 2"
+[ "$(harmost_status "$RESULT_DIR/img-webp-2.headers")" = "HIT" ] \
+  || fail "the second WebP image request was $(harmost_status "$RESULT_DIR/img-webp-2.headers"), not HIT — check that cache.vary lists Accept"
+[ "$(harmost_status "$RESULT_DIR/img-png-2.headers")" = "HIT" ] \
+  || fail "the second PNG image request was $(harmost_status "$RESULT_DIR/img-png-2.headers"), not HIT"
+
+# The safety half: a client that cannot read WebP must never be handed the
+# cached WebP entry.
+WEBP_TYPE=$(img_type "$RESULT_DIR/img-webp-2.headers")
+PNG_TYPE=$(img_type "$RESULT_DIR/img-png-2.headers")
+[ "$WEBP_TYPE" = "image/webp" ] || fail "WebP-capable client received $WEBP_TYPE"
+[ "$PNG_TYPE" = "image/png" ] || fail "PNG-only client received $PNG_TYPE — formats are sharing a cache entry"
+
+# Nothing was refused storage for a Vary the key could not honour.
+UNSUPPORTED=$(curl -fsS "$METRICS_URL/metrics" | awk '
+  /^harmost_cache_bypass_reason_total[{]/ && /reason="unsupported_vary"/ && /route="next-image"/ { sum += $2 }
+  END { print sum + 0 }')
+[ "$UNSUPPORTED" -eq 0 ] || fail "$UNSUPPORTED image responses were refused storage as unsupported_vary"
+
+# And the low-priority tier ceiling is 50% of the global 8.
+TIER_LOW=$(curl -fsS "$METRICS_URL/metrics" \
+  | sed -n 's/^harmost_concurrency_limit{limiter="tier:low"} \([0-9]*\)$/\1/p' | head -1)
+[ "${TIER_LOW:-0}" -eq 4 ] \
+  || fail "the low-priority tier ceiling is ${TIER_LOW:-missing}, expected 4 (50% of 8)"
+echo "PASS: 4 requests, 2 renders, WebP and PNG kept apart, low tier capped at 4"
 
 echo
 echo "PASS: real Next.js integration proof completed"

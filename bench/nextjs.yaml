@@ -16,6 +16,10 @@ origin:
     queue:
       max: 100
       timeout: 5s
+  # So `priority: low` on the image route means something. Step 11 asserts that
+  # a tier ceiling is actually enforced.
+  priorities:
+    low: 50
 
 health:
   path: "/healthz"
@@ -50,6 +54,29 @@ routes:
   - id: next-static
     match: "/_next/static/**"
     class: static
+
+  # The image optimiser. `vary: [Accept]` is load-bearing: Next negotiates the
+  # output format on `Accept` and answers `Vary: Accept`, so without it in the
+  # key Harmost refuses to store anything and the route gets a 0% hit rate.
+  # Step 11 asserts the hit, the format separation, and the tier ceiling.
+  - id: next-image
+    match: "/_next/image"
+    class: public_dynamic
+    priority: low
+    weight: 4
+    cache:
+      ttl:
+        max: 1h
+      query:
+        mode: include
+        keys: ["url", "w", "q"]
+      vary:
+        headers: ["Accept"]
+    concurrency:
+      max: 4
+      queue:
+        max: 30
+        timeout: 5s
 
   - id: health
     match: "/healthz"

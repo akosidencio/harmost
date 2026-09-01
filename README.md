@@ -717,6 +717,10 @@ origin:
     queue:
       max: 1000
       timeout: 2s
+  # Reserved capacity. Low-priority work — image transforms below — can never
+  # occupy more than 30% of the ceiling, however much of it arrives.
+  priorities:
+    low: 30
 
 cache:
   enabled: true
@@ -730,16 +734,36 @@ routes:
     match: "/_next/static/**"
     class: static
 
-  # The image optimiser is expensive and its output is keyed by query.
+  # The image optimiser is the most expensive thing on a self-hosted Next
+  # origin that is not a render, and it runs in the same Node process. Three
+  # things follow, and all three matter.
+  #
+  # `vary: [Accept]` is not optional. Next content-negotiates the output
+  # format on `Accept` and answers `Vary: Accept` — the same URL returns WebP
+  # to one client and PNG to another. Without `Accept` in the key, Harmost
+  # refuses to store the response at all (`bypass_reason=unsupported_vary`)
+  # rather than risk serving one format to a client that cannot read it, so
+  # the route silently gets a 0% hit rate.
+  #
+  # `priority: low` and `weight: 4` are what stop images starving renders: a
+  # transform is several hundred milliseconds of origin CPU, not the single
+  # unit of work a bare ceiling assumes.
   - id: next-image
     match: "/_next/image"
     class: public_dynamic
+    priority: low
+    weight: 4
     cache:
+      # The origin already says `public, max-age=14400`, so no override is
+      # needed — this is only the ceiling Harmost will honour. The output is
+      # immutable for a given url+w+q+format, so it can be generous.
       ttl:
-        max: 60s
+        max: 1h
       query:
         mode: include
         keys: ["url", "w", "q"]
+      vary:
+        headers: ["Accept"]
     concurrency:
       max: 20
 

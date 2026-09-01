@@ -25,7 +25,7 @@ must pass before merge.
 | Doc tests | `cargo test --workspace --doc --locked` | any failure |
 | Dependency advisories | `cargo audit -D warnings` | any advisory not listed in `.cargo/audit.toml` with a reason |
 | End-to-end suite | `./bench/all.sh` | any script's own assertions |
-| Next.js proof | `./bench/nextjs.sh`, `./bench/nextjs-browser.sh` | any assertion |
+| Next.js proof | `./bench/nextjs.sh` (11 steps), `./bench/nextjs-browser.sh` | any assertion |
 | Fuzz targets | `cargo +nightly fuzz build`, then 60s per target | a crash, or a target that no longer builds |
 
 `bench/all.sh` runs, among the rest of the suite, the operability scripts added
