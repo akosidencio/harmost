@@ -120,6 +120,8 @@ pub fn validate(cfg: &Config) -> Result<()> {
     check_unimplemented(cfg)?;
     check_coalesce_wait(cfg)?;
     check_queue(&cfg.origin.concurrency, "origin.concurrency")?;
+    validate_purge(cfg)?;
+    validate_tag_header(cfg)?;
     validate_breaker(cfg)?;
     validate_retry(cfg)?;
     validate_priorities(cfg)?;
@@ -551,6 +553,62 @@ fn priority_name(priority: Priority) -> &'static str {
     }
 }
 
+/// The shortest purge token worth having.
+///
+/// Not arbitrary: the endpoint is reachable by anyone who can reach the admin
+/// listener, and a short shared secret on an invalidation endpoint is a
+/// stampede trigger behind a lock anybody can pick. Long enough that guessing
+/// is not the attack, short enough to paste.
+const MIN_PURGE_TOKEN: usize = 24;
+
+fn validate_purge(cfg: &Config) -> Result<()> {
+    let Some(token) = cfg.cache.purge.token.as_deref() else {
+        return Ok(());
+    };
+    if cfg.telemetry.admin.is_none() {
+        return Err(err(
+            "cache.purge.token is set but telemetry.admin is not configured; the purge endpoint              is served on the admin listener, so there is nothing listening for it",
+        ));
+    }
+    if token.len() < MIN_PURGE_TOKEN {
+        return Err(err(format!(
+            "cache.purge.token is {} characters; at least {MIN_PURGE_TOKEN} are required. The              purge endpoint makes an origin re-render on demand, so a guessable secret in front              of it is a stampede anybody can trigger",
+            token.len()
+        )));
+    }
+    // A token has to survive a shell, a Kubernetes secret and an
+    // `Authorization` header unchanged. Refusing the awkward bytes up front
+    // beats an operator debugging why a correct-looking token is rejected.
+    if !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(err(
+            "cache.purge.token must be printable ASCII with no spaces; it travels in an              Authorization header",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tag_header(cfg: &Config) -> Result<()> {
+    let name = &cfg.cache.tag_header;
+    if http::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+        return Err(err(format!(
+            "cache.tag_header `{name}` is not a valid HTTP header name"
+        )));
+    }
+    // Reading tags from a header the client controls would let anyone tag a
+    // response into somebody else's invalidation group — or, with a purge
+    // token in hand, decide what a purge destroys. Tags come from the origin.
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "cookie" | "authorization" | "host" | "accept" | "accept-encoding" | "user-agent"
+    ) {
+        return Err(err(format!(
+            "cache.tag_header is `{name}`, which is a request header; invalidation tags are              declared by the origin on its response"
+        )));
+    }
+    Ok(())
+}
+
 /// A breaker that cannot eject anything is a protection somebody believes they
 /// turned on. Every check here exists because the setting parses cleanly while
 /// describing something inert or self-defeating.
@@ -840,6 +898,86 @@ origin:
     #[test]
     fn accepts_a_minimal_config() {
         validate(&parse(BASE)).unwrap();
+    }
+
+    // ------------------------------------------------- cache lifecycle
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    const ADMIN: &str = "telemetry:\n  admin:\n    listen: \"127.0.0.1:9091\"\n";
+
+    #[test]
+    fn accepts_a_purge_token_alongside_an_admin_listener() {
+        validate(&parse(&format!(
+            "{BASE}cache:\n  purge:\n    token: \"{TOKEN}\"\n{ADMIN}"
+        )))
+        .unwrap();
+    }
+
+    /// The endpoint is served on the admin listener, so a token without one is
+    /// a protection configured against nothing.
+    #[test]
+    fn a_purge_token_without_an_admin_listener_is_refused() {
+        let e = validate(&parse(&format!(
+            "{BASE}cache:\n  purge:\n    token: \"{TOKEN}\"\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("telemetry.admin"), "{e}");
+    }
+
+    #[test]
+    fn a_short_purge_token_is_refused() {
+        let e = validate(&parse(&format!(
+            "{BASE}cache:\n  purge:\n    token: \"short\"\n{ADMIN}"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("at least 24"), "{e}");
+        assert!(e.0.contains("stampede"), "names the consequence: {e}");
+    }
+
+    #[test]
+    fn a_purge_token_that_cannot_travel_in_a_header_is_refused() {
+        let e = validate(&parse(&format!(
+            "{BASE}cache:\n  purge:\n    token: \"has a space in it and is long enough\"\n{ADMIN}"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("printable ASCII"), "{e}");
+    }
+
+    #[test]
+    fn accepts_the_next_js_cache_tag_header() {
+        validate(&parse(&format!(
+            "{BASE}cache:\n  tag_header: \"x-next-cache-tags\"\n"
+        )))
+        .unwrap();
+    }
+
+    /// Tags decide what a purge destroys. Taking them from a header the client
+    /// controls would hand that decision to the client.
+    #[test]
+    fn a_request_header_as_the_tag_source_is_refused() {
+        for header in ["Cookie", "authorization", "User-Agent", "Accept"] {
+            let e = validate(&parse(&format!(
+                "{BASE}cache:\n  tag_header: \"{header}\"\n"
+            )))
+            .unwrap_err();
+            assert!(e.0.contains("declared by the origin"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_tag_header_name_is_refused() {
+        let e = validate(&parse(&format!(
+            "{BASE}cache:\n  tag_header: \"not a header\"\n"
+        )))
+        .unwrap_err();
+        assert!(e.0.contains("valid HTTP header name"), "{e}");
+    }
+
+    #[test]
+    fn both_eviction_policies_are_accepted() {
+        for policy in ["clock", "fifo"] {
+            validate(&parse(&format!("{BASE}cache:\n  eviction: {policy}\n"))).unwrap();
+        }
     }
 
     // ------------------------------------------------- origin resilience

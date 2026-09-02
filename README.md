@@ -717,6 +717,10 @@ origin:
     queue:
       max: 1000
       timeout: 2s
+  # Reserved capacity. Low-priority work — image transforms below — can never
+  # occupy more than 30% of the ceiling, however much of it arrives.
+  priorities:
+    low: 30
 
 cache:
   enabled: true
@@ -730,16 +734,36 @@ routes:
     match: "/_next/static/**"
     class: static
 
-  # The image optimiser is expensive and its output is keyed by query.
+  # The image optimiser is the most expensive thing on a self-hosted Next
+  # origin that is not a render, and it runs in the same Node process. Three
+  # things follow, and all three matter.
+  #
+  # `vary: [Accept]` is not optional. Next content-negotiates the output
+  # format on `Accept` and answers `Vary: Accept` — the same URL returns WebP
+  # to one client and PNG to another. Without `Accept` in the key, Harmost
+  # refuses to store the response at all (`bypass_reason=unsupported_vary`)
+  # rather than risk serving one format to a client that cannot read it, so
+  # the route silently gets a 0% hit rate.
+  #
+  # `priority: low` and `weight: 4` are what stop images starving renders: a
+  # transform is several hundred milliseconds of origin CPU, not the single
+  # unit of work a bare ceiling assumes.
   - id: next-image
     match: "/_next/image"
     class: public_dynamic
+    priority: low
+    weight: 4
     cache:
+      # The origin already says `public, max-age=14400`, so no override is
+      # needed — this is only the ceiling Harmost will honour. The output is
+      # immutable for a given url+w+q+format, so it can be generous.
       ttl:
-        max: 60s
+        max: 1h
       query:
         mode: include
         keys: ["url", "w", "q"]
+      vary:
+        headers: ["Accept"]
     concurrency:
       max: 20
 
@@ -961,6 +985,113 @@ Both are off by default and both are documented where their trade-offs are:
 [Slow readers and render capacity](#slow-readers-and-render-capacity) for
 `spool`, and [Using Harmost with Next.js](#using-harmost-with-nextjs) for
 `upgrade`.
+
+### Generating configuration from a Next.js build
+
+[`@harmost/next`](./packages/harmost-next) takes from the build the two things
+Harmost cannot work out by watching traffic:
+
+```bash
+next build
+npx harmost-next generate --upstream next-1:3000 --out harmost.yaml
+harmost check --config harmost.yaml
+```
+
+The build id becomes `deployment.id`; prerendered routes become `public_ssr`
+with a TTL from their `initialRevalidateSeconds`; Route Handlers and
+dynamically rendered pages become `private_dynamic`; `/_next/image` is
+generated with the `vary: [Accept]` it needs to cache at all.
+
+**Anything the build does not prove is shareable is generated private.** A
+prerendered route is proof — Next produced one response for everybody. A
+dynamic one is not, so opting it into `public_ssr` stays a decision a person
+makes. The same package routes `revalidateTag()` and `revalidatePath()` to the
+purge API below.
+
+This is the difference between Harmost inferring route policy from headers and
+being *told* it by the build — the gap that made hand-written route config
+necessary in the first place.
+
+### Cache invalidation
+
+Two things beyond a TTL: tags, and an endpoint to purge them.
+
+```yaml
+cache:
+  # clock (default) or fifo.
+  eviction: clock
+  # Response header the origin declares tags on, comma-separated.
+  tag_header: "x-harmost-cache-tags"
+  purge:
+    # Without a token the endpoint does not exist. Min 24 printable ASCII.
+    token: "${HARMOST_PURGE_TOKEN}"
+
+telemetry:
+  admin:
+    listen: "127.0.0.1:9091"   # required — /purge lives here
+```
+
+An origin tags a response by setting the header:
+
+```
+X-Harmost-Cache-Tags: product-42, collection-sale
+```
+
+and anything holding the token invalidates it, by tag or by path:
+
+```bash
+# By tag.
+curl -X POST -H "Authorization: Bearer $HARMOST_PURGE_TOKEN" \
+  "http://127.0.0.1:9091/purge?tag=product-42"
+
+# By path — one page, every variant of it: query strings, Accept, the RSC
+# payload beside the HTML. This is what revalidatePath() means by a path.
+curl -X POST -H "Authorization: Bearer $HARMOST_PURGE_TOKEN" \
+  "http://127.0.0.1:9091/purge?path=/products/iphone"
+```
+
+**Purging by path did not change the cache key.** Entries are keyed by a hash,
+so there is no way back from a URL to its entries without storing the path
+somewhere. It rides in the cache key's `user_tag`, which Pingora hashes into
+nothing — so the key that decides what is shared with whom is provably
+untouched, and a test pins that. Matching is exact rather than a prefix; a
+dynamic-route pattern like `revalidatePath('/products/[slug]', 'page')` needs
+route metadata that arrives with the framework integration.
+
+**Framework-neutral by construction.** Any origin that can set a header can be
+purged by tag — no adapter, no JavaScript, no npm package. That is deliberate:
+it is what makes the framework integration on the roadmap an *integration*
+rather than a prerequisite. Next.js emits its own `x-next-cache-tags`, so
+pointing `tag_header` at it reaches `revalidateTag()` content today, at the
+cost of depending on a private Next environment variable — the trade is spelled
+out in [`docs/OPERATIONS.md`](./docs/OPERATIONS.md).
+
+**The endpoint is `POST`-only, token-gated, and absent by default.** A `GET`
+that invalidates a cache gets fetched by crawlers and link prefetchers; an open
+purge endpoint is a stampede trigger anybody can pull. A misspelled parameter
+is a `400` rather than a quiet success, for the same reason unknown config keys
+are refused.
+
+**Deployment rollovers need no call at all.** The cache key already carries
+`deployment.id`, so a build's entries become unreachable the moment it changes
+— and the reload that changes it purges them, returning their bytes to the
+budget. A reload that does not change the id leaves the cache alone.
+
+**Storage stays in process, and that was measured too.** Disk and an external
+store (Redis, memcached) were both evaluated and declined: a cache hit is
+~570 µs end to end and ~60 µs of that is the lookup, so a hit is already
+dominated by the round trip to Harmost and a second hop would roughly double it
+— to buy capacity a microcache with second-long TTLs does not need, and at the
+cost of the streaming partial writes that keep coalescing from destroying
+streaming. [`docs/CACHE-STORAGE-EVALUATION.md`](./docs/CACHE-STORAGE-EVALUATION.md)
+has the numbers and the four conditions that would reopen it.
+
+**Eviction is `clock` — second-chance FIFO — and the default is measured, not
+asserted.** An SSR microcache sees a heavily skewed request distribution, where
+plain FIFO evicts a hot entry as readily as a cold one purely because it
+arrived earlier. On a Zipfian workload the second-chance variant served a
+**0.600 hit ratio against FIFO's 0.525**, for one relaxed atomic per read. The
+comparison runs as a test, so a regression is a failure rather than a feeling.
 
 ### Origin resilience
 

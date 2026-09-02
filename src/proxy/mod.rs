@@ -218,7 +218,7 @@ impl Harmost {
         let initial = policy.load();
         // `Storage` takes `&'static self` throughout, so the store and the
         // lock are created once and leaked deliberately at startup.
-        let store = BoundedStore::new(initial.config.cache.max_memory.as_usize());
+        let store = BoundedStore::new(&initial.config.cache);
         let cache_lock: &'static pingora_cache::lock::CacheKeyLockImpl = Box::leak(
             pingora_cache::lock::CacheLock::new_boxed(initial.config.timeouts.origin.as_duration()),
         );
@@ -738,7 +738,19 @@ impl ProxyHttp for Harmost {
         }
         .build(&meta);
 
-        Ok(PingoraCacheKey::new("", key.canonical_string(), ""))
+        // The path rides along in `user_tag`, which Pingora hashes into
+        // *nothing*: `primary_hasher` covers only the namespace and the
+        // primary key. Carrying it here is what makes `POST /purge?path=…`
+        // possible at all — entries are keyed by a hash, so without the path
+        // stored somewhere there is no way back from a URL to its entries —
+        // and doing it in the one field that cannot change the key means it
+        // cannot change what is shared with whom. `cache::key` remains the
+        // sole authority on that, which the test below pins.
+        Ok(PingoraCacheKey::new(
+            "",
+            key.canonical_string(),
+            purgeable_path(&path),
+        ))
     }
 
     /// Admission. Reached only on a genuine cache miss, so hits and coalesced
@@ -1227,6 +1239,12 @@ impl ProxyHttp for Harmost {
         ctx: &mut Ctx,
     ) -> Result<()> {
         resp.remove_header(crate::cache::TRANSIENT_HEADER);
+        // Invalidation tags describe an origin's internal content model —
+        // which products, which collections, which revisions. That is
+        // reconnaissance, and it is nobody downstream's business, so the
+        // header is stripped whether the response came from the origin or
+        // from the cache.
+        resp.remove_header(self.store.tag_header());
         if ctx.policy.config.debug_headers {
             resp.insert_header("X-Harmost", cache_status(session, ctx).to_ascii_uppercase())?;
         }
@@ -1318,6 +1336,7 @@ impl ProxyHttp for Harmost {
         // spike that caused the incident someone is reading it during.
         metrics::CACHE_BYTES.set(self.store.bytes_used() as i64);
         metrics::CACHE_ENTRIES.set(self.store.entries() as i64);
+        metrics::CACHE_TAGS.set(self.store.tags() as i64);
         if ctx.upgrade_permit.take().is_some() {
             metrics::UPGRADES_ACTIVE.set(
                 (self
@@ -1363,6 +1382,22 @@ impl ProxyHttp for Harmost {
 /// printable ASCII, so a value that is not readable as UTF-8 is a value that
 /// could never have parsed. Treating it as absent starts a fresh trace, which
 /// is the same thing a malformed value does.
+/// The request path, if it is short enough to be worth remembering.
+///
+/// Every stored path costs memory inside the cache's byte budget, and a path
+/// is client-controlled, so this is bounded like everything else that is. A
+/// path past the bound is not purgeable *by path* — it is still purgeable by
+/// tag and by `all`. Truncating instead would be worse than dropping: a
+/// truncated path can collide with a different one, and a purge that removes
+/// the wrong entry is a correctness bug rather than a missing feature.
+fn purgeable_path(path: &str) -> &str {
+    if path.len() <= crate::cache::MAX_PURGEABLE_PATH {
+        path
+    } else {
+        ""
+    }
+}
+
 fn header_str<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }

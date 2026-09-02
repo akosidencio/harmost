@@ -29,6 +29,9 @@ pub struct Reloader {
     path: String,
     policy: Arc<ArcSwap<PolicySnapshot>>,
     admission: Arc<AdmissionController>,
+    /// The response cache, so a deployment rollover can reclaim the previous
+    /// build's entries. `None` in tests that only exercise policy.
+    store: Option<&'static crate::cache::BoundedStore>,
     generation: AtomicU64,
 }
 
@@ -42,8 +45,17 @@ impl Reloader {
             path: path.into(),
             policy,
             admission,
+            store: None,
             generation: AtomicU64::new(1),
         }
+    }
+
+    /// Give the reloader the cache, so that changing `deployment.id` reclaims
+    /// the old build's entries instead of leaving them to age out.
+    #[must_use]
+    pub fn with_store(mut self, store: &'static crate::cache::BoundedStore) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Re-read, validate, and apply. Returns the new generation, or an
@@ -87,8 +99,23 @@ impl Reloader {
         }
         if cfg.cache.max_memory != current.config.cache.max_memory
             || cfg.cache.store != current.config.cache.store
+            || cfg.cache.eviction != current.config.cache.eviction
+            || cfg.cache.tag_header != current.config.cache.tag_header
         {
-            return Err("cache store or memory budget changed; that needs a restart".to_string());
+            return Err(
+                "cache store, memory budget, eviction policy or tag header changed; the store is \
+                 built once at startup and its entries are already indexed under the old header, \
+                 so that needs a restart"
+                    .to_string(),
+            );
+        }
+        if cfg.cache.purge.token != current.config.cache.purge.token {
+            return Err(
+                "cache.purge.token changed; the admin listener reads it once at startup, so a \
+                 reload would report success while the old secret stayed in force; that needs a \
+                 restart"
+                    .to_string(),
+            );
         }
         if cfg.timeouts.origin != current.config.timeouts.origin {
             return Err(
@@ -181,6 +208,7 @@ impl Reloader {
                     .to_string(),
             );
         }
+        let deployment_changed = cfg.deployment.id != current.config.deployment.id;
         drop(current);
 
         let route_limits: Vec<(String, usize, usize, std::time::Duration)> = cfg
@@ -226,6 +254,25 @@ impl Reloader {
                     i64::try_from(tier.limit().saturating_sub(tier.available()))
                         .unwrap_or(i64::MAX),
                 );
+        }
+        // Deployment-safe invalidation. The cache key already carries
+        // `deployment.id`, so the previous build's entries become unreachable
+        // the instant the id changes — but unreachable is not reclaimed, and a
+        // cache still holding a whole dead build has that much less room for
+        // the one now serving traffic. Done before the swap, so no request on
+        // the new generation observes the old entries occupying the budget.
+        if deployment_changed && let Some(store) = self.store {
+            let purged = store.purge_all();
+            if purged.entries > 0 {
+                log::info!(
+                    "deployment id changed; purged {} cache entries ({} bytes) from the                      previous build",
+                    purged.entries,
+                    purged.bytes
+                );
+                crate::telemetry::metrics::CACHE_PURGED
+                    .with_label_values(&["deployment"])
+                    .inc_by(purged.entries as u64);
+            }
         }
         self.policy.store(snapshot);
         // Published only after the swap succeeded, so the gauge answers "which
@@ -388,6 +435,79 @@ routes:
         assert_eq!(policy.load().config.origin.priorities.low, 40);
     }
 
+    /// Put one entry in a store, so a purge has something to reclaim.
+    async fn fill_one(store: &'static crate::cache::BoundedStore) {
+        use pingora_cache::key::CacheKey;
+        use pingora_cache::trace::Span;
+        use pingora_cache::{CacheMeta, storage::Storage};
+        use pingora_http::ResponseHeader;
+
+        let now = std::time::SystemTime::now();
+        let meta = CacheMeta::new(
+            now + std::time::Duration::from_secs(600),
+            now,
+            0,
+            0,
+            ResponseHeader::build(200, None).unwrap(),
+        );
+        let mut writer = store
+            .get_miss_handler(
+                &CacheKey::new("", "/page", ""),
+                &meta,
+                &Span::inactive().handle(),
+            )
+            .await
+            .unwrap();
+        writer
+            .write_body(bytes::Bytes::from_static(b"body"), true)
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    /// A deployment rollover has to reclaim the previous build's entries.
+    /// They are already unreachable — the id is in the cache key — but
+    /// unreachable is not the same as returned to the byte budget, and a cache
+    /// still holding a whole dead build has that much less room for the one
+    /// now serving traffic.
+    #[tokio::test]
+    async fn changing_the_deployment_id_purges_the_previous_build() {
+        let cache =
+            crate::cache::BoundedStore::new(&crate::config::schema::CacheDefaults::default());
+        let (path, reloader, policy) = setup(BASE);
+        let reloader = reloader.with_store(cache);
+
+        fill_one(cache).await;
+        assert_eq!(cache.entries(), 1);
+        assert!(cache.bytes_used() > 0);
+
+        std::fs::write(&path.0, format!("{BASE}deployment:\n  id: \"build-2\"\n")).unwrap();
+        reloader.reload().unwrap();
+
+        assert_eq!(
+            policy.load().config.deployment.id.as_deref(),
+            Some("build-2")
+        );
+        assert_eq!(cache.entries(), 0, "the previous build's entries survived");
+        assert_eq!(cache.bytes_used(), 0, "their bytes were never reclaimed");
+    }
+
+    /// A reload that leaves the deployment id alone must not empty the cache.
+    /// Purging on every `SIGHUP` would turn a routine config change into an
+    /// origin stampede — the exact failure this feature exists to avoid.
+    #[tokio::test]
+    async fn an_ordinary_reload_leaves_the_cache_alone() {
+        let cache =
+            crate::cache::BoundedStore::new(&crate::config::schema::CacheDefaults::default());
+        let (path, reloader, _policy) = setup(BASE);
+        let reloader = reloader.with_store(cache);
+
+        fill_one(cache).await;
+        std::fs::write(&path.0, BASE.replace("max: 100", "max: 120")).unwrap();
+        reloader.reload().unwrap();
+        assert_eq!(cache.entries(), 1, "a routine reload emptied the cache");
+    }
+
     #[test]
     fn changing_upstreams_is_refused_with_an_explanation() {
         let (path, reloader, _policy) = setup(BASE);
@@ -427,6 +547,10 @@ routes:
                 "upstreams: [\"a:3000\"]\n  http_version: http2",
             ),
             format!("{BASE}spool:\n  max_memory: 16MiB\n"),
+            // The store is built once and its entries are already indexed
+            // under the old tag header; the policy is baked into the store.
+            format!("{BASE}cache:\n  eviction: fifo\n"),
+            format!("{BASE}cache:\n  tag_header: \"x-next-cache-tags\"\n"),
             format!("{BASE}upgrade:\n  max_concurrent: 7\n"),
             // Each backend's failure window and its open/closed state are
             // built with the pool. A reload cannot rebuild them without

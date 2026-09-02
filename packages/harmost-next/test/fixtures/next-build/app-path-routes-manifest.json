@@ -1,0 +1,15 @@
+{
+  "/_global-error/page": "/_global-error",
+  "/_not-found/page": "/_not-found",
+  "/account/page": "/account",
+  "/api/action-probe/route": "/api/action-probe",
+  "/api/draft/route": "/api/draft",
+  "/api/private-session/route": "/api/private-session",
+  "/cart/page": "/cart",
+  "/flash-sale/page": "/flash-sale",
+  "/healthz/route": "/healthz",
+  "/page": "/",
+  "/preview/page": "/preview",
+  "/products/[slug]/page": "/products/[slug]",
+  "/search/page": "/search"
+}

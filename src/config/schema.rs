@@ -597,6 +597,71 @@ pub struct CacheDefaults {
     /// opt-out is not offered at any level; see `Route.cache.override_origin`.
     #[serde(default = "yes")]
     pub respect_origin: bool,
+    /// Which entry is discarded when the byte budget is full.
+    #[serde(default)]
+    pub eviction: Eviction,
+    /// Response header the origin uses to tag an entry for later invalidation.
+    ///
+    /// Framework-neutral on purpose: any origin that can set a header can be
+    /// purged by tag, with no adapter and no JavaScript. Next.js emits its own
+    /// `x-next-cache-tags` on statically generated App Router responses when
+    /// the server runs in minimal mode, so pointing this at that header makes
+    /// `revalidateTag()` reachable from Harmost without an integration — at
+    /// the cost of depending on a private Next environment variable. See
+    /// `docs/OPERATIONS.md`.
+    ///
+    /// Whatever it is named, Harmost strips it from the downstream response:
+    /// tag names describe an origin's internal content model and are nobody
+    /// else's business.
+    #[serde(default = "default_tag_header")]
+    pub tag_header: String,
+    /// The purge endpoint, served on the admin listener.
+    #[serde(default)]
+    pub purge: Purge,
+}
+
+/// What gets discarded when the cache is full.
+///
+/// The distinction matters more than it looks. A microcache in front of an SSR
+/// origin sees a heavily skewed request distribution — a handful of URLs are
+/// most of the traffic — and FIFO evicts a hot entry as readily as a cold one
+/// purely because it arrived earlier. `bench/eviction.rs` measures the
+/// difference on a Zipfian workload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Eviction {
+    /// Second-chance FIFO. An entry that has been read since it was queued
+    /// survives one pass and is requeued; the second time round it goes.
+    ///
+    /// The default. It costs one relaxed atomic store on the hit path and
+    /// nothing else — no list surgery, no write lock on read — which is why it
+    /// is affordable where true LRU is not.
+    #[default]
+    Clock,
+    /// Strict insertion order, ignoring reads entirely. Kept so the
+    /// improvement is measurable rather than asserted, and as an escape hatch
+    /// if the extra atomic ever matters.
+    Fifo,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Purge {
+    /// Shared secret required by `POST /purge`. **Without it the endpoint does
+    /// not exist**, which is the only safe default: purging is the one admin
+    /// operation that costs the origin real work, and an open purge endpoint
+    /// is a cache-stampede trigger anybody can pull.
+    ///
+    /// The endpoint lives on the admin listener, so this is defence in depth
+    /// rather than the only barrier. Both are wanted: the admin listener is
+    /// bound wherever an operator points it, and read-only status is a very
+    /// different exposure from invalidation.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+fn default_tag_header() -> String {
+    "x-harmost-cache-tags".into()
 }
 
 impl Default for CacheDefaults {
@@ -607,6 +672,9 @@ impl Default for CacheDefaults {
             max_memory: default_max_memory(),
             max_body_size: default_max_body(),
             respect_origin: true,
+            eviction: Eviction::default(),
+            tag_header: default_tag_header(),
+            purge: Purge::default(),
         }
     }
 }

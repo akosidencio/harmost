@@ -171,6 +171,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
     let graceful = cfg.server.graceful.clone();
     let concurrency = cfg.origin.concurrency.clone();
     let priorities = cfg.origin.priorities.clone();
+    let purge_token = cfg.cache.purge.token.clone();
     let max_attempts = proxy_max_attempts(&cfg.origin.retry);
 
     // Span export, if it is configured. Built before the server so a bad
@@ -373,12 +374,6 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
             .set(0);
     }
 
-    server.add_service(pingora_core::services::background::background_service(
-        "reload",
-        Reloader::new(path.to_string(), policy.clone(), admission.clone()),
-    ));
-    eprintln!("  reload config with: kill -HUP <pid>");
-
     // Drain state is shared: the admin endpoints read it, the background
     // watcher sets it for SIGUSR1, and the server signal watcher sets it before
     // allowing SIGTERM to reach Pingora.
@@ -426,6 +421,17 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Registered here rather than earlier because the reloader needs the
+    // response cache, which `Harmost::new` creates: a `deployment.id` change
+    // has to reclaim the previous build's entries, and a reloader with no
+    // store would silently skip that.
+    server.add_service(pingora_core::services::background::background_service(
+        "reload",
+        Reloader::new(path.to_string(), policy.clone(), admission.clone())
+            .with_store(harmost.store()),
+    ));
+    eprintln!("  reload config with: kill -HUP <pid>");
+
     // Taken before the proxy is moved into its service. These are handles to
     // the same live state the request path uses, not copies: a status document
     // assembled from a startup snapshot would report zeros forever.
@@ -440,6 +446,7 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         spool: harmost.spool_budget(),
         upgrades: harmost.upgrade_limiter(),
         retry: harmost.retry_budget(),
+        purge_token: purge_token.clone(),
         drain: drain.clone(),
         require_healthy_upstream: admin_cfg.require_healthy_upstream,
     });
@@ -636,6 +643,24 @@ fn check(path: &str) -> ExitCode {
                     cfg.origin.retry.budget_percent,
                     cfg.origin.retry.window.as_duration(),
                     cfg.origin.retry.budget_min,
+                );
+            }
+            if cfg.cache.purge.token.is_some() {
+                println!(
+                    "  purge endpoint ENABLED: POST /purge on the admin listener invalidates \
+                     cache entries by tag. Anyone holding cache.purge.token can make this \
+                     origin re-render on demand"
+                );
+            }
+            if cfg
+                .cache
+                .tag_header
+                .eq_ignore_ascii_case("x-next-cache-tags")
+            {
+                println!(
+                    "  reading invalidation tags from Next.js's own x-next-cache-tags; that \
+                     header is only emitted with NEXT_PRIVATE_MINIMAL_MODE=1 and only for \
+                     statically generated routes. See docs/OPERATIONS.md"
                 );
             }
             // Everything below trades a safety property for convenience.

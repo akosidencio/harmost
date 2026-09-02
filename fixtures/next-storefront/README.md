@@ -13,6 +13,15 @@ the App Router's RSC variant reached by a different mechanism. `/legacy/session`
 sets a cookie from `getServerSideProps` under a deliberately permissive route
 policy, so the `Set-Cookie` barrier has to hold on the legacy code path too.
 
+`public/` carries two images on purpose. `product.svg` is what the pages
+actually render; `bands.png` exists only so `bench/nextjs.sh` can exercise
+`/_next/image`, and it is a raster file because Next's image optimiser refuses
+SVG outright (`dangerouslyAllowSVG` defaults to false) and answers `400` with
+no `Vary` header — an SVG-only fixture cannot reach the optimiser's success
+path at all. It is eight flat colour bands at 1280x960 so that `w=640` is a
+genuine downscale while the file still compresses to about 5KB, which is the
+most a binary committed to a git repository should cost.
+
 It is an integration origin, not a benchmark simulator. Each expensive route
 emits JSON `render_start` and `render_end` records carrying an instance id and a
 unique render id. Harmost's Prometheus origin counter is the machine-readable

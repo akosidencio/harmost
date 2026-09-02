@@ -1,0 +1,40 @@
+# Cache tags and the purge API.
+#
+# The origin answers `Cache-Control: private, no-store` as a dynamically
+# rendered Next.js route does, so the route has to say out loud that these
+# responses are shareable before anything can be cached — and therefore before
+# anything can be purged.
+#
+# `@LISTEN@`, `@ORIGIN@`, `@METRICS@` and `@ADMIN@` are substituted by
+# bench/lib.sh with ports allocated for this run.
+version: 1
+server:
+  listen: "127.0.0.1:@LISTEN@"
+origin:
+  upstreams: ["127.0.0.1:@ORIGIN@"]
+  concurrency:
+    max: 50
+cache:
+  enabled: true
+  max_memory: 64MiB
+  max_body_size: 4MiB
+  eviction: clock
+  tag_header: "x-harmost-cache-tags"
+  purge:
+    token: "@TOKEN@"
+timeouts:
+  origin: 20s
+debug_headers: true
+routes:
+  - id: tagged
+    match: "/tagged/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 1h
+telemetry:
+  prometheus:
+    listen: "127.0.0.1:@METRICS@"
+  admin:
+    listen: "127.0.0.1:@ADMIN@"

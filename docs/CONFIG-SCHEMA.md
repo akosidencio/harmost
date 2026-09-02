@@ -94,6 +94,9 @@ needs to change:
 | `origin.priorities` | reserved capacity | every tier 100% — no tiering |
 | `origin.load_balancing: least_loaded` | load-aware selection | `round_robin` |
 | `route.priority`, `route.weight` | weighted admission | `normal`, `1` |
+| `cache.eviction` | measured eviction policy | `clock` — **a behaviour change**, see below |
+| `cache.tag_header` | cache tags | `x-harmost-cache-tags` |
+| `cache.purge.token` | the purge API | absent — **endpoint disabled** |
 
 Two of those are worth acting on rather than merely noting:
 
@@ -114,6 +117,15 @@ Two of those are worth acting on rather than merely noting:
   ejection cap keeps it in rotation — ejecting the only backend turns a partial
   failure into a total outage — so the breaker would observe failures and never
   act on one. Validation refuses the combination rather than leaving it inert.
+- **`cache.eviction` defaults to `clock`, not to the previous FIFO.** This is
+  the one added key whose default changes existing behaviour. It only changes
+  *which* entry is discarded when the budget is full, never how many or which
+  responses are shareable, and it measured a 0.600 hit ratio against FIFO's
+  0.525 on a skewed workload. Set `eviction: fifo` to restore the old
+  behaviour exactly.
+- **`cache.purge.token` needs `telemetry.admin`.** The endpoint is served on
+  the admin listener, so a token with no listener is a protection configured
+  against nothing. It must also be at least 24 printable-ASCII characters.
 - **`route.priority` needs `origin.priorities`.** Labelling routes by priority
   while every tier may occupy the whole ceiling is a prioritisation that does
   nothing, so it is refused for the same reason as everything else in this
@@ -135,6 +147,8 @@ running.
 | An `origin.priorities` share that floors to a ceiling of 0 | Every request at that priority would be refused. |
 | `route.priority` with uniform `origin.priorities` | Every priority competes for the same ceiling. |
 | `route.weight` above any ceiling it is charged against | No request on the route could ever be admitted. |
+| `cache.purge.token` with no `telemetry.admin` | Nothing is listening for the endpoint it secures. |
+| `cache.tag_header` naming a *request* header (`Cookie`, `Accept`, …) | Tags decide what a purge destroys; taking them from the client hands that decision to the client. |
 
 ### Keys that are deliberately refused
 
