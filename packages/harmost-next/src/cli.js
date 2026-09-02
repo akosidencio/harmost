@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { writeFile } from 'node:fs/promises';
-
-import { HarmostNextError, readBuild } from './manifests.js';
+import { HarmostNextError } from './manifests.js';
+import { generateToFile } from './generate-to-file.js';
+import { readBuild } from './manifests.js';
 import { generateConfig } from './routes.js';
 import { VERIFIED_NEXT_RELEASES } from './compat.js';
 
@@ -18,6 +18,9 @@ OPTIONS
   --concurrency <N>    origin.concurrency.max. Default: 200
   --out <FILE>         Write here instead of stdout.
   --routes-only        Omit deployment.id as well as the origin block.
+  --check              Run \`harmost check\` on the result and fail if it is
+                       rejected. Needs --out and at least one --upstream.
+  --harmost-bin <PATH> The harmost binary. Default: $HARMOST_BIN, else PATH.
 
 NOTES
   Every route the build does not prove is shareable is generated private.
@@ -34,6 +37,8 @@ function parseArgs(argv) {
     concurrency: 200,
     out: null,
     routesOnly: false,
+    check: false,
+    harmostBin: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -66,6 +71,12 @@ function parseArgs(argv) {
       case '--routes-only':
         options.routesOnly = true;
         break;
+      case '--check':
+        options.check = true;
+        break;
+      case '--harmost-bin':
+        options.harmostBin = next();
+        break;
       default:
         // Refused rather than ignored, on the same reasoning as Harmost's own
         // config: an option that is accepted and does nothing lets somebody
@@ -88,23 +99,46 @@ export async function main(argv) {
   }
 
   const options = parseArgs(rest);
-  const build = await readBuild(options.distDir);
-  const yaml = generateConfig(build, {
+
+  if (options.check && !options.out) {
+    throw new HarmostNextError('--check needs --out: there is nothing on stdout for Harmost to read');
+  }
+
+  if (!options.out) {
+    const build = await readBuild(options.distDir);
+    process.stdout.write(
+      generateConfig(build, {
+        upstreams: options.upstreams,
+        concurrency: options.concurrency,
+        includeDeployment: !options.routesOnly,
+      }),
+    );
+    return 0;
+  }
+
+  const result = generateToFile({
+    distDir: options.distDir,
+    out: options.out,
     upstreams: options.upstreams,
     concurrency: options.concurrency,
     includeDeployment: !options.routesOnly,
+    check: options.check,
+    harmostBin: options.harmostBin,
   });
 
-  if (options.out) {
-    await writeFile(options.out, yaml);
+  process.stderr.write(
+    `harmost-next: wrote ${result.out} — ${result.routes} routes, build ${result.buildId}\n`,
+  );
+  if (result.checked) {
+    process.stderr.write('harmost-next: harmost check passed\n');
+  } else if (options.upstreams.length === 0) {
     process.stderr.write(
-      `harmost-next: wrote ${options.out} (build ${build.buildId})\n` +
-        (options.upstreams.length === 0
-          ? 'harmost-next: no --upstream given, so this is routes only and not a complete config\n'
-          : 'harmost-next: run `harmost check --config ' + options.out + '` before deploying\n'),
+      'harmost-next: no --upstream given, so this is routes only and not a complete config\n',
     );
   } else {
-    process.stdout.write(yaml);
+    process.stderr.write(
+      `harmost-next: not checked; add --check, or run \`harmost check --config ${result.out}\`\n`,
+    );
   }
   return 0;
 }

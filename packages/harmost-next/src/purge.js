@@ -208,6 +208,9 @@ export async function revalidatePath(path, options) {
 
 async function importNextCache() {
   try {
+    // @ts-ignore -- `next` is an optional peer dependency, so this module is
+    // resolvable in a Next app and absent everywhere else. That is exactly why
+    // the import is dynamic and inside a try.
     return await import('next/cache');
   } catch (cause) {
     throw new HarmostNextError(

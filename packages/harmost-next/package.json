@@ -12,6 +12,10 @@
     ".": {
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
+    },
+    "./config": {
+      "types": "./src/config.d.ts",
+      "default": "./src/config.js"
     }
   },
   "bin": {
@@ -24,7 +28,8 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "test:bun": "bun test test/",
-    "test:all": "npm run test && npm run test:bun"
+    "test:all": "npm run test && npm run test:bun",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "peerDependencies": {
     "next": ">=14"
@@ -39,5 +44,9 @@
     "nextjs",
     "cache",
     "reverse-proxy"
-  ]
+  ],
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5.6"
+  }
 }

@@ -11,7 +11,12 @@ already knows them — your Next.js build.
    invalidate Next's own cache. They do nothing to the copy Harmost is serving
    in front of it. These helpers do both.
 
-Zero dependencies. Runs on Node and Bun.
+Zero runtime dependencies. Runs on Node and Bun.
+
+Written in JavaScript with no build step — the published files are the files
+that run — and type-checked as if it were TypeScript: `npm run typecheck` runs
+`tsc` over the source with `checkJs`, and consumers get full types from
+`index.d.ts`.
 
 ```bash
 npm install --save-dev @harmost/next   # or: bun add -d @harmost/next
@@ -23,9 +28,11 @@ npm install --save-dev @harmost/next   # or: bun add -d @harmost/next
 
 ```bash
 next build
-npx harmost-next generate --upstream next-1:3000 --upstream next-2:3000 --out harmost.yaml
-harmost check --config harmost.yaml
+npx harmost-next generate --upstream next-1:3000 --out harmost.yaml --check
 ```
+
+`--check` runs `harmost check` on the result and **fails if it is rejected**, so
+a config that would not start is a failed build rather than a failed deploy.
 
 Regenerate after every build. `deployment.id` is the Next build id and it is
 part of every cache key, so a new build is never served the previous build's
@@ -56,6 +63,57 @@ It also generates the two routes that are easy to get wrong by hand:
   transform is several hundred milliseconds of origin CPU and must not starve
   page renders.
 
+### Running it automatically
+
+Two ways, and they are for different jobs.
+
+**A `postbuild` script — the one to use in CI.** `npm run build` and
+`bun run build` both run it, its exit code is the build's exit code, and it
+appears in the log as its own step:
+
+```json
+{
+  "scripts": {
+    "build": "next build",
+    "postbuild": "harmost-next generate --upstream next-1:3000 --out harmost.yaml --check"
+  }
+}
+```
+
+**A `next.config` wrapper — for local development**, so nobody has to remember
+a second command:
+
+```js
+// next.config.mjs
+import { withHarmost } from '@harmost/next/config';
+
+export default withHarmost(
+  { output: 'standalone' },
+  { out: 'harmost.yaml', upstreams: ['next-1:3000'], check: true },
+);
+```
+
+Next has no post-build callback, so the wrapper works from a
+`process.on('exit')` handler. That is worth knowing rather than hiding:
+
+- **It only runs on a successful build.** A non-zero exit means the build
+  failed, and generating a route policy from a half-finished build would leave
+  a stale file that looks current.
+- **It can still fail the build.** Setting the exit code from an exit handler
+  works, so a config Harmost rejects fails the build that produced it — not a
+  warning nobody reads.
+- **It fires once**, guarded by an environment variable, because Next loads
+  `next.config` in its compilation workers as well as in the build itself.
+- **It does nothing in `next dev`**, because it is gated on the
+  production-build phase.
+
+Both paths call the same code, so a config that is checked in CI and unchecked
+locally is not a thing that can happen.
+
+Where the `harmost` binary is not available — a build container that does not
+ship it — omit `--check` rather than letting it fail; the generate step needs
+nothing but Node.
+
 ### Options
 
 ```
@@ -65,6 +123,9 @@ It also generates the two routes that are easy to get wrong by hand:
 --concurrency <N>    origin.concurrency.max. Default: 200
 --out <FILE>         Write here instead of stdout.
 --routes-only        Omit deployment.id as well as the origin block.
+--check              Run `harmost check` on the result and fail if it is
+                     rejected. Needs --out and at least one --upstream.
+--harmost-bin <PATH> The harmost binary. Default: $HARMOST_BIN, else PATH.
 ```
 
 `concurrency` is the one number that has to come from your own measurement: it
@@ -140,6 +201,8 @@ nobody has run them. If yours is refused, the message names both versions.
 |---|---|
 | Node 22.22 | Verified — `npm test` |
 | Bun 1.4 | Verified — `npm run test:bun` |
+
+`npm run test:all` runs both.
 
 One suite, both runtimes: the package uses only `node:` builtins and web
 standards (`fetch`, `AbortSignal`), and the tests are `node:test`, which Bun

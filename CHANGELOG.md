@@ -39,9 +39,21 @@ cache is full.
   on the same reasoning as an unknown config schema version. The matrix is
   checked against a real build in the test suite, and a further test runs the
   generated config through `harmost check`.
+- **Automation that fits an existing build.** `harmost-next generate --check`
+  runs `harmost check` on what it produced and fails if it is rejected, so a
+  config that would not start is a failed build rather than a failed deploy. A
+  `postbuild` script is the CI path — `npm run build` and `bun run build` both
+  run it — and `withHarmost()` from `@harmost/next/config` wraps a Next config
+  for local development. Both call the same code, so a config that is checked
+  in CI and unchecked locally cannot happen. The wrapper hooks
+  `process.on('exit')` because Next has no post-build callback: it runs only
+  on a successful build, fires once even though Next loads the config in its
+  workers, does nothing in `next dev`, and *can* still fail the build.
 - **Node and Bun**, both verified: the package uses only `node:` builtins and
   web standards, and its `node:test` suite runs unmodified under `bun test`. CI
-  runs both.
+  runs both. The source is JavaScript with no build step and is type-checked
+  with `tsc --checkJs`, so consumers get full types without the package
+  needing a compile.
 
 **Cache lifecycle**
 

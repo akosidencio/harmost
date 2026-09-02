@@ -1,0 +1,102 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+
+const run = promisify(execFile);
+const ROOT = fileURLToPath(new URL('../../..', import.meta.url));
+const PKG = fileURLToPath(new URL('..', import.meta.url));
+const FIXTURE = path.join(ROOT, 'fixtures/next-storefront/.next');
+const BINARY = ['target/debug/harmost', 'target/release/harmost']
+  .map((p) => path.join(ROOT, p))
+  .find((p) => existsSync(p));
+
+/**
+ * Drive the hook the way Next does: load the config, ask it for the
+ * production-build phase, then let the process exit.
+ *
+ * A subprocess rather than an in-process call, because the whole mechanism is
+ * `process.on('exit')` and there is no way to observe that without a process
+ * actually ending.
+ */
+async function runHook(hookOptions, { fail = false } = {}) {
+  const dir = await mkdtemp(path.join(tmpdir(), 'harmost-hook-'));
+  const out = path.join(dir, 'harmost.yaml');
+  const script = path.join(dir, 'run.mjs');
+  await writeFile(
+    script,
+    `import { withHarmost } from ${JSON.stringify(path.join(PKG, 'src/config.js'))};\n` +
+      `const config = withHarmost({ output: 'standalone' }, ${JSON.stringify({ out, ...hookOptions })});\n` +
+      `config('phase-production-build', {});\n` +
+      (fail ? 'process.exitCode = 7;\n' : ''),
+  );
+  const result = await run(process.execPath, [script], { cwd: dir }).catch((e) => e);
+  return { out, dir, result };
+}
+
+test('a production build writes the config on the way out', async () => {
+  const { out, result } = await runHook({ distDir: FIXTURE, upstreams: ['next-1:3000'] });
+  assert.equal(result.code ?? 0, 0, result.stderr);
+  const yaml = await readFile(out, 'utf8');
+  assert.match(yaml, /^version: 1$/m);
+  assert.match(yaml, /^deployment:$/m);
+  assert.match(result.stdout, /@harmost\/next: wrote/);
+});
+
+test('silent means silent', async () => {
+  const { result } = await runHook({ distDir: FIXTURE, upstreams: ['x:3000'], silent: true });
+  assert.equal(result.code ?? 0, 0, result.stderr);
+  assert.equal(result.stdout, '');
+});
+
+test('a failed build generates nothing', async () => {
+  // Generating a route policy from a half-finished build would leave a stale
+  // file that looks current.
+  const { out, result } = await runHook(
+    { distDir: FIXTURE, upstreams: ['next-1:3000'] },
+    { fail: true },
+  );
+  assert.equal(result.code, 7, "the build's own exit code must survive");
+  assert.ok(!existsSync(out), 'a failed build wrote a config anyway');
+});
+
+test('a build that cannot be read fails rather than warns', async () => {
+  const { result } = await runHook({ distDir: path.join(ROOT, 'no-such-dir') });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /could not read/);
+});
+
+test(
+  'a configuration Harmost would reject fails the build that produced it',
+  { skip: BINARY ? false : 'harmost binary not built' },
+  async () => {
+    const { result } = await runHook({
+      distDir: FIXTURE,
+      check: true,
+      harmostBin: BINARY,
+      upstreams: [],
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /routes-only fragment/);
+  },
+);
+
+test(
+  'a good configuration passes the check and the build succeeds',
+  { skip: BINARY ? false : 'harmost binary not built' },
+  async () => {
+    const { result } = await runHook({
+      distDir: FIXTURE,
+      upstreams: ['127.0.0.1:3000'],
+      check: true,
+      harmostBin: BINARY,
+    });
+    assert.equal(result.code ?? 0, 0, result.stderr);
+    assert.match(result.stdout, /harmost check passed/);
+  },
+);

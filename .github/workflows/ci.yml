@@ -118,6 +118,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Install dev dependencies (typescript, @types/node)
+        run: npm install --no-save typescript@^5.6 @types/node@^22
+      - name: Typecheck
+        run: npm run typecheck
       - name: Test on Node
         run: npm test
       - uses: oven-sh/setup-bun@v2
