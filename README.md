@@ -8,11 +8,12 @@ Rust reverse proxy and origin workload governor for Next.js and other SSR
 origins: bounded render concurrency, request coalescing, safe microcaching,
 bounded queues and load shedding. Built on Pingora.
 
-> [!WARNING]
-> **Harmost is under active development and is not ready for production.** It
-> is in an early validation, verification, and testing phase. APIs,
-> configuration, behavior, and operational guarantees may change without
-> notice. Use it only in development or controlled test environments.
+> [!CAUTION]
+> **Harmost is under active development and remains pre-1.0.** Version 0.1.2 is
+> running and externally load-tested in a controlled DigitalOcean
+> staging deployment, but it has not been validated under sustained production
+> traffic or independently security-audited. APIs, configuration, behavior and
+> operational guarantees may change without notice.
 
 **Every conventional defense counts requests. Server rendering made requests
 stop being a unit of work.** One route is a cached shell; the next fans out
@@ -314,6 +315,61 @@ and exits non-zero when it fails, so each is a gate rather than a report. The
 numbers below are one machine's; see [Quick start](#quick-start) for how to run
 them and what the parameter block is for.
 
+### DigitalOcean staging validation
+
+Harmost v0.1.2 was tested on 2 September 2026 in front of the Reko Next.js
+storefront on DigitalOcean App Platform. Public traffic normally follows this
+path:
+
+```text
+Client -> Cloudflare / App Platform ingress -> Harmost -> Next.js storefront
+```
+
+For a controlled A/B, only the ingress target changed: one deployment routed
+the same public hostname directly to the Next.js service and the other routed
+it through Harmost. Both services used one 512 MiB, one-vCPU instance. Each
+deployment was fresh, and each leg used the same five-minute k6 profile: a
+30-second ramp to 10 virtual users, four minutes steady, then a 30-second ramp
+down, with 1–3 seconds of think time. The workload mixed cacheable `GET`
+requests to `/books`, `/genres` and `/unlireads` with a low-rate uncached
+`/api/health` control.
+
+| Ingress path | Requests | Requests/s | Average | Median | p95 | p99 | Max | Failures |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Direct to Next.js | 1,355 | 4.503 | 113.21 ms | 92.76 ms | 166.15 ms | 192.53 ms | 307.06 ms | 0 |
+| Through Harmost | 1,341 | 4.460 | 127.34 ms | 142.24 ms | 165.62 ms | 235.18 ms | 368.22 ms | 0 |
+
+Harmost reused a cached response for 1,270 of 1,273 cacheable requests
+(99.76%). It added 12.5% to average latency and 22.2% to p99 in this run, while
+p95 was effectively unchanged (-0.3%). Requests per second were 1.0% lower,
+but this closed-user workload includes think time and is not a throughput or
+maximum-capacity benchmark.
+
+Container cgroups were sampled every five seconds over the same window. CPU is
+CPU time as a percentage of one core; RAM is cgroup usage, not the 512 MiB
+allocation. Alloy was unchanged between legs and is excluded.
+
+| Ingress path | Component | Average RAM | Maximum RAM | CPU |
+| --- | --- | ---: | ---: | ---: |
+| Direct | Next.js | 227.35 MiB | 237.08 MiB | 12.30% |
+| Harmost | Next.js | 225.20 MiB | 232.79 MiB | 6.83% |
+| Harmost | Proxy | 135.10 MiB | 135.10 MiB | 16.35% |
+| Harmost | Combined | 360.30 MiB | — | 23.18% |
+
+For this cache-friendly workload, Harmost reduced origin CPU by 44.5%, but the
+additional proxy made combined average RAM 58.5% higher and combined CPU time
+higher than direct ingress. The components run on separate instances, so the
+combined row is a topology total rather than usage within one 512 MiB limit.
+
+After the A/B, the original Harmost ingress spec was restored byte-for-byte at
+the canonical JSON level. Public probes returned `DISABLED` for health and
+`MISS` followed by `HIT` for `/books`.
+
+These results demonstrate correct operation under bounded concurrent traffic
+on a real managed staging deployment. They are one short, cache-friendly field
+test—not evidence of sustained production readiness, uncached overload
+behavior, maximum capacity or a general latency improvement.
+
 ### Admission control benchmark
 
 ```
@@ -542,12 +598,14 @@ and the wrong configuration.
 
 ## Using Harmost with Next.js
 
-> **This is locally validated, not production validated.** The repository runs
-> one Harmost process against three real Next.js 16 standalone origins and
-> verifies coalescing, origin distribution, HTML/RSC separation, `Set-Cookie`
-> isolation, mutation bypass, Draft Mode isolation and Suspense streaming. The
-> configuration schema remains pre-1.0, and no managed-platform or production
-> deployment has been validated. See
+> **This is validated locally and in controlled managed-platform staging, not
+> through sustained production operation.** The repository runs one Harmost
+> process against three real Next.js 16 standalone origins and verifies
+> coalescing, origin distribution, HTML/RSC separation, `Set-Cookie` isolation,
+> mutation bypass, Draft Mode isolation and Suspense streaming. Harmost v0.1.2
+> also runs in front of a real Next.js storefront on DigitalOcean App Platform;
+> see [DigitalOcean staging validation](#digitalocean-staging-validation). The
+> configuration schema remains pre-1.0. See
 > [Project maturity](#project-maturity-and-expectations).
 
 ### Reproduce the real Next.js proof
@@ -1501,10 +1559,13 @@ boundary, which is where the key finally becomes opaque.
 ## Project status
 
 The core proxy, admission, cache, coalescing, protocol, observability, and
-restart paths are implemented and exercised against local fixtures. The full
-workspace test suite includes unit, property, fuzz, browser, adversarial, soak,
-memory-pressure, restart, and chaos coverage. This is still synthetic evidence,
-not production validation.
+restart paths are implemented and exercised against local fixtures and a
+controlled DigitalOcean App Platform staging canary. The full workspace test
+suite includes unit, property, fuzz, browser, adversarial, soak,
+memory-pressure, restart, and chaos coverage. The staging canary adds external
+TLS, managed ingress, private service discovery, real Next.js traffic and
+hosted telemetry to that synthetic evidence. It is still bounded staging
+evidence, not sustained production validation.
 
 The two most important open validation gaps are the independent cache-key and
 shareability review and an end-to-end exercise of published release artifacts.

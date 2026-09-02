@@ -5,7 +5,7 @@ All notable changes to Harmost. The format follows
 
 ---
 
-## [0.1.2] — unreleased
+## [0.1.2] — 2026-09-02
 
 Origin resilience, the cache lifecycle, and the first framework adapter. Almost
 everything here is off or inert by default — the single exception is
