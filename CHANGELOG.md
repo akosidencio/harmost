@@ -28,24 +28,26 @@ cache is full.
   a prerendered route is proof, a dynamic one is not, and a generator that
   guessed would be one bad guess away from serving one user's page to another.
 - **`revalidateTag()` / `revalidatePath()` wrappers** that invalidate Next's
-  incremental cache and then Harmost's copy. Values are sent verbatim, because
-  Harmost matches them verbatim; one that cannot survive a query string is
-  refused rather than encoded into one that purges nothing. The token travels in
-  an `Authorization` header and redirects are refused, so it cannot be bounced
-  to another host. A failed purge throws — stale content served silently is
-  worse than a failed deploy hook.
+  incremental cache and then Harmost's copy. Tag invalidation uses Next's
+  explicit `{ expire: 0 }` profile by default, so stale-while-revalidate HTML
+  cannot refill Harmost immediately after a purge. Values are percent-encoded
+  exactly once and Harmost decodes them once, preserving query delimiters as
+  data. The token travels in an `Authorization` header and redirects are
+  refused, so it cannot be bounced to another host. A failed purge or malformed
+  success body throws — stale content served silently is worse than a failed
+  deploy hook.
 - **A compatibility matrix that is asserted rather than transcribed.** Next's
   build manifests carry their own version numbers and an unknown one is refused,
   on the same reasoning as an unknown config schema version. The matrix is
   checked against a real build in the test suite, and a further test runs the
   generated config through `harmost check`.
 - **Automation that fits an existing build.** `harmost-next generate --check`
-  runs `harmost check` on what it produced and fails if it is rejected, so a
-  config that would not start is a failed build rather than a failed deploy. A
-  `postbuild` script is the CI path — `npm run build` and `bun run build` both
-  run it — and `withHarmost()` from `@harmost/next/config` wraps a Next config
-  for local development. Both call the same code, so a config that is checked
-  in CI and unchecked locally cannot happen. The wrapper hooks
+  runs `harmost check` on a sibling temporary file and fails if it is rejected,
+  so a config that would not start cannot overwrite the last known-good output.
+  The validated file is installed with an atomic rename. A `postbuild` script
+  is the CI path — `npm run build` and `bun run build` both run it — and
+  `withHarmost()` from `@harmost/next/config` wraps a Next config for local
+  development. Both call the same code. The wrapper hooks
   `process.on('exit')` because Next has no post-build callback: it runs only
   on a successful build, fires once even though Next loads the config in its
   workers, does nothing in `next dev`, and *can* still fail the build.

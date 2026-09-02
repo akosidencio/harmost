@@ -1,5 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 
 import { HarmostNextError, readBuildSync } from './manifests.js';
 import { generateConfig } from './routes.js';
@@ -41,38 +43,65 @@ export function generateToFile(options = {}) {
 
   const build = readBuildSync(distDir);
   const yaml = generateConfig(build, { upstreams, concurrency, includeDeployment });
-  writeFileSync(out, yaml);
-
   const result = { buildId: build.buildId, out, routes: countRoutes(yaml), checked: false };
-  if (!check) return result;
 
-  if (upstreams.length === 0) {
+  if (check && upstreams.length === 0) {
     throw new HarmostNextError(
       'cannot check a routes-only fragment: it has no `origin:` block, so Harmost will ' +
         'refuse it. Pass upstreams, or turn the check off.',
     );
   }
 
-  const binary = harmostBin(bin);
+  const temporary = path.join(
+    path.dirname(out),
+    `.${path.basename(out)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let committed = false;
   try {
-    execFileSync(binary, ['check', '--config', out], { stdio: 'pipe', encoding: 'utf8' });
-  } catch (cause) {
-    if (cause?.code === 'ENOENT') {
-      throw new HarmostNextError(
-        `\`${binary}\` is not on PATH, so the generated config could not be checked. ` +
-          'Set HARMOST_BIN, pass --harmost-bin, or turn the check off where the binary ' +
-          'is not available.',
-        { cause },
-      );
+    // A sibling temporary file keeps validation from destroying the last
+    // known-good config and makes the final replacement atomic.
+    writeFileSync(temporary, yaml, { flag: 'wx' });
+
+    if (check) {
+      const binary = harmostBin(bin);
+      try {
+        execFileSync(binary, ['check', '--config', temporary], {
+          stdio: 'pipe',
+          encoding: 'utf8',
+        });
+      } catch (cause) {
+        if (cause?.code === 'ENOENT') {
+          throw new HarmostNextError(
+            `\`${binary}\` is not on PATH, so the generated config could not be checked. ` +
+              'Set HARMOST_BIN, pass --harmost-bin, or turn the check off where the binary ' +
+              'is not available.',
+            { cause },
+          );
+        }
+        const detail = `${cause?.stdout ?? ''}${cause?.stderr ?? ''}`.trim();
+        throw new HarmostNextError(
+          `\`${binary} check\` rejected the generated configuration:\n${detail}`,
+          { cause },
+        );
+      }
+      result.checked = true;
     }
-    const detail = `${cause?.stdout ?? ''}${cause?.stderr ?? ''}`.trim();
-    throw new HarmostNextError(
-      `\`${binary} check\` rejected the generated configuration:\n${detail}`,
-      { cause },
-    );
+
+    renameSync(temporary, out);
+    committed = true;
+    return result;
+  } finally {
+    if (!committed) {
+      try {
+        unlinkSync(temporary);
+      } catch {
+        // Preserve the generation or validation error that brought us here;
+        // a cleanup failure must not replace its actionable diagnostics. The
+        // uniquely named file cannot be mistaken for the committed config and
+        // a later run will never reuse it.
+      }
+    }
   }
-  result.checked = true;
-  return result;
 }
 
 function countRoutes(yaml) {

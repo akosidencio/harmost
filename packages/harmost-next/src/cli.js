@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { HarmostNextError } from './manifests.js';
 import { generateToFile } from './generate-to-file.js';
 import { readBuild } from './manifests.js';
@@ -143,8 +147,28 @@ export async function main(argv) {
   return 0;
 }
 
-// Only when executed, not when imported by a test.
-if (process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop())) {
+// Comparing real paths works with both POSIX separators and Windows `\\`.
+// A basename suffix can also mistake an unrelated imported `cli.js` for this
+// executable.
+export function isDirectExecution(moduleFile, argvFile, pathApi = path, canonicalize = realpathSync) {
+  if (!argvFile) return false;
+  const resolve = (file) => {
+    const absolute = pathApi.resolve(file);
+    try {
+      return canonicalize(absolute);
+    } catch {
+      return absolute;
+    }
+  };
+  const modulePath = resolve(moduleFile);
+  const argumentPath = resolve(argvFile);
+  return pathApi.sep === '\\'
+    ? modulePath.toLowerCase() === argumentPath.toLowerCase()
+    : modulePath === argumentPath;
+}
+
+const executedDirectly = isDirectExecution(fileURLToPath(import.meta.url), process.argv[1]);
+if (executedDirectly) {
   main(process.argv.slice(2))
     .then((code) => process.exit(code))
     .catch((error) => {

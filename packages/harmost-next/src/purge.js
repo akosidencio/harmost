@@ -1,29 +1,8 @@
 import { HarmostNextError } from './manifests.js';
 
-/**
- * Values are sent to Harmost **verbatim**, and that constrains what they may
- * contain.
- *
- * Harmost deliberately does not percent-decode purge parameters: the stored
- * tag is the bytes the origin declared, and the stored path is the request
- * path as it arrived, so decoding would let a purge be aimed at one name and
- * match another. Encoding here would hit the same wall from the other side —
- * `%2C` would be looked up as `%2C`, match nothing, and report success.
- *
- * So a value that cannot survive a query string is refused rather than mangled
- * into one that silently purges nothing.
- */
-function assertQuerySafe(kind, value) {
+function assertValue(kind, value) {
   if (typeof value !== 'string' || value.length === 0) {
     throw new HarmostNextError(`${kind} must be a non-empty string`);
-  }
-  const offending = value.match(/[&#?\s%]/);
-  if (offending) {
-    throw new HarmostNextError(
-      `${kind} ${JSON.stringify(value)} contains ${JSON.stringify(offending[0])}, which cannot ` +
-        'be sent unambiguously in a purge query. Harmost matches these verbatim and never ' +
-        'percent-decodes them, so encoding it here would purge nothing and report success.',
-    );
   }
 }
 
@@ -34,7 +13,7 @@ function assertQuerySafe(kind, value) {
  * no-op this package refuses everywhere else.
  */
 function assertTag(tag) {
-  assertQuerySafe('tag', tag);
+  assertValue('tag', tag);
   if (tag.includes(',')) {
     throw new HarmostNextError(
       `tag ${JSON.stringify(tag)} contains a comma. The tag header is comma-separated, so a ` +
@@ -44,7 +23,7 @@ function assertTag(tag) {
 }
 
 function assertPath(path) {
-  assertQuerySafe('path', path);
+  assertValue('path', path);
   if (!path.startsWith('/')) {
     throw new HarmostNextError(
       `path ${JSON.stringify(path)} must be absolute; Harmost stores the request path, which ` +
@@ -88,9 +67,11 @@ export function createPurger(options = {}) {
 
   async function send(params, description) {
     const url = new URL(base);
-    // Built by hand rather than with URLSearchParams, which would
-    // percent-encode the values Harmost matches verbatim.
-    url.search = params.join('&');
+    // Harmost percent-decodes every value exactly once. URLSearchParams keeps
+    // delimiters inside tags and paths from changing the shape of the query.
+    // It emits form-style `+` for spaces, but Harmost deliberately implements
+    // percent decoding rather than form decoding, so use `%20` instead.
+    url.search = new URLSearchParams(params).toString().replaceAll('+', '%20');
 
     let response;
     try {
@@ -127,7 +108,28 @@ export function createPurger(options = {}) {
         `purge (${description}) failed: HTTP ${response.status} ${detail.trim()}`.trim(),
       );
     }
-    return response.json().catch(() => ({}));
+    let result;
+    try {
+      result = await response.json();
+    } catch (cause) {
+      throw new HarmostNextError(
+        `purge (${description}) returned HTTP ${response.status} with invalid JSON`,
+        { cause },
+      );
+    }
+    if (
+      !result ||
+      typeof result !== 'object' ||
+      Array.isArray(result) ||
+      result.purged !== true ||
+      !Number.isSafeInteger(result.entries) ||
+      result.entries < 0
+    ) {
+      throw new HarmostNextError(
+        `purge (${description}) returned HTTP ${response.status} with an invalid success body`,
+      );
+    }
+    return result;
   }
 
   return {
@@ -137,7 +139,7 @@ export function createPurger(options = {}) {
       list.forEach(assertTag);
       if (list.length === 0) return { purged: false, entries: 0 };
       return send(
-        list.map((tag) => `tag=${tag}`),
+        list.map((tag) => ['tag', tag]),
         `${list.length} tag(s)`,
       );
     },
@@ -148,7 +150,7 @@ export function createPurger(options = {}) {
       list.forEach(assertPath);
       if (list.length === 0) return { purged: false, entries: 0 };
       return send(
-        list.map((path) => `path=${path}`),
+        list.map((path) => ['path', path]),
         `${list.length} path(s)`,
       );
     },
@@ -163,7 +165,10 @@ export function createPurger(options = {}) {
         throw new HarmostNextError('purge needs at least one tag or path');
       }
       return send(
-        [...tagList.map((t) => `tag=${t}`), ...pathList.map((p) => `path=${p}`)],
+        [
+          ...tagList.map((tag) => ['tag', tag]),
+          ...pathList.map((path) => ['path', path]),
+        ],
         `${tagList.length} tag(s), ${pathList.length} path(s)`,
       );
     },
@@ -176,7 +181,7 @@ export function createPurger(options = {}) {
      * incident-time tool, not a routine one.
      */
     async purgeAll() {
-      return send(['all=1'], 'everything');
+      return send([['all', '1']], 'everything');
     },
   };
 }
@@ -193,10 +198,13 @@ export function createPurger(options = {}) {
  * content served silently is worse than a failed deploy hook: one is visible
  * immediately, the other is discovered by a customer.
  */
-export async function revalidateTag(tag, options) {
+export async function revalidateTag(tag, options = {}) {
+  const { nextProfile = { expire: 0 }, ...purgerOptions } = options;
   const { revalidateTag: nextRevalidateTag } = await importNextCache();
-  nextRevalidateTag(tag);
-  return createPurger(options).purgeTags([tag]);
+  // Immediate expiry is deliberate. With stale-while-revalidate, the first
+  // Harmost miss could fetch stale HTML from Next and cache it again.
+  nextRevalidateTag(tag, nextProfile);
+  return createPurger(purgerOptions).purgeTags([tag]);
 }
 
 /** The same, for `revalidatePath()`. */

@@ -27,7 +27,7 @@ export interface GenerateOptions {
 }
 
 export interface PurgeResult {
-  purged?: boolean;
+  purged: boolean;
   scope?: 'selective' | 'all';
   tags?: number;
   paths?: number;
@@ -43,6 +43,11 @@ export interface PurgerOptions {
   token?: string;
   timeoutMs?: number;
   fetch?: typeof globalThis.fetch;
+}
+
+export interface RevalidateTagOptions extends PurgerOptions {
+  /** Next cache-life profile. Defaults to `{ expire: 0 }` for immediate invalidation. */
+  nextProfile?: string | { expire?: number };
 }
 
 export interface Purger {
@@ -61,7 +66,7 @@ export function routeId(page: string, taken: Set<string>): string;
 export function createPurger(options?: PurgerOptions): Purger;
 
 /** `revalidateTag()` from `next/cache`, then the same tag in Harmost. */
-export function revalidateTag(tag: string, options?: PurgerOptions): Promise<PurgeResult>;
+export function revalidateTag(tag: string, options?: RevalidateTagOptions): Promise<PurgeResult>;
 /** `revalidatePath()` from `next/cache`, then the same path in Harmost. */
 export function revalidatePath(path: string, options?: PurgerOptions): Promise<PurgeResult>;
 

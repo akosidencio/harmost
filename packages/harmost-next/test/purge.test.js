@@ -1,5 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { createPurger } from '../src/purge.js';
 
@@ -46,19 +50,24 @@ test('it POSTs, because a GET that invalidates a cache gets crawled', async () =
   assert.equal(calls[0].url.pathname, '/purge');
 });
 
-test('values are sent verbatim, because Harmost matches them verbatim', async () => {
-  // Percent-encoding here would be looked up as the encoded form, match
-  // nothing, and report success.
+test('values are encoded once and delimiters cannot alter the purge query', async () => {
   const { purger, calls } = stub();
-  await purger.purgePaths(['/products/iphone']);
-  assert.equal(calls[0].url.search, '?path=/products/iphone');
+  await purger.purge({
+    tags: ['sale & 100%'],
+    paths: ['/search?q=a&b#results'],
+  });
+  const [call] = calls;
+  assert.deepEqual(call.url.searchParams.getAll('tag'), ['sale & 100%']);
+  assert.deepEqual(call.url.searchParams.getAll('path'), ['/search?q=a&b#results']);
+  assert.match(call.url.search, /tag=sale%20%26%20100%25/);
+  assert.match(call.url.search, /path=%2Fsearch%3Fq%3Da%26b%23results/);
 });
 
 test('tags and paths travel in one request', async () => {
   const { purger, calls } = stub();
   await purger.purge({ tags: ['sale'], paths: ['/p/1'] });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url.search, '?tag=sale&path=/p/1');
+  assert.equal(calls[0].url.search, '?tag=sale&path=%2Fp%2F1');
 });
 
 test('duplicates collapse', async () => {
@@ -73,15 +82,11 @@ test('purging everything is spelled out', async () => {
   assert.equal(calls[0].url.search, '?all=1');
 });
 
-test('a value that could not have matched is refused, not mangled', async () => {
+test('a value that could not have matched is refused', async () => {
   const { purger, calls } = stub();
   // A comma can never appear in a stored tag: the tag header is
   // comma-separated, so Harmost split it before indexing.
   await assert.rejects(() => purger.purgeTags(['a,b']), /comma/);
-  // These cannot survive a query string unambiguously.
-  await assert.rejects(() => purger.purgeTags(['a&b']), /cannot be sent/);
-  await assert.rejects(() => purger.purgeTags(['a b']), /cannot be sent/);
-  await assert.rejects(() => purger.purgeTags(['a%2Cb']), /cannot be sent/);
   // The stored path always begins with a slash.
   await assert.rejects(() => purger.purgePaths(['products']), /must be absolute/);
   assert.equal(calls.length, 0, 'a refused purge must not reach the network');
@@ -99,6 +104,56 @@ test('an empty list is a no-op rather than a purge of everything', async () => {
 test('a failed purge throws rather than leaving stale content served quietly', async () => {
   const failing = stub({ status: 401, body: 'unauthorized' });
   await assert.rejects(() => failing.purger.purgeTags(['a']), /401/);
+});
+
+test('a malformed HTTP success response throws rather than pretending the purge worked', async () => {
+  await assert.rejects(
+    () => stub({ body: '<html>not the admin listener</html>' }).purger.purgeTags(['a']),
+    /invalid JSON/,
+  );
+  await assert.rejects(
+    () => stub({ body: '{}' }).purger.purgeTags(['a']),
+    /invalid success body/,
+  );
+  await assert.rejects(
+    () => stub({ body: '{"purged":false,"entries":0}' }).purger.purgeTags(['a']),
+    /invalid success body/,
+  );
+  await assert.rejects(
+    () => stub({ body: '{"purged":true,"entries":"3"}' }).purger.purgeTags(['a']),
+    /invalid success body/,
+  );
+});
+
+test('revalidateTag immediately expires Next before purging Harmost', async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'harmost-next-cache-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await cp(fileURLToPath(new URL('../src', import.meta.url)), path.join(dir, 'src'), {
+    recursive: true,
+  });
+  const nextDir = path.join(dir, 'node_modules/next');
+  await mkdir(nextDir, { recursive: true });
+  await writeFile(
+    path.join(nextDir, 'package.json'),
+    JSON.stringify({ name: 'next', type: 'module', exports: { './cache': './cache.js' } }),
+  );
+  await writeFile(
+    path.join(nextDir, 'cache.js'),
+    'export const revalidateTag = (...args) => globalThis.__harmostNextTagCalls.push(args);\n',
+  );
+
+  globalThis.__harmostNextTagCalls = [];
+  t.after(() => delete globalThis.__harmostNextTagCalls);
+  const copied = await import(`${pathToFileURL(path.join(dir, 'src/purge.js'))}?test=${Date.now()}`);
+  const fetch = async () => new Response('{"purged":true,"entries":1}');
+  const base = { endpoint: 'http://127.0.0.1:9091', token: 'token', fetch };
+
+  await copied.revalidateTag('product-42', base);
+  await copied.revalidateTag('product-43', { ...base, nextProfile: 'max' });
+  assert.deepEqual(globalThis.__harmostNextTagCalls, [
+    ['product-42', { expire: 0 }],
+    ['product-43', 'max'],
+  ]);
 });
 
 test('it refuses to start without an endpoint or a token', () => {

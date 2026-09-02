@@ -31,8 +31,9 @@ next build
 npx harmost-next generate --upstream next-1:3000 --out harmost.yaml --check
 ```
 
-`--check` runs `harmost check` on the result and **fails if it is rejected**, so
-a config that would not start is a failed build rather than a failed deploy.
+`--check` runs `harmost check` on a temporary sibling file and **fails if it is
+rejected**. The previous config is replaced atomically only after validation,
+so a failed generation cannot destroy the last known-good output.
 
 Regenerate after every build. `deployment.id` is the Next build id and it is
 part of every cache key, so a new build is never served the previous build's
@@ -146,6 +147,15 @@ await revalidateTag('product-42');
 await revalidatePath('/products/iphone');
 ```
 
+Tag invalidation expires Next immediately with `{ expire: 0 }` by default.
+This prevents the first Harmost miss from receiving stale-while-revalidate
+HTML from Next and caching it again. To select another Next cache-life profile,
+pass `nextProfile` alongside the Harmost connection options:
+
+```js
+await revalidateTag('product-42', { nextProfile: 'max' });
+```
+
 Or without Next in the loop — from a deploy hook, a CLI, a webhook:
 
 ```js
@@ -161,13 +171,13 @@ await harmost.purge({ tags: ['sale'], paths: ['/products/iphone'] });
 
 Four behaviours worth knowing, all of them deliberate:
 
-- **A failed purge throws.** Stale content served silently is worse than a
-  failed deploy hook: one is discovered by a customer, the other by you.
-- **Values are sent verbatim.** Harmost never percent-decodes purge
-  parameters, so encoding here would look up the encoded form, match nothing,
-  and report success. A value that cannot survive a query string unambiguously
-  — a `&`, a space, a `%`, or a comma in a tag — is **refused** rather than
-  mangled into one that purges nothing.
+- **A failed purge throws.** That includes a `2xx` response whose JSON does not
+  prove the purge succeeded, which catches traffic listeners and proxies that
+  answer the purge path with an HTML success page.
+- **Values are encoded exactly once.** Harmost percent-decodes purge parameters
+  once, so spaces, `%`, `&`, `?`, and `#` remain part of the tag or path rather
+  than becoming query syntax. A comma in a tag is still refused because the
+  origin tag header is comma-separated and could never have stored that name.
 - **The token travels in an `Authorization` header, never in the URL**, and
   redirects are refused rather than followed, so it cannot be bounced to
   another host.

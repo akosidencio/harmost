@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -24,10 +24,11 @@ const BINARY = ['target/debug/harmost', 'target/release/harmost']
  * `process.on('exit')` and there is no way to observe that without a process
  * actually ending.
  */
-async function runHook(hookOptions, { fail = false } = {}) {
+async function runHook(hookOptions, { fail = false, initial } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), 'harmost-hook-'));
   const out = path.join(dir, 'harmost.yaml');
   const script = path.join(dir, 'run.mjs');
+  if (initial !== undefined) await writeFile(out, initial);
   await writeFile(
     script,
     `import { withHarmost } from ${JSON.stringify(path.join(PKG, 'src/config.js'))};\n` +
@@ -85,6 +86,28 @@ test(
     assert.match(result.stderr, /routes-only fragment/);
   },
 );
+
+test('a failed check preserves the last valid config and removes its temporary file', async () => {
+  const initial = 'known-good: true\n';
+  const { out, dir, result } = await runHook(
+    {
+      distDir: FIXTURE,
+      check: true,
+      // Node rejects Harmost's CLI arguments, after the temporary config has
+      // been written. This exercises the validation-failure path without a
+      // platform-specific shell script.
+      harmostBin: process.execPath,
+      upstreams: ['127.0.0.1:3000'],
+    },
+    { initial },
+  );
+  assert.equal(result.code, 1);
+  assert.equal(await readFile(out, 'utf8'), initial);
+  assert.deepEqual(
+    (await readdir(dir)).filter((name) => name.endsWith('.tmp')),
+    [],
+  );
+});
 
 test(
   'a good configuration passes the check and the build succeeds',
