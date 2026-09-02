@@ -62,32 +62,71 @@ its bullets: disk and external cache storage were evaluated and declined, with
 the measurements and the conditions that would reopen the question in
 [`CACHE-STORAGE-EVALUATION.md`](./CACHE-STORAGE-EVALUATION.md).
 
-## 5. Scale deliberately
+The next milestones are deliberately Next.js-first. Their interfaces, safety
+properties, reference topologies, and exit criteria are specified in
+[`NEXTJS-PRODUCTION-REFERENCE-SPEC.md`](./NEXTJS-PRODUCTION-REFERENCE-SPEC.md).
+No adapter for another framework begins until that specification's exit
+criteria pass. A framework-neutral contract should describe a proven
+integration rather than predict what one might need.
 
-- Evaluate adaptive concurrency only after latency and failure signals are
-  trustworthy; retain operator-defined hard ceilings.
-- Define a multi-instance capacity model that cannot accidentally multiply the
-  intended origin ceiling.
-- Keep distributed coalescing optional. Prefer path-stable ingress routing
-  until measurements justify a distributed lock.
-
-## 6. Framework integration and production-ready examples
-
-Deliberately after phase 4. An adapter contract designed before the cache
-lifecycle it has to drive would be a guess; designed after, it is a description
-of something that already works.
+## 5. Make the Next.js path production-shaped
 
 The first adapter has shipped: [`@harmost/next`](../packages/harmost-next)
-generates route configuration and a deployment id from a Next.js build, and
-routes `revalidateTag()` / `revalidatePath()` to the phase 4 purge API. What
-remains here is the generalisation — a contract other frameworks can implement
-— and the examples.
+generates conservative route configuration and a deployment id from a Next.js
+build, and routes `revalidateTag()` / `revalidatePath()` to the purge API. The
+current storefront remains an integration fixture, not yet a copyable
+production reference.
 
-- Ship working, production-shaped Next.js examples rather than fixtures: a real
-  deployment topology, a deployment-id rollover, and an invalidation flow
-  someone can copy instead of infer.
-- Define a versioned, framework-neutral adapter contract for route cost,
-  request variants, privacy, deployment ids, and invalidation events.
-- Add adapters for other server-rendered applications after that contract is
-  stable. Likely candidates include Nuxt, SvelteKit, React Router/Remix, Astro
-  SSR, and non-JavaScript origins that can provide equivalent metadata.
+- Promote the fixture into a documented standalone-container reference with an
+  edge/load-balancer boundary, private origin network, health checks, streaming,
+  deployment rollover, and scoped invalidation.
+- Coordinate Next.js cache/tag state across origins and use consistent build,
+  deployment, and Server Action identities. Harmost invalidation must prove that
+  Next.js state converges before its own response copy is purged.
+- Add a checked-in `harmost.next.yaml` assertion file so operators approve
+  public dynamic routes by their Next.js names while generated output remains
+  reproducible and private by default.
+- Add `inspect`, `doctor`, and `explain` workflows that expose route decisions,
+  deployment mismatches, streaming problems, and cache bypasses without sending
+  load or mutating production state.
+- Add an explicit, guarded calibration workflow. Stop presenting the generated
+  concurrency value as safe until it has been measured for the application's
+  renders and hardware.
+- Document and test the rollout sequence: observe, protect without reuse,
+  coalesce approved routes, enable short caching, then replicate.
+- Ship the protection dashboard, recording rules, and alerts required by the
+  technical specification.
+- Exercise build-id rollover, invalidation, private-response isolation, RSC
+  variants, Server Actions, streaming, overload, recovery, and restart in CI
+  and a production-shaped staging environment.
+
+## 6. Scale the proven Next.js reference deliberately
+
+- Define one global origin-work budget for a Harmost replica group. Begin with
+  validated static partitioning so adding replicas cannot silently multiply the
+  intended ceiling.
+- Exercise path-stable ingress with two or more Harmost replicas. Correctness
+  must not depend on affinity, but cache locality and coalescing should benefit
+  from it.
+- Keep distributed coalescing and distributed response caching out of the
+  critical path until measurements justify their failure modes and complexity.
+- Evaluate optional short-lived capacity leases only after static partitioning
+  passes scale-up, scale-down, replica-loss, and network-partition tests.
+- Evaluate adaptive concurrency only after fixed-limit calibration, origin
+  latency, failure, queue, and recovery signals are trustworthy. Retain
+  operator-defined hard ceilings.
+
+## 7. Extract the framework contract
+
+Only after phases 5 and 6 meet the exit criteria in the Next.js technical
+specification:
+
+- Extract a versioned, framework-neutral adapter contract from the working
+  Next.js inputs for route cost, request variants, privacy, deployment ids, and
+  invalidation events.
+- Publish a conformance suite that verifies fail-closed generation and runtime
+  privacy barriers before accepting another adapter.
+- Select the next framework from measured self-hosting demand. Possible
+  candidates include Nuxt, SvelteKit, React Router/Remix, Astro SSR, and
+  non-JavaScript origins that can provide equivalent metadata; this list is not
+  a delivery commitment or an implementation order.
