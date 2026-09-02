@@ -3,30 +3,111 @@
 All notable changes to Harmost. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning.** Harmost is pre-1.0 and follows Cargo's pre-1.0 SemVer
-convention: `0.x.y` may change behaviour in a `y` bump, and every such change
-is listed here. It is a binary rather than a library, so the surface that
-matters is the **configuration file** and the **operator interface** — the
-config schema version, the CLI, the signals, the metric names and the admin
-endpoints. Changes to those are called out explicitly.
-
-**Configuration schema.** Separate from the release version and currently
-**version 1**, unchanged since the first release. The rules for what may change
-without a schema bump are in [`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md).
-
-**Maturity.** No release has been run in production by anyone. "Done, tested"
-throughout this file means unit-tested and, where a `bench/` script exists,
-asserted end to end against a local fixture origin. See
-[Project maturity](./README.md#project-maturity-and-expectations).
-
 ---
 
 ## [0.1.2] — unreleased
 
-Roadmap phase 3: origin resilience. Everything here is off or inert by default,
-so no existing config changes behaviour.
+Origin resilience, the cache lifecycle, and the first framework adapter. Almost
+everything here is off or inert by default — the single exception is
+`cache.eviction`, whose new default changes which entry is discarded when the
+cache is full.
 
 ### Added
+
+**Next.js integration**
+
+- **[`@harmost/next`](./packages/harmost-next)**, a zero-dependency package that
+  takes from the Next.js build the two things Harmost cannot work out on its
+  own.
+- **`harmost-next generate`** turns `next build` output into a Harmost config:
+  the build id becomes `deployment.id`, prerendered routes become `public_ssr`
+  with `override_origin` and a TTL from `initialRevalidateSeconds`, Route
+  Handlers and dynamically rendered pages become `private_dynamic`, and
+  `/_next/image` is generated with the `vary: [Accept]` that makes it cache at
+  all. **Anything the build does not prove is shareable is generated private** —
+  a prerendered route is proof, a dynamic one is not, and a generator that
+  guessed would be one bad guess away from serving one user's page to another.
+- **`revalidateTag()` / `revalidatePath()` wrappers** that invalidate Next's
+  incremental cache and then Harmost's copy. Tag invalidation uses Next's
+  explicit `{ expire: 0 }` profile by default, so stale-while-revalidate HTML
+  cannot refill Harmost immediately after a purge. Values are percent-encoded
+  exactly once and Harmost decodes them once, preserving query delimiters as
+  data. The token travels in an `Authorization` header and redirects are
+  refused, so it cannot be bounced to another host. A failed purge or malformed
+  success body throws — stale content served silently is worse than a failed
+  deploy hook.
+- **A compatibility matrix that is asserted rather than transcribed.** Next's
+  build manifests carry their own version numbers and an unknown one is refused,
+  on the same reasoning as an unknown config schema version. The matrix is
+  checked against a real build in the test suite, and a further test runs the
+  generated config through `harmost check`.
+- **Automation that fits an existing build.** `harmost-next generate --check`
+  runs `harmost check` on a sibling temporary file and fails if it is rejected,
+  so a config that would not start cannot overwrite the last known-good output.
+  The validated file is installed with an atomic rename. A `postbuild` script
+  is the CI path — `npm run build` and `bun run build` both run it — and
+  `withHarmost()` from `@harmost/next/config` wraps a Next config for local
+  development. Both call the same code. The wrapper hooks
+  `process.on('exit')` because Next has no post-build callback: it runs only
+  on a successful build, fires once even though Next loads the config in its
+  workers, does nothing in `next dev`, and *can* still fail the build.
+- **Node and Bun**, both verified: the package uses only `node:` builtins and
+  web standards, and its `node:test` suite runs unmodified under `bun test`. CI
+  runs both. The source is JavaScript with no build step and is type-checked
+  with `tsc --checkJs`, so consumers get full types without the package
+  needing a compile.
+
+**Cache lifecycle**
+
+- **Cache tags and a purge API.** An origin tags a response with a header
+  (`cache.tag_header`, default `x-harmost-cache-tags`); `POST /purge?tag=...`
+  on the admin listener invalidates everything carrying it. Framework-neutral
+  by construction — any origin that can set a header can be purged, with no
+  adapter and no JavaScript in the loop.
+- **Purge by path** (`?path=/products/iphone`), the `revalidatePath()` shape:
+  one path, every variant of it — query strings, `Accept`, the RSC payload
+  beside the HTML. Entries are keyed by a hash, so the request path is carried
+  in the cache key's `user_tag`, which Pingora hashes into nothing: the key
+  itself is provably unchanged, and a test pins that. Paths longer than 512
+  bytes are not remembered and so are not purgeable by path; they remain
+  purgeable by tag and by `all`.
+- Tags and paths may be combined in one request, so a deploy hook calling both
+  `revalidateTag()` and `revalidatePath()` is a single call rather than two
+  chances to half-apply.
+- **The endpoint is off unless `cache.purge.token` is set**, and answers `404`
+  rather than `401` when it is not. `POST` only; a `GET` gets `405`. A
+  misspelled parameter is a `400` rather than a quiet no-op. Tokens are
+  compared in constant time and must be at least 24 printable-ASCII characters.
+- **Deployment-safe invalidation.** A `SIGHUP` that changes `deployment.id`
+  purges the previous build's entries, returning their bytes to the budget; the
+  key already made them unreachable. A reload that does not change the id
+  leaves the cache alone.
+- **Next.js tags without an integration.** Next emits `x-next-cache-tags` under
+  `NEXT_PRIVATE_MINIMAL_MODE=1` for statically generated App Router routes
+  (verified against 16.3.3), so pointing `cache.tag_header` at it reaches
+  `revalidateTag()` content today. Documented with its compatibility risk: the
+  variable is private and unversioned.
+- **Metrics:** `harmost_cache_purged_total{scope}`,
+  `harmost_cache_evicted_total`, `harmost_cache_tags`. `/status` reports the
+  eviction policy, tag header, tag count, eviction and purge totals, and
+  whether purging is enabled.
+- **Disk and external cache storage evaluated and declined**, closing phase 4's
+  remaining bullet with a measured decision rather than a feature:
+  [`docs/CACHE-STORAGE-EVALUATION.md`](./docs/CACHE-STORAGE-EVALUATION.md). A
+  cache hit is ~570 µs end to end and ~60 µs of that is the lookup — so a hit
+  is already dominated by the round trip to Harmost, and a second hop to an
+  external store would roughly double it to buy capacity a microcache with
+  second-long TTLs does not need. The document lists the four conditions that
+  would reopen the question, and both measurements are assertions rather than
+  reports so the argument fails a test when it stops being true.
+- **Benchmark:** [`bench/storage.sh`](./bench/storage.sh) — hit against miss
+  latency, and a small-body hit that isolates the round-trip floor.
+- **Benchmark:** [`bench/purge.sh`](./bench/purge.sh) — a tag purge removes
+  exactly the entries carrying it and costs exactly that many re-renders,
+  measured at the origin; a `GET`, a wrong token, a missing token and a
+  misspelled parameter each change nothing.
+
+**Origin resilience** 
 
 - **Per-backend circuit breakers** (`origin.breaker`), fed by passive
   observation of real traffic rather than a probe. Catches the origin that
@@ -77,7 +158,15 @@ so no existing config changes behaviour.
 
 ### Changed
 
-- `harmost check` prints the breaker, retry and priority settings in force.
+- **`cache.eviction` defaults to `clock` (second-chance FIFO) rather than the
+  previous plain FIFO.** The only added key whose default changes behaviour. It
+  changes which entry is discarded when the budget is full, never how many or
+  which responses are shareable. Measured at a **0.600 hit ratio against FIFO's
+  0.525** on a Zipfian workload, for one relaxed atomic per read; the
+  comparison runs as a test, so the default has to keep earning itself. Set
+  `eviction: fifo` to restore the old behaviour exactly.
+- `harmost check` prints the breaker, retry and priority settings in force, and
+  warns when the purge endpoint is enabled.
 - `SIGHUP` refuses `origin.breaker` and `origin.retry`: both carry rolling
   windows bound at startup. `origin.priorities`, `route.priority` and
   `route.weight` **do** reload.
@@ -89,6 +178,20 @@ so no existing config changes behaviour.
 
 ### Known limitations
 
+- **The cache is per process, and so is its purge endpoint.** Every replica
+  holds its own entries and must be purged separately. Fan out from the deploy
+  pipeline, or accept that invalidation is eventually consistent within one TTL.
+- **Purge by path is exact, not a prefix, and spans hosts.** There is no
+  equivalent of `revalidatePath('/products/[slug]', 'page')`: matching a
+  dynamic route pattern needs the route metadata phase 6's adapter contract
+  will carry. A path purge also matches that path on every virtual host this
+  instance serves, which over-purges rather than under-purges.
+- **In-flight fills are not purged.** A purge concerns stored responses;
+  cancelling a render already streaming to a client would turn an invalidation
+  into a user-visible error.
+- `cache.eviction`, `cache.tag_header` and `cache.purge.token` do not reload:
+  the store is built once and its entries are already indexed under the old
+  header, and the admin listener reads the token at startup.
 - Breaker and retry-budget state is process-local, like the cache and the
   admission ceilings. Each replica must observe a failing backend for itself,
   and *n* replicas have *n* retry budgets.
@@ -101,10 +204,20 @@ so no existing config changes behaviour.
 
 ### Upgrading from 0.1.1
 
-No configuration change is required. If you run more than one backend,
-`origin.breaker` is the piece worth adding first — watch
-`harmost_upstream_ejected` before relying on it. Leave `origin.retry` off until
-`harmost_upstream_failures_total` says what is actually failing.
+No configuration change is required, with one behaviour change to be aware of:
+`cache.eviction` now defaults to `clock` rather than FIFO. Set `eviction: fifo`
+to keep the previous behaviour exactly.
+
+Two things are worth turning on deliberately.
+
+1. **The purge API** takes two keys — `cache.purge.token` and a
+   `telemetry.admin` listener — and validation refuses the first without the
+   second. Remember that every replica has its own cache and its own endpoint.
+2. **`origin.breaker`**, if you run more than one backend. It is the only thing
+   here that sees an origin which is answering and failing at the same time.
+   Watch `harmost_upstream_ejected` for a week before relying on it, and leave
+   `origin.retry` off until `harmost_upstream_failures_total` says what is
+   actually failing — retries added to a misdiagnosed problem make it worse.
 
 ---
 

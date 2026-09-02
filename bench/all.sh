@@ -89,6 +89,14 @@ run chaos.sh "${CHAOS_ROUNDS:-2}"
 run breaker.sh "${BREAKER_REQUESTS:-40}" "${BREAKER_RENDER_MS:-20}"
 run retry.sh "${RETRY_REQUESTS:-40}" "${RETRY_RENDER_MS:-20}"
 
+# Phase 4: the cache lifecycle. Tags and the purge API, including the half
+# that matters most — that an unauthorised or misspelled purge changes nothing.
+run purge.sh "${PURGE_RENDER_MS:-20}"
+# The measurement behind docs/CACHE-STORAGE-EVALUATION.md. It is a gate rather
+# than a report so the argument for keeping the cache in process decays into a
+# test failure rather than into a stale claim in a document.
+run storage.sh "${STORAGE_SAMPLES:-60}" "${STORAGE_RENDER_MS:-200}"
+
 # bench/tracing.sh also needs python3 (for the OTLP collector it asserts
 # against) and skips itself with a message when it is missing.
 #

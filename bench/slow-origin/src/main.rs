@@ -18,6 +18,9 @@
 //!   phases without a restart clouding the numbers.
 //! * `GET /healthz`  — liveness, deliberately excluded from the counters so an
 //!   active health check cannot inflate a render count.
+//! * `GET /tagged/<tag>/<n>` — an ordinary render that also declares
+//!   `X-Harmost-Cache-Tags: <tag>`, so a benchmark can prove a purge by tag
+//!   removes exactly the entries carrying it and nothing else.
 //! * `GET /__fail` / `GET /__heal` — make every *render* answer `502` while
 //!   leaving `/healthz` answering `200`. That combination is the whole point:
 //!   it is what an origin looks like when its health endpoint is a static
@@ -316,6 +319,18 @@ async fn main() -> std::io::Result<()> {
             // as a shared response. Wrong in the dangerous direction: it can
             // only ever manufacture a failure or, worse, mask a real one by
             // making the count noisy enough to be given slack.
+            // `/tagged/<tag>/<n>` declares an invalidation tag, so a
+            // benchmark can prove a purge removes exactly the entries carrying
+            // it. The tag is taken from the path rather than a fixed constant
+            // so one origin can serve several independent tag groups.
+            let cache_tags = path
+                .strip_prefix("/tagged/")
+                .and_then(|rest| rest.split('/').next())
+                .filter(|tag| {
+                    !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+                .map(|tag| format!("X-Harmost-Cache-Tags: {tag}\r\n"))
+                .unwrap_or_default();
             let set_cookie = if path.starts_with("/private") {
                 format!("Set-Cookie: session=user-{instance}-{seq}; Path=/\r\n")
             } else {
@@ -349,6 +364,7 @@ async fn main() -> std::io::Result<()> {
                  X-Origin-Concurrency: {now}\r\n\
                  X-Origin-Peak: {peak}\r\n\
                  X-Origin-Total: {}\r\n\
+                 {cache_tags}\
                  {set_cookie}\
                  Connection: close\r\n\r\n{body}",
                 body.len(),

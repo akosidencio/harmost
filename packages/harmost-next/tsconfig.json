@@ -1,0 +1,16 @@
+{
+  "//": "Type-checking only. There is no build step and no emit: the package ships the JavaScript it is written in, so it runs unmodified on Node and Bun with nothing to compile. This gets TypeScript's checking without TypeScript's build.",
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "lib": ["es2023", "dom"],
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.js", "src/**/*.d.ts"]
+}

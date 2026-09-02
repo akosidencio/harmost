@@ -111,6 +111,21 @@ cache:
   max_memory: 512MiB
   max_body_size: 4MiB
   respect_origin: true
+  # clock (default) or fifo. Second-chance FIFO spares an entry that has been
+  # read since it was queued, which on the skewed request distribution an SSR
+  # microcache actually sees is worth about a seventh more hits for one
+  # relaxed atomic per read.
+  eviction: clock
+  # Response header the origin declares invalidation tags on. Point it at
+  # `x-next-cache-tags` to consume Next.js's own tags — see docs/OPERATIONS.md
+  # for what that costs.
+  tag_header: "x-harmost-cache-tags"
+  purge:
+    # Enables POST /purge on the admin listener. Without a token the endpoint
+    # does not exist: purging makes an origin re-render on demand, so an open
+    # one is a stampede anybody can trigger. At least 24 printable ASCII
+    # characters.
+    token: "replace-me-with-a-real-secret-32ch"
 
 coalesce:
   enabled: true

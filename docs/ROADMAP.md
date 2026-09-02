@@ -27,8 +27,14 @@ shareability; the review brief is in
 - Passive failure observation counts any 5xx as an origin failure. An origin
   that answers 5xx for reasons of its own — a deliberate error page, a route
   that 500s on bad input — will trip breakers that no backend deserves.
-- The cache is bounded in-process memory with FIFO eviction. Restarting clears
-  it, and there is no purge API.
+- The cache is bounded in-process memory. Restarting clears it, and it is not
+  shared between replicas — every instance holds its own entries and must be
+  purged separately. Disk and external storage were evaluated and declined; see
+  [`CACHE-STORAGE-EVALUATION.md`](./CACHE-STORAGE-EVALUATION.md) for the
+  measurements and for what would reopen it.
+- Purging by path is exact. There is no equivalent of
+  `revalidatePath('/products/[slug]', 'page')`, because matching a dynamic
+  route pattern needs the route metadata phase 6 introduces.
 - Harmost does not rate-limit bytes, connections, clients, or requests per
   second. Keep an edge component in front of public deployments.
 - A direct `SIGTERM` takes at least `drain_period + shutdown_timeout`, including
@@ -47,22 +53,11 @@ shareability; the review brief is in
 
 See [`OPERATIONS.md`](./OPERATIONS.md) for deployment consequences and
 [`THREAT-MODEL.md`](./THREAT-MODEL.md) for intentionally undefended threats.
-Milestone numbering continues phases 0–3, whose completed work is recorded in
-the changelog.
-
-## 4. Complete the cache lifecycle and framework integration
-
-- Add a purge API and cache tags, including deployment-safe invalidation and a
-  path from Next.js `revalidateTag()` and `revalidatePath()` events.
-- Replace FIFO eviction with a measured production policy and evaluate optional
-  disk or external storage.
-- Build a versioned `@harmost/next` integration for route hints, deployment ids,
-  invalidation events, and a tested compatibility matrix.
-- Define a versioned, framework-neutral adapter contract for route cost,
-  request variants, privacy, deployment ids, and invalidation events.
-- Add adapters for other server-rendered applications after that contract is
-  stable. Likely candidates include Nuxt, SvelteKit, React Router/Remix, Astro
-  SSR, and non-JavaScript origins that can provide equivalent metadata.
+Milestone numbering continues phases 0–4, whose completed work is recorded in
+the changelog. Phase 4 closed with a decision rather than a feature on one of
+its bullets: disk and external cache storage were evaluated and declined, with
+the measurements and the conditions that would reopen the question in
+[`CACHE-STORAGE-EVALUATION.md`](./CACHE-STORAGE-EVALUATION.md).
 
 ## 5. Scale deliberately
 
@@ -72,3 +67,24 @@ the changelog.
   intended origin ceiling.
 - Keep distributed coalescing optional. Prefer path-stable ingress routing
   until measurements justify a distributed lock.
+
+## 6. Framework integration and production-ready examples
+
+Deliberately after phase 4. An adapter contract designed before the cache
+lifecycle it has to drive would be a guess; designed after, it is a description
+of something that already works.
+
+The first adapter has shipped: [`@harmost/next`](../packages/harmost-next)
+generates route configuration and a deployment id from a Next.js build, and
+routes `revalidateTag()` / `revalidatePath()` to the phase 4 purge API. What
+remains here is the generalisation — a contract other frameworks can implement
+— and the examples.
+
+- Ship working, production-shaped Next.js examples rather than fixtures: a real
+  deployment topology, a deployment-id rollover, and an invalidation flow
+  someone can copy instead of infer.
+- Define a versioned, framework-neutral adapter contract for route cost,
+  request variants, privacy, deployment ids, and invalidation events.
+- Add adapters for other server-rendered applications after that contract is
+  stable. Likely candidates include Nuxt, SvelteKit, React Router/Remix, Astro
+  SSR, and non-JavaScript origins that can provide equivalent metadata.

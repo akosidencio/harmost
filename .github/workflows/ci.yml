@@ -95,6 +95,47 @@ jobs:
       - name: Audit
         run: cargo audit -D warnings
 
+  # @harmost/next, on both runtimes it claims to support.
+  #
+  # The Rust binary is built first on purpose: the package's headline claim is
+  # that what it generates is a configuration Harmost accepts, and the test
+  # that proves it skips itself when the binary is absent. Skipping quietly in
+  # CI would leave the one assertion that matters unenforced.
+  harmost-next:
+    name: "@harmost/next (node + bun)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/harmost-next
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build harmost, so the generated config can be checked for real
+        run: cargo build
+        working-directory: .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dev dependencies (typescript, @types/node)
+        run: npm install --no-save typescript@^5.6 @types/node@^22
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test on Node
+        run: npm test
+        env:
+          # A `cargo build` that quietly produced nothing would otherwise let
+          # the binary-dependent tests skip and CI go green without them.
+          HARMOST_REQUIRE_BINARY: "1"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Test on Bun
+        run: npm run test:bun
+        env:
+          HARMOST_REQUIRE_BINARY: "1"
+
   # The end-to-end evidence behind the README's claims. Every script asserts its
   # own result and exits non-zero when it fails, so this is a gate rather than a
   # report — and each one writes the parameters it ran with next to its numbers,
