@@ -4,11 +4,13 @@ This file tracks active work only. Completed features and fixes belong in the
 [`CHANGELOG.md`](../CHANGELOG.md), while the evidence required for a release is
 defined in [`RELEASE-GATES.md`](./RELEASE-GATES.md).
 
-Harmost remains a working prototype with no production validation. The core
-proxy, admission, cache, coalescing, protocol, observability, and restart paths
-are implemented and tested against local fixtures. The most important open
-validation work is an independent review of cache keys and response
-shareability; the review brief is in
+Harmost remains a working prototype with no sustained production validation.
+It is not a general Next.js performance accelerator; it is an overload governor
+for expensive SSR and dynamic origin workloads. The core proxy, admission,
+cache, coalescing, protocol, observability, and restart paths are implemented
+and tested against local fixtures. The most important open validation work is
+an independent review of cache keys and response shareability; the review
+brief is in
 [`CACHE-KEY-REVIEW.md`](./CACHE-KEY-REVIEW.md).
 
 ## Current limitations and non-goals
@@ -47,9 +49,10 @@ shareability; the review brief is in
   that changes them instead of silently ignoring it.
 - No release artifact has yet exercised the documented checksums, SBOM,
   provenance, and reproducible-build workflow end to end.
-- Harmost governs SSR origin work; it is not a general-purpose edge server or
-  a replacement for client rate limiting, authentication, redirects, or static
-  file serving.
+- Harmost governs expensive SSR and dynamic origin work. It is not a general
+  Next.js performance accelerator, general-purpose edge server, or replacement
+  for client rate limiting, authentication, redirects, static file serving, a
+  CDN, or an ordinary reverse proxy.
 
 See [`OPERATIONS.md`](./OPERATIONS.md) for deployment consequences and
 [`THREAT-MODEL.md`](./THREAT-MODEL.md) for intentionally undefended threats.

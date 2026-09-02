@@ -1,5 +1,10 @@
 # Operating Harmost
 
+Harmost is an overload governor for expensive SSR and dynamic origin workloads,
+not a general Next.js performance accelerator. Operate it around origin-work
+ceilings, queueing, shedding and recovery; a cache hit rate or latency change
+alone does not establish that the deployment benefits from Harmost.
+
 Everything here is asserted by a script in [`bench/`](../bench) rather than
 described from memory. Where a number appears, the benchmark that produced it
 is named.

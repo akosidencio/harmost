@@ -1,5 +1,10 @@
 # @harmost/next
 
+This package does not make every Next.js application faster. Harmost is an
+overload governor for expensive SSR and dynamic origin workloads; this package
+only derives safer route policy from a Next.js build and coordinates cache
+invalidation. Static or mostly ISR applications may not need Harmost at all.
+
 Two things Harmost cannot work out on its own, taken from the place that
 already knows them — your Next.js build.
 

@@ -1,5 +1,10 @@
 # Operator artifacts
 
+These artifacts monitor Harmost as an overload governor for expensive SSR and
+dynamic origin workloads. They do not treat cache-hit rate or lower latency as
+the product goal; the primary signals are bounded origin work, queueing,
+shedding, origin health and recovery.
+
 Two files, both meant to be copied into your own monitoring stack rather than
 imported and forgotten.
 

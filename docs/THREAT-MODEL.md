@@ -1,5 +1,10 @@
 # Harmost threat model
 
+Harmost is an overload governor for expensive SSR and dynamic origin workloads,
+not a general Next.js performance accelerator. This model therefore treats
+unbounded or amplified origin work as a primary availability threat alongside
+the confidentiality risks introduced by safe response reuse.
+
 **Status: first edition, written 2026-08-27 alongside roadmap phase 1. Not
 independently reviewed.** Harmost has never run in production and has had no
 third-party security review. This document is the author's own analysis; read

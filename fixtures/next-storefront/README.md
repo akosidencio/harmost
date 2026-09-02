@@ -6,6 +6,10 @@ and exercises public SSR, query-keyed dynamic pages, React Server Component
 navigation, Suspense streaming, cookies, Draft Mode, a Server Action, and an
 absolute `Set-Cookie` privacy barrier.
 
+It verifies Harmost's integration with expensive SSR and dynamic Next.js
+request shapes. It is not evidence that every Next.js application benefits
+from Harmost, and it is not a general site-performance benchmark.
+
 The `pages/` half is not there for variety. A Pages Router page answers the
 same page in two shapes — the document at `/legacy/x` and a JSON props payload
 at `/_next/data/<buildId>/legacy/x.json` — which is the same class of hazard as

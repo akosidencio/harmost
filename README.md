@@ -67,9 +67,10 @@ Reference documentation:
 | [`ops/`](./ops) | Example Prometheus alerts and a Grafana dashboard |
 | [`CHANGELOG.md`](./CHANGELOG.md) | What changed in each release, and what to do when upgrading |
 
-Everything described below as a benefit is a **design goal supported by local
-tests**, not an outcome observed under real traffic. If you deploy it, do so
-behind something you can fail back to, and read
+Except for the bounded staging A/B result reported below, everything described
+as a benefit is a **design goal supported by local tests**, not an outcome
+observed under sustained production traffic. If you deploy it, do so behind
+something you can fail back to, and read
 [Slow readers and render capacity](#slow-readers-and-render-capacity) and
 [the roadmap and current limitations](./docs/ROADMAP.md) for the parts that are
 known to be incomplete.
@@ -310,65 +311,43 @@ concurrency makes a burst slower on purpose — see the wall-clock discussion in
 
 ## Benchmarks
 
-Each script starts a test origin and a proxy, runs load, asserts its own claim
-and exits non-zero when it fails, so each is a gate rather than a report. The
-numbers below are one machine's; see [Quick start](#quick-start) for how to run
-them and what the parameter block is for.
+The managed staging result below records one workload-specific field test. The
+local benchmarks that follow isolate individual mechanisms and are executable
+gates: each starts its own fixture origin and proxy, asserts its claim, and exits
+non-zero on failure.
 
 ### DigitalOcean staging validation
 
-Harmost v0.1.2 was tested on 2 September 2026 in front of the Reko Next.js
-storefront on DigitalOcean App Platform. Public traffic normally follows this
-path:
+A controlled A/B test ran against a real Next.js storefront on DigitalOcean
+App Platform. One product-detail route was temporarily changed from ISR to
+dynamic SSR, then exercised with the same repeated URL and arrival-rate profile:
+a jump to 20 requests per second for 20 seconds, surrounded by bounded baseline
+and recovery periods. The public ingress was switched between Harmost and the
+origin; the original app specification and ISR route settings were restored
+afterward.
 
-```text
-Client -> Cloudflare / App Platform ingress -> Harmost -> Next.js storefront
-```
+| Product SSR spike                 |         Harmost |                       Direct origin |
+| --------------------------------- | --------------: | ----------------------------------: |
+| Successful requests               |             501 |                                  60 |
+| Client timeouts                   |               0 |                                  80 |
+| Dropped iterations                |               0 |                                 361 |
+| Origin renders                    |              51 | One per request reaching the origin |
+| Origin peak RAM                   |         334 MiB |                             379 MiB |
+| Successful latency, average / p95 | 111 ms / 166 ms |                     5.48 s / 9.10 s |
 
-For a controlled A/B, only the ingress target changed: one deployment routed
-the same public hostname directly to the Next.js service and the other routed
-it through Harmost. Both services used one 512 MiB, one-vCPU instance. Each
-deployment was fresh, and each leg used the same five-minute k6 profile: a
-30-second ramp to 10 virtual users, four minutes steady, then a 30-second ramp
-down, with 1–3 seconds of think time. The workload mixed cacheable `GET`
-requests to `/books`, `/genres` and `/unlireads` with a low-rate uncached
-`/api/health` control.
+Both paths kept the independent health control available. The latency row
+includes successful responses only. Harmost's process used approximately 24 MiB
+of RAM on its separate instance, so this is evidence of origin protection and
+work reuse, not a claim of lower aggregate resource use. The result is specific
+to a repeated, publicly shareable SSR product response: it does not imply a
+benefit for ISR, static, personalized, unique-key, or otherwise uncacheable
+traffic.
 
-| Ingress path | Requests | Requests/s | Average | Median | p95 | p99 | Max | Failures |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Direct to Next.js | 1,355 | 4.503 | 113.21 ms | 92.76 ms | 166.15 ms | 192.53 ms | 307.06 ms | 0 |
-| Through Harmost | 1,341 | 4.460 | 127.34 ms | 142.24 ms | 165.62 ms | 235.18 ms | 368.22 ms | 0 |
-
-Harmost reused a cached response for 1,270 of 1,273 cacheable requests
-(99.76%). It added 12.5% to average latency and 22.2% to p99 in this run, while
-p95 was effectively unchanged (-0.3%). Requests per second were 1.0% lower,
-but this closed-user workload includes think time and is not a throughput or
-maximum-capacity benchmark.
-
-Container cgroups were sampled every five seconds over the same window. CPU is
-CPU time as a percentage of one core; RAM is cgroup usage, not the 512 MiB
-allocation. Alloy was unchanged between legs and is excluded.
-
-| Ingress path | Component | Average RAM | Maximum RAM | CPU |
-| --- | --- | ---: | ---: | ---: |
-| Direct | Next.js | 227.35 MiB | 237.08 MiB | 12.30% |
-| Harmost | Next.js | 225.20 MiB | 232.79 MiB | 6.83% |
-| Harmost | Proxy | 135.10 MiB | 135.10 MiB | 16.35% |
-| Harmost | Combined | 360.30 MiB | — | 23.18% |
-
-For this cache-friendly workload, Harmost reduced origin CPU by 44.5%, but the
-additional proxy made combined average RAM 58.5% higher and combined CPU time
-higher than direct ingress. The components run on separate instances, so the
-combined row is a topology total rather than usage within one 512 MiB limit.
-
-After the A/B, the original Harmost ingress spec was restored byte-for-byte at
-the canonical JSON level. Public probes returned `DISABLED` for health and
-`MISS` followed by `HIT` for `/books`.
-
-These results demonstrate correct operation under bounded concurrent traffic
-on a real managed staging deployment. They are one short, cache-friendly field
-test—not evidence of sustained production readiness, uncached overload
-behavior, maximum capacity or a general latency improvement.
+This is bounded staging evidence, not a production guarantee. In a separate
+uncached dynamic-route spike, an overly permissive route concurrency ceiling let
+the 512 MiB origin approach its memory limit and return upstream `504` responses
+before Harmost could shed work. Concurrency limits still have to be calibrated
+to the capacity of the protected origin.
 
 ### Admission control benchmark
 
