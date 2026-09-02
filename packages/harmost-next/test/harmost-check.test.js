@@ -8,12 +8,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
+import { BINARY, FIXTURE, ROOT } from './fixture.js';
+
 import { readBuild } from '../src/manifests.js';
 import { generateConfig } from '../src/routes.js';
 
 const run = promisify(execFile);
-const ROOT = fileURLToPath(new URL('../../..', import.meta.url));
-const FIXTURE = path.join(ROOT, 'fixtures/next-storefront/.next');
 
 /**
  * The claim this whole package rests on: what it generates is a configuration
@@ -23,9 +23,6 @@ const FIXTURE = path.join(ROOT, 'fixtures/next-storefront/.next');
  * JavaScript package's test suite should not require a Rust toolchain to run —
  * but CI builds it, so the check is not optional there.
  */
-const BINARY = ['target/debug/harmost', 'target/release/harmost']
-  .map((p) => path.join(ROOT, p))
-  .find((p) => existsSync(p));
 
 test(
   'the generated configuration passes `harmost check`',

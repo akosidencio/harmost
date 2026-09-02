@@ -1,13 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fileURLToPath } from 'node:url';
-
+import { FIXTURE, REAL_BUILD } from './fixture.js';
 import { readBuild } from '../src/manifests.js';
 import { generateConfig, routeId, toGlob } from '../src/routes.js';
 import { quote } from '../src/yaml.js';
 import { SUPPORTED_MANIFESTS, VERIFIED_NEXT_RELEASES } from '../src/compat.js';
-
-const FIXTURE = fileURLToPath(new URL('../../../fixtures/next-storefront/.next', import.meta.url));
 
 const build = await readBuild(FIXTURE);
 
@@ -33,11 +30,24 @@ test('the compatibility matrix matches the build it claims to support', () => {
 });
 
 test('a missing build is refused with an explanation, not guessed at', async () => {
-  await assert.rejects(
-    () => readBuild(fileURLToPath(new URL('./does-not-exist', import.meta.url))),
-    { name: 'HarmostNextError' },
-  );
+  await assert.rejects(() => readBuild('./does-not-exist'), { name: 'HarmostNextError' });
 });
+
+test(
+  'the committed fixture still matches the storefront it was copied from',
+  { skip: REAL_BUILD ? false : 'no local next build; the committed fixture is the source of truth' },
+  async () => {
+    // Guards the drift the committed copy makes possible: a Next upgrade that
+    // changes the manifests would leave this suite testing a format nothing
+    // emits any more.
+    const live = await readBuild(REAL_BUILD);
+    assert.deepEqual(
+      live.manifestVersions,
+      build.manifestVersions,
+      'the storefront now builds different manifest versions; refresh test/fixtures/next-build',
+    );
+  },
+);
 
 // --------------------------------------------------------------- route globs
 

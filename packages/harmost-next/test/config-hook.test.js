@@ -8,13 +8,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
+import { BINARY, FIXTURE, ROOT } from './fixture.js';
+
 const run = promisify(execFile);
-const ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const PKG = fileURLToPath(new URL('..', import.meta.url));
-const FIXTURE = path.join(ROOT, 'fixtures/next-storefront/.next');
-const BINARY = ['target/debug/harmost', 'target/release/harmost']
-  .map((p) => path.join(ROOT, p))
-  .find((p) => existsSync(p));
 
 /**
  * Drive the hook the way Next does: load the config, ask it for the
