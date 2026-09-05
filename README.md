@@ -4,9 +4,9 @@
 
 **Stop traffic spikes from becoming render spikes.**
 
-Rust reverse proxy and origin workload governor for Next.js and other SSR
-origins: bounded render concurrency, request coalescing, safe microcaching,
-bounded queues and load shedding. Built on Pingora.
+Rust reverse proxy and origin workload governor for self-hosted Next.js:
+bounded render concurrency, request coalescing, safe microcaching, bounded
+queues and load shedding. Built on Pingora.
 
 > [!CAUTION]
 > **Harmost is under active development and remains pre-1.0.** Version 0.1.2 is
@@ -15,11 +15,19 @@ bounded queues and load shedding. Built on Pingora.
 > traffic or independently security-audited. APIs, configuration, behavior and
 > operational guarantees may change without notice.
 
-**Every conventional defense counts requests. Server rendering made requests
-stop being a unit of work.** One route is a cached shell; the next fans out
-into a React render, a database round trip, a CMS call and a pricing service.
-Rate limiting, connection limits and autoscaling triggers all count requests,
-so none of them can tell those two apart.
+A scraper walks ten thousand product URLs on your storefront. Every URL is
+distinct, so the cache has nothing to serve and there are no duplicate requests
+to collapse. Each one is a full React render, a database round trip and a CMS
+call. The rate limiter sees an unremarkable arrival rate and lets them through.
+The autoscaler reacts thirty seconds later, by which point the origin is already
+failing.
+
+Nothing in that path was misconfigured. The defenses simply had no way to see
+what those requests cost, because **every conventional defense counts requests,
+and server rendering made requests stop being a unit of work.** One route is a
+cached shell; the next fans out into a React render, a database round trip, a
+CMS call and a pricing service. Rate limiting, connection limits and autoscaling
+triggers all count requests, so none of them can tell those two apart.
 
 Harmost counts the work instead. It is an open-source Rust reverse proxy that
 bounds how much *rendering* may reach an origin at once, rather than how many
@@ -128,6 +136,28 @@ Conventional protection is a poor fit for this shape:
 - **Autoscaling** reacts on the order of tens of seconds. A traffic spike arrives
   in one.
 
+### The case nothing else covers
+
+Caching and request collapsing are the two mechanisms usually reached for, and
+both depend on requests repeating. A burst on one popular URL is the easy
+shape: one render serves all of it.
+
+The hard shape is the opposite one. An automated client walking thousands of
+distinct URLs produces sustained origin concurrency in which **every request is
+a unique cache miss and nothing can be collapsed.** A cache contributes
+nothing. Coalescing contributes nothing. The work arrives an order of magnitude
+faster than an autoscaler responds, and it does not stop when the burst does,
+because there is no burst — just a client that keeps walking. Bounding how much
+of that may reach the origin at once is the only mechanism left.
+
+Blocking the client is the first thing to try, and Harmost is not the tool for
+it: it does not rate-limit by client, address or request rate, and a public
+deployment should still have an edge component in front that does. But some of
+this traffic is legitimate, some is distributed across enough addresses to
+survive per-client limits, and some of it simply gets through. Admission
+control decides what happens to the share that does — whether it degrades the
+origin, or queues behind a ceiling and receives a defined answer.
+
 ### Why Harmost exists
 
 Because the useful unit to bound is *origin work*, not requests, and few
@@ -173,10 +203,9 @@ not the ones you planned for:
   count.
 - **Crawlers and scrapers do not care how popular you are.** An automated
   client walking thousands of distinct URLs produces sustained concurrency
-  against your origin regardless of your organic traffic. Every URL is unique,
-  so every one is a cache miss and none of them can be collapsed. This is the
-  case where caching and coalescing offer nothing at all and bounded admission
-  is the only mechanism that applies.
+  against your origin regardless of your organic traffic — the shape described
+  in [the case nothing else covers](#the-case-nothing-else-covers), where reuse
+  offers nothing and bounded admission is the only mechanism that applies.
 - **Small sites have spikier traffic than large ones.** A large site's load is
   comparatively smooth. A small site's load is a launch, a drop, a newsletter
   or a link from somewhere busy — a step change, not a curve.
