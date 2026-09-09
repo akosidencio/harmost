@@ -70,6 +70,40 @@ test('tags and paths travel in one request', async () => {
   assert.equal(calls[0].url.search, '?tag=sale&path=%2Fp%2F1');
 });
 
+test('a replicated purge reaches every local Harmost cache', async () => {
+  const calls = [];
+  const purger = createPurger({
+    endpoints: ['http://127.0.0.1:9091', 'http://127.0.0.1:9092'],
+    token: 'test-token-0123456789abcdef',
+    fetch: async (url) => {
+      calls.push(new URL(url));
+      return new Response('{"purged":true,"entries":2}', {
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  const result = await purger.purgeTags(['product-42']);
+  assert.deepEqual(calls.map((url) => url.origin).sort(), [
+    'http://127.0.0.1:9091',
+    'http://127.0.0.1:9092',
+  ]);
+  assert.equal(result.replicas, 2);
+  assert.equal(result.entries, 4);
+  assert.equal(result.results.length, 2);
+});
+
+test('a partial replicated purge is reported as a failure', async () => {
+  const purger = createPurger({
+    endpoints: ['http://127.0.0.1:9091', 'http://127.0.0.1:9092'],
+    token: 'test-token-0123456789abcdef',
+    fetch: async (url) => new Response(
+      new URL(url).port === '9092' ? 'unavailable' : '{"purged":true,"entries":1}',
+      { status: new URL(url).port === '9092' ? 503 : 200 },
+    ),
+  });
+  await assert.rejects(() => purger.purgeTags(['product-42']), /127\.0\.0\.1:9092.*503/);
+});
+
 test('duplicates collapse', async () => {
   const { purger, calls } = stub();
   await purger.purgeTags(['a', 'a', 'b']);

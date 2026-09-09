@@ -5,8 +5,9 @@ dynamic origin workloads. They do not treat cache-hit rate or lower latency as
 the product goal; the primary signals are bounded origin work, queueing,
 shedding, origin health and recovery.
 
-Prometheus loads alert rules and compact recording rules for saturation,
-shedding, origin latency, avoided origin work, and cache/spool occupancy.
+Prometheus loads alert rules and compact recording rules for local and replica
+group saturation, shedding, origin latency, avoided origin work, and
+cache/spool occupancy.
 
 Three files, all meant to be copied into your own monitoring stack rather than
 imported and forgotten.

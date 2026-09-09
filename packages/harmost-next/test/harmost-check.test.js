@@ -57,3 +57,21 @@ test(
     await assert.rejects(() => run(BINARY, ['check', '--config', file]));
   },
 );
+
+test(
+  'a small statically partitioned group passes `harmost check`',
+  { skip: BINARY ? false : 'harmost binary not built; run cargo build' },
+  async () => {
+    const build = await readBuild(FIXTURE);
+    const yaml = generateConfig(build, {
+      upstreams: ['127.0.0.1:3000'],
+      globalConcurrency: 9,
+      replicas: 2,
+    });
+    const dir = await mkdtemp(path.join(tmpdir(), 'harmost-next-group-'));
+    const file = path.join(dir, 'generated.yaml');
+    await writeFile(file, yaml);
+    const { stdout } = await run(BINARY, ['check', '--config', file]);
+    assert.match(stdout, /replica-group capacity: 8\/9 allocated/);
+  },
+);

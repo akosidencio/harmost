@@ -244,6 +244,9 @@ jobs:
       - name: Production-reference assertions
         run: ./bench/nextjs-reference.sh
 
+      - name: Replicated-governor assertions
+        run: ./bench/nextjs-replicas.sh
+
   # Fuzz targets are built on every run so a target cannot rot unnoticed, and
   # run briefly. A short run is a smoke test, not a campaign: it catches a
   # target that panics immediately, which is the failure mode that matters for

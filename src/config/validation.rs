@@ -43,6 +43,7 @@ pub fn validate(cfg: &Config) -> Result<()> {
         ));
     }
     check_concurrency_max(cfg.origin.concurrency.max, "origin.concurrency.max")?;
+    validate_capacity_group(cfg)?;
     if cfg.cache.max_memory.get() == 0 {
         return Err(err("cache.max_memory must be greater than zero"));
     }
@@ -132,6 +133,32 @@ pub fn validate(cfg: &Config) -> Result<()> {
             return Err(err(format!("duplicate route id `{}`", route.id)));
         }
         check_route(route, cfg)?;
+    }
+    Ok(())
+}
+
+fn validate_capacity_group(cfg: &Config) -> Result<()> {
+    let Some(group) = &cfg.capacity else {
+        return Ok(());
+    };
+    if group.global_max == 0 {
+        return Err(err("capacity.global_max must be greater than zero"));
+    }
+    if group.replicas == 0 {
+        return Err(err("capacity.replicas must be greater than zero"));
+    }
+    let allocated = cfg
+        .origin
+        .concurrency
+        .max
+        .checked_mul(group.replicas)
+        .ok_or_else(|| err("capacity allocation overflows this platform"))?;
+    if allocated > group.global_max {
+        return Err(err(format!(
+            "origin.concurrency.max ({}) across capacity.replicas ({}) allocates {allocated}, \
+             which exceeds capacity.global_max ({})",
+            cfg.origin.concurrency.max, group.replicas, group.global_max
+        )));
     }
     Ok(())
 }
@@ -898,6 +925,34 @@ origin:
     #[test]
     fn accepts_a_minimal_config() {
         validate(&parse(BASE)).unwrap();
+    }
+
+    #[test]
+    fn accepts_a_conservative_static_replica_partition() {
+        let cfg = parse(&format!(
+            "{BASE}  concurrency:\n    max: 4\ncapacity:\n  global_max: 9\n  replicas: 2\n"
+        ));
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_replica_partition_that_multiplies_the_global_budget() {
+        let cfg = parse(&format!(
+            "{BASE}  concurrency:\n    max: 5\ncapacity:\n  global_max: 8\n  replicas: 2\n"
+        ));
+        let error = validate(&cfg).unwrap_err();
+        assert!(error.0.contains("allocates 10"), "{error}");
+        assert!(error.0.contains("global_max (8)"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_empty_replica_capacity_contract() {
+        for capacity in [
+            "capacity:\n  global_max: 0\n  replicas: 2\n",
+            "capacity:\n  global_max: 8\n  replicas: 0\n",
+        ] {
+            assert!(validate(&parse(&format!("{BASE}{capacity}"))).is_err());
+        }
     }
 
     // ------------------------------------------------- cache lifecycle

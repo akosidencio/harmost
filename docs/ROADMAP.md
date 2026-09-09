@@ -3,12 +3,10 @@
 Harmost protects expensive SSR and dynamic origin workloads. It remains a
 working prototype without sustained production validation.
 
-## 6. Validate scaling across Harmost replicas
+## 6. Complete replica validation
 
-- Partition one global origin-work budget across replicas and test scaling, failures, and recovery.
-- Validate path-stable ingress with multiple Harmost replicas.
-- Evaluate capacity leases and adaptive concurrency after fixed limits are proven.
-- Revisit distributed caching and coalescing only when measurements justify them.
+- Validate the static partition and path-stable reference in production-shaped staging.
+- Revisit capacity leases, adaptive limits, and distributed reuse only if fixed partitions prove insufficient.
 
 ## 7. Expand framework support
 
@@ -17,7 +15,7 @@ working prototype without sustained production validation.
 
 ## Current boundaries
 
-- Cache and protection state are local to each process; limits and purges need coordination across replicas.
+- Cache and coalescing remain local to each process; replica limits are statically partitioned and purges must reach every admin endpoint.
 - Path purges match exact paths; dynamic route-pattern invalidation is not implemented.
 - Slow readers can hold origin capacity unless response spooling is enabled, which sacrifices progressive rendering.
 - Disk and external cache storage were [evaluated and declined](./CACHE-STORAGE-EVALUATION.md).

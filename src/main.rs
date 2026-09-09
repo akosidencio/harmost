@@ -606,6 +606,13 @@ fn check(path: &str) -> ExitCode {
                 "  global origin concurrency: {}",
                 cfg.origin.concurrency.max
             );
+            if let Some(group) = &cfg.capacity {
+                let allocated = cfg.origin.concurrency.max * group.replicas;
+                println!(
+                    "  replica-group capacity: {allocated}/{} allocated across at most {} replica(s)",
+                    group.global_max, group.replicas
+                );
+            }
             for r in &cfg.routes {
                 let overrides = r.cache.as_ref().is_some_and(|c| c.override_origin);
                 if overrides {

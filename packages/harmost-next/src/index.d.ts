@@ -46,6 +46,10 @@ export interface GenerateOptions {
   upstreams?: string[];
   /** `origin.concurrency.max`. Required when writing a complete config. */
   concurrency?: number;
+  /** One origin-work budget partitioned across the Harmost replica group. */
+  globalConcurrency?: number;
+  /** Maximum Harmost replicas sharing `globalConcurrency`. */
+  replicas?: number;
   /** `origin.priorities.low`, which reserves the rest for page renders. */
   lowPriorityPercent?: number;
   /** Checked-in operator assertions for dynamic routes. */
@@ -62,11 +66,17 @@ export interface PurgeResult {
   entries: number;
   bytes?: number;
   remaining_entries?: number;
+  /** Number of Harmost replicas reached by a fan-out purge. */
+  replicas?: number;
+  /** Per-replica responses when more than one endpoint is configured. */
+  results?: PurgeResult[];
 }
 
 export interface PurgerOptions {
   /** Harmost's **admin** listener, e.g. `http://127.0.0.1:9091`. */
   endpoint?: string;
+  /** Every Harmost admin listener in a replica group. */
+  endpoints?: readonly string[];
   /** Must match `cache.purge.token`. */
   token?: string;
   timeoutMs?: number;
@@ -86,6 +96,19 @@ export interface Purger {
 }
 
 export class HarmostNextError extends Error {}
+
+export function resolveCapacity(
+  options?: Pick<GenerateOptions, 'concurrency' | 'globalConcurrency' | 'replicas'>,
+  settings?: { requireExplicit?: boolean },
+): {
+  concurrency: number;
+  group: null | {
+    globalMax: number;
+    replicas: number;
+    allocated: number;
+    unallocated: number;
+  };
+};
 
 export function readBuild(distDir: string): Promise<NextBuild>;
 export function generateConfig(build: NextBuild, options?: GenerateOptions): string;

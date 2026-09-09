@@ -27,6 +27,8 @@ OPTIONS
                        one, the output is a complete config; with none, it is
                        routes only, to paste into an existing file.
   --concurrency <N>    Required with --upstream. Measure this origin ceiling.
+  --global-concurrency <N> One origin-work budget for the Harmost replica group.
+  --replicas <N>       Maximum Harmost replicas sharing the global budget.
   --rollout <STAGE>    observe, protect, coalesce, or cache. Default: cache.
   --out <FILE>         Write here instead of stdout.
   --identity-out <FILE> Write deployment identity here. With --out, defaults
@@ -67,6 +69,8 @@ function parseArgs(argv) {
     distDir: '.next',
     upstreams: [],
     concurrency: null,
+    globalConcurrency: null,
+    replicas: null,
     out: null,
     routesOnly: false,
     check: false,
@@ -119,6 +123,22 @@ function parseArgs(argv) {
           throw new HarmostNextError('--concurrency must be a positive integer');
         }
         options.concurrency = value;
+        break;
+      }
+      case '--global-concurrency': {
+        const value = Number(next());
+        if (!Number.isSafeInteger(value) || value <= 0) {
+          throw new HarmostNextError('--global-concurrency must be a positive integer');
+        }
+        options.globalConcurrency = value;
+        break;
+      }
+      case '--replicas': {
+        const value = Number(next());
+        if (!Number.isSafeInteger(value) || value <= 0) {
+          throw new HarmostNextError('--replicas must be a positive integer');
+        }
+        options.replicas = value;
         break;
       }
       case '--rollout': {
@@ -261,9 +281,14 @@ export async function main(argv) {
     return result.ok ? 0 : 1;
   }
 
-  if (options.upstreams.length > 0 && options.concurrency === null) {
+  if (
+    options.upstreams.length > 0 &&
+    options.concurrency === null &&
+    options.globalConcurrency === null &&
+    options.replicas === null
+  ) {
     throw new HarmostNextError(
-      'a complete configuration requires --concurrency; measure the origin instead of shipping the old 200-request placeholder',
+      'a complete configuration requires --concurrency, or --global-concurrency with --replicas',
     );
   }
 
@@ -275,7 +300,9 @@ export async function main(argv) {
     process.stdout.write(
       generateConfig(build, {
         upstreams: options.upstreams,
-        concurrency: options.concurrency ?? 200,
+        concurrency: options.concurrency,
+        globalConcurrency: options.globalConcurrency,
+        replicas: options.replicas,
         includeDeployment: !options.routesOnly,
         policy,
         rollout: options.rollout,
@@ -289,6 +316,8 @@ export async function main(argv) {
     out: options.out,
     upstreams: options.upstreams,
     concurrency: options.concurrency,
+    globalConcurrency: options.globalConcurrency,
+    replicas: options.replicas,
     includeDeployment: !options.routesOnly,
     check: options.check,
     harmostBin: options.harmostBin,

@@ -229,12 +229,24 @@ impl Admin {
         );
         let _ = write!(
             s,
-            "\"schema_version\":{},\"generation\":{},\"fingerprint\":{},\"routes\":{},\"features\":[",
+            "\"schema_version\":{},\"generation\":{},\"fingerprint\":{},\"routes\":{},\"capacity\":",
             crate::config::SCHEMA_VERSION,
             policy.generation,
             policy.fingerprint,
             cfg.routes.len()
         );
+        match &cfg.capacity {
+            Some(group) => {
+                let allocated = cfg.origin.concurrency.max * group.replicas;
+                let _ = write!(
+                    s,
+                    "{{\"global_max\":{},\"replicas\":{},\"per_replica\":{},\"allocated\":{allocated}}}",
+                    group.global_max, group.replicas, cfg.origin.concurrency.max
+                );
+            }
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"features\":[");
         let mut first = true;
         for feature in compiled_features() {
             if !first {
@@ -994,6 +1006,25 @@ mod tests {
         ] {
             assert!(body.contains(expected), "missing {expected} in {body}");
         }
+    }
+
+    #[test]
+    fn the_status_document_exposes_the_replica_group_budget() {
+        let a = admin(false);
+        let mut cfg = a.policy.load().config.clone();
+        cfg.origin.concurrency.max = 4;
+        cfg.capacity = Some(crate::config::schema::CapacityGroup {
+            global_max: 9,
+            replicas: 2,
+        });
+        a.policy.store(PolicySnapshot::build(cfg, 8).unwrap());
+        let body = a.status_body();
+        assert!(
+            body.contains(
+                r#""capacity":{"global_max":9,"replicas":2,"per_replica":4,"allocated":8}"#
+            ),
+            "{body}"
+        );
     }
 
     /// A backend that passes its probe and fails its renders is the case

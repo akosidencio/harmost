@@ -1,4 +1,5 @@
 export { readBuild, HarmostNextError } from './manifests.js';
+export { resolveCapacity } from './capacity.js';
 export { generateConfig, inspectRoutes, toGlob, routeId } from './routes.js';
 export {
   POLICY_VERSION,

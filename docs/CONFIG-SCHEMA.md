@@ -81,6 +81,7 @@ needs to change:
 | Key | Added with | Default |
 |---|---|---|
 | `mode` | staged Next.js rollout | `protect` |
+| `capacity` | static multi-replica budget partition | absent |
 | `server.h2c` | protocol coverage | `false` |
 | `server.tls` | TLS termination | absent |
 | `server.trusted_proxies` | forwarded-header trust | trusts nobody |
@@ -104,6 +105,10 @@ Two of those are worth acting on rather than merely noting:
 - **`mode: observe` does not protect the origin.** It records classification
   and telemetry while bypassing admission, caching, coalescing, and spooling.
   Use it only as the first rollout stage.
+
+- **`capacity` declares a static replica partition.** Harmost verifies that
+  `origin.concurrency.max × capacity.replicas` does not exceed
+  `capacity.global_max`. The orchestrator must enforce the replica count.
 
 - **`server.graceful.pid_file` and `upgrade_socket` default to `/tmp`.** Two
   Harmost processes on one host with the defaults will hand each other their
@@ -152,6 +157,7 @@ running.
 | An `origin.priorities` share that floors to a ceiling of 0 | Every request at that priority would be refused. |
 | `route.priority` with uniform `origin.priorities` | Every priority competes for the same ceiling. |
 | `route.weight` above any ceiling it is charged against | No request on the route could ever be admitted. |
+| Replica allocation above `capacity.global_max` | Copying a local ceiling across replicas would exceed the declared group budget. |
 | `cache.purge.token` with no `telemetry.admin` | Nothing is listening for the endpoint it secures. |
 | `cache.tag_header` naming a *request* header (`Cookie`, `Accept`, …) | Tags decide what a purge destroys; taking them from the client hands that decision to the client. |
 

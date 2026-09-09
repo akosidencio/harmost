@@ -1,4 +1,5 @@
 import { HARMOST_SCHEMA_VERSION } from './compat.js';
+import { resolveCapacity } from './capacity.js';
 import { normalizeRouteName, policyFingerprint, validatePolicy } from './policy.js';
 import { Lines, inlineList, quote } from './yaml.js';
 
@@ -62,7 +63,6 @@ export function generateConfig(build, options = {}) {
     includeDeployment = true,
     staleIfError = '1m',
     upstreams = [],
-    concurrency = 200,
     lowPriorityPercent = 30,
     policy: policyInput = null,
     rollout = 'cache',
@@ -70,9 +70,14 @@ export function generateConfig(build, options = {}) {
   if (!['observe', 'protect', 'coalesce', 'cache'].includes(rollout)) {
     throw new TypeError(`rollout must be observe, protect, coalesce, or cache; got ${rollout}`);
   }
+  const capacity = resolveCapacity(options);
+  const concurrency = capacity.concurrency;
   const policy = policyInput ? validatePolicy(policyInput, build) : { version: 1, routes: {} };
-  const imageWeight = upstreams.length > 0 ? Math.min(4, concurrency) : 4;
-  const effectiveLowPriorityPercent = upstreams.length > 0
+  const imageUsesPriority = upstreams.length === 0 || concurrency > 1;
+  const imageWeight = upstreams.length > 0
+    ? Math.min(4, Math.max(1, concurrency - 1))
+    : 4;
+  const effectiveLowPriorityPercent = upstreams.length > 0 && imageUsesPriority
     ? Math.max(lowPriorityPercent, Math.ceil((imageWeight * 100) / concurrency))
     : lowPriorityPercent;
   const base = build.basePath || '';
@@ -136,8 +141,22 @@ export function generateConfig(build, options = {}) {
     out.raw(`  upstreams: ${inlineList(upstreams)}`);
     out.raw('  concurrency:');
     out.raw(`    max: ${concurrency}`);
-    out.raw('  priorities:');
-    out.raw(`    low: ${effectiveLowPriorityPercent}`);
+    if (imageUsesPriority) {
+      out.raw('  priorities:');
+      out.raw(`    low: ${effectiveLowPriorityPercent}`);
+    }
+  }
+
+  if (capacity.group) {
+    out.raw();
+    out.comment(
+      'Static replica partition. Each Harmost process enforces the local\n' +
+        'origin ceiling above; their declared sum cannot exceed this group\n' +
+        'budget. Keep the orchestrator at or below `replicas`.',
+    );
+    out.raw('capacity:');
+    out.raw(`  global_max: ${capacity.group.globalMax}`);
+    out.raw(`  replicas: ${capacity.group.replicas}`);
   }
 
   out.raw();
@@ -161,7 +180,7 @@ export function generateConfig(build, options = {}) {
   out.raw(`  - id: ${quote(routeId('next-image', taken))}`);
   out.raw(`    match: ${quote(p('/_next/image'))}`);
   out.raw('    class: public_dynamic');
-  out.raw('    priority: low');
+  if (imageUsesPriority) out.raw('    priority: low');
   out.raw(`    weight: ${imageWeight}`);
   out.raw('    cache:');
   out.raw('      ttl:');

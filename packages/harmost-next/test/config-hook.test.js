@@ -140,5 +140,25 @@ test(
 test('a complete generated config requires an explicit measured ceiling', async () => {
   const { result } = await runHook({ distDir: FIXTURE, upstreams: ['next-1:3000'] });
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /explicit `concurrency`/);
+  assert.match(result.stderr, /requires `concurrency`/);
+});
+
+test('a group budget writes its conservative allocation into config and identity', async () => {
+  const { out, dir, result } = await runHook({
+    distDir: FIXTURE,
+    upstreams: ['next-1:3000'],
+    globalConcurrency: 9,
+    replicas: 2,
+  });
+  assert.equal(result.code ?? 0, 0, result.stderr);
+  const yaml = await readFile(out, 'utf8');
+  const identity = JSON.parse(await readFile(path.join(dir, 'harmost.deployment.json'), 'utf8'));
+  assert.match(yaml, /concurrency:\n    max: 4/);
+  assert.match(yaml, /capacity:\n  global_max: 9\n  replicas: 2/);
+  assert.deepEqual(identity.capacity, {
+    global_max: 9,
+    replicas: 2,
+    allocated: 8,
+    unallocated: 1,
+  });
 });
