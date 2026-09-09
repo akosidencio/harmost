@@ -18,6 +18,10 @@ pub struct Config {
     #[serde(default)]
     pub server: Server,
     pub origin: Origin,
+    /// Optional static partition of one origin-work budget across a bounded
+    /// Harmost replica group.
+    #[serde(default)]
+    pub capacity: Option<CapacityGroup>,
     #[serde(default)]
     pub health: Option<Health>,
     #[serde(default)]
@@ -51,6 +55,15 @@ pub enum Mode {
     Observe,
     #[default]
     Protect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityGroup {
+    /// Maximum combined origin work across the declared replica group.
+    pub global_max: usize,
+    /// Maximum number of simultaneously active Harmost replicas.
+    pub replicas: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -41,16 +41,23 @@ function assertPath(path) {
  */
 export function createPurger(options = {}) {
   const {
-    endpoint = process.env.HARMOST_PURGE_URL,
     token = process.env.HARMOST_PURGE_TOKEN,
     timeoutMs = 2000,
     fetch: fetchImpl = globalThis.fetch,
   } = options;
+  const configuredEndpoints = options.endpoints ?? (
+    options.endpoint
+      ? [options.endpoint]
+      : process.env.HARMOST_PURGE_URLS
+        ? process.env.HARMOST_PURGE_URLS.split(',').map((value) => value.trim()).filter(Boolean)
+        : process.env.HARMOST_PURGE_URL
+          ? [process.env.HARMOST_PURGE_URL]
+          : []
+  );
 
-  if (!endpoint) {
+  if (!Array.isArray(configuredEndpoints) || configuredEndpoints.length === 0) {
     throw new HarmostNextError(
-      'no Harmost endpoint: pass `endpoint` or set HARMOST_PURGE_URL to the admin listener, ' +
-        'for example http://127.0.0.1:9091',
+      'no Harmost endpoint: pass `endpoint`/`endpoints`, or set HARMOST_PURGE_URL(S) to the admin listener(s)',
     );
   }
   if (!token) {
@@ -63,9 +70,10 @@ export function createPurger(options = {}) {
     throw new HarmostNextError('no fetch available; pass one explicitly');
   }
 
-  const base = new URL('/purge', endpoint);
+  const bases = [...new Set(configuredEndpoints.map((endpoint) => new URL('/purge', endpoint).href))]
+    .map((endpoint) => new URL(endpoint));
 
-  async function send(params, description) {
+  async function sendOne(base, params, description) {
     const url = new URL(base);
     // Harmost percent-decodes every value exactly once. URLSearchParams keeps
     // delimiters inside tags and paths from changing the shape of the query.
@@ -98,14 +106,14 @@ export function createPurger(options = {}) {
 
     if (response.status >= 300 && response.status < 400) {
       throw new HarmostNextError(
-        `purge endpoint answered a ${response.status} redirect; refusing to re-send the token ` +
+        `purge endpoint at ${url.origin} answered a ${response.status} redirect; refusing to re-send the token ` +
           'to another host',
       );
     }
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
       throw new HarmostNextError(
-        `purge (${description}) failed: HTTP ${response.status} ${detail.trim()}`.trim(),
+        `purge (${description}) at ${url.origin} failed: HTTP ${response.status} ${detail.trim()}`.trim(),
       );
     }
     let result;
@@ -113,7 +121,7 @@ export function createPurger(options = {}) {
       result = await response.json();
     } catch (cause) {
       throw new HarmostNextError(
-        `purge (${description}) returned HTTP ${response.status} with invalid JSON`,
+        `purge (${description}) at ${url.origin} returned HTTP ${response.status} with invalid JSON`,
         { cause },
       );
     }
@@ -126,10 +134,23 @@ export function createPurger(options = {}) {
       result.entries < 0
     ) {
       throw new HarmostNextError(
-        `purge (${description}) returned HTTP ${response.status} with an invalid success body`,
+        `purge (${description}) at ${url.origin} returned HTTP ${response.status} with an invalid success body`,
       );
     }
     return result;
+  }
+
+  async function send(params, description) {
+    const results = await Promise.all(
+      bases.map((base) => sendOne(base, params, description)),
+    );
+    if (results.length === 1) return results[0];
+    return {
+      purged: true,
+      entries: results.reduce((sum, result) => sum + result.entries, 0),
+      replicas: results.length,
+      results,
+    };
   }
 
   return {

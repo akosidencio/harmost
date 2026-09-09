@@ -721,13 +721,12 @@ Ingress ──▶ Service/harmost ──▶ Deployment/harmost (2 replicas)
 
 with `upstreams: ["web.default.svc.cluster.local:3000"]`.
 
-Keep the Harmost replica count low. Coalescing only collapses requests that
-reach the *same* instance, so replicas divide the benefit — and an autoscaler
-that adds replicas during a spike reduces collapsing exactly when it is most
-wanted. Concurrency limits are also per process: two replicas configured with a
-ceiling of 100 can admit up to 200 origin requests between them. Size the
-per-process limit accordingly. If you need more than a few replicas, have the
-Ingress consistent-hash on path so one key lands on one instance.
+Keep the Harmost replica count low and declare one group budget when generating
+configuration. For example, `--global-concurrency 80 --replicas 2` emits a
+local ceiling of 40 and a `capacity` contract that Harmost validates. Keep the
+Deployment at or below that replica count. Have the Ingress consistently hash
+the URI so one key normally lands on one local cache; correctness and privacy
+do not depend on that affinity.
 
 #### Where this does not work
 
@@ -1041,6 +1040,10 @@ npx harmost-next generate \
   --check
 ```
 
+For a replica group, replace `--concurrency 40` with
+`--global-concurrency 80 --replicas 2`. Division rounds down, so the generated
+sum never exceeds the declared origin-work budget.
+
 The build or Next.js deployment identity becomes `deployment.id`; prerendered routes become `public_ssr`
 with a TTL from their `initialRevalidateSeconds`; Route Handlers and
 dynamically rendered pages become `private_dynamic`; `/_next/image` is
@@ -1117,6 +1120,10 @@ that invalidates a cache gets fetched by crawlers and link prefetchers; an open
 purge endpoint is a stampede trigger anybody can pull. A misspelled parameter
 is a `400` rather than a quiet success, for the same reason unknown config keys
 are refused.
+
+**Replicated purges must reach every process.** `@harmost/next` accepts all
+admin listeners through `endpoints` or `HARMOST_PURGE_URLS` and fails if any
+local cache cannot be invalidated.
 
 **Deployment rollovers need no call at all.** The cache key already carries
 `deployment.id`, so a build's entries become unreachable the moment it changes

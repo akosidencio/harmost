@@ -3,6 +3,7 @@ import { renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
+import { resolveCapacity } from './capacity.js';
 import { HarmostNextError, readBuildSync } from './manifests.js';
 import { policyFingerprint, readPolicySync, validatePolicy } from './policy.js';
 import { generateConfig } from './routes.js';
@@ -35,6 +36,8 @@ export function generateToFile(options = {}) {
     out,
     upstreams = [],
     concurrency = null,
+    globalConcurrency = null,
+    replicas = null,
     includeDeployment = true,
     check = false,
     harmostBin: bin,
@@ -45,11 +48,10 @@ export function generateToFile(options = {}) {
   } = options;
 
   if (!out) throw new HarmostNextError('generateToFile needs an `out` path');
-  if (upstreams.length > 0 && concurrency === null) {
-    throw new HarmostNextError(
-      'a complete configuration requires an explicit `concurrency`; measure the origin instead of shipping the old 200-request placeholder',
-    );
-  }
+  const capacity = resolveCapacity(
+    { concurrency, globalConcurrency, replicas },
+    { requireExplicit: upstreams.length > 0 },
+  );
 
   const build = readBuildSync(distDir);
   if (policyInput && policyFile) {
@@ -60,10 +62,11 @@ export function generateToFile(options = {}) {
     : policyInput
       ? validatePolicy(policyInput, build)
       : null;
-  const effectiveConcurrency = concurrency ?? 200;
   const yaml = generateConfig(build, {
     upstreams,
-    concurrency: effectiveConcurrency,
+    concurrency: capacity.group ? null : capacity.concurrency,
+    globalConcurrency,
+    replicas,
     includeDeployment,
     policy,
     rollout,
@@ -78,7 +81,15 @@ export function generateToFile(options = {}) {
     next_deployment_id: build.deploymentId,
     build_fingerprint: build.fingerprint,
     policy_fingerprint: policyFingerprint(policy),
-    concurrency: upstreams.length > 0 ? effectiveConcurrency : null,
+    concurrency: upstreams.length > 0 ? capacity.concurrency : null,
+    capacity: capacity.group
+      ? {
+          global_max: capacity.group.globalMax,
+          replicas: capacity.group.replicas,
+          allocated: capacity.group.allocated,
+          unallocated: capacity.group.unallocated,
+        }
+      : null,
     rollout,
   }, null, 2)}\n`;
   const result = {

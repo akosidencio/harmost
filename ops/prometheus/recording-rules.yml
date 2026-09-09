@@ -7,6 +7,11 @@ groups:
           sum by (job, instance, limiter) (harmost_origin_in_flight)
           / clamp_min(sum by (job, instance, limiter) (harmost_concurrency_limit), 1)
 
+      - record: harmost:group_admission_saturation:ratio
+        expr: >-
+          sum by (job, limiter) (harmost_origin_in_flight)
+          / clamp_min(sum by (job, limiter) (harmost_concurrency_limit), 1)
+
       - record: harmost:shed_rate:ratio5m
         expr: >-
           sum by (job, instance, route) (rate(harmost_admission_total{decision=~"shed_.*"}[5m]))

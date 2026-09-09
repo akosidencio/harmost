@@ -152,6 +152,8 @@ nothing but Node.
 --upstream <ADDR>    Repeatable. With at least one, the output is a complete
                      config; with none, it is routes only.
 --concurrency <N>    Required with --upstream. Measure this origin ceiling.
+--global-concurrency <N> One budget for a Harmost replica group.
+--replicas <N>       Maximum replicas sharing the global budget.
 --rollout <STAGE>    observe, protect, coalesce, or cache.
 --out <FILE>         Write here instead of stdout.
 --identity-out <FILE> Deployment identity artifact path.
@@ -164,6 +166,11 @@ nothing but Node.
 `concurrency` is the one number that has to come from your own measurement: it
 is the ceiling on how much work the origin does at once, and the right value is
 a property of your renders and your hardware, not of your framework.
+
+For multiple Harmost processes, use `--global-concurrency` with `--replicas`
+instead. Generation divides down conservatively, records the allocation in
+`capacity` and the identity artifact, and refuses incomplete or conflicting
+inputs.
 
 ### Inspect, explain, doctor, and calibrate
 
@@ -216,7 +223,7 @@ Or without Next in the loop — from a deploy hook, a CLI, a webhook:
 import { createPurger } from '@harmost/next';
 
 const harmost = createPurger({
-  endpoint: process.env.HARMOST_PURGE_URL,   // the ADMIN listener
+  endpoints: process.env.HARMOST_PURGE_URLS.split(','), // every ADMIN listener
   token: process.env.HARMOST_PURGE_TOKEN,
 });
 
@@ -279,8 +286,8 @@ runs natively.
 - **No `revalidatePath()` route patterns.** Harmost purges by exact path, so
   `revalidatePath('/products/[slug]', 'page')` has no equivalent; matching a
   dynamic route pattern needs route metadata Harmost does not carry.
-- **No fan-out.** Harmost's cache is per process, so a purge reaches one
-  instance. Call every replica, or accept that invalidation is eventually
-  consistent within one TTL.
+- **Replica fan-out is explicit.** Harmost's cache is per process. Pass every
+  admin listener through `endpoints` or `HARMOST_PURGE_URLS`; the purge fails
+  if any replica cannot be invalidated.
 - **No inferred route cost.** Nothing in a Next build says what a page costs
   to render. Set `weight` explicitly in the assertion file.

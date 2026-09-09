@@ -5,11 +5,21 @@ identical standalone Next.js origins. The origins share Next.js cache and tag
 state through a mounted cache directory. Only the edge listener is public; the
 Harmost admin and metrics listeners and direct origin ports bind to loopback.
 
+A second topology runs two Harmost replicas behind URI-stable ingress. Each
+replica keeps local cache and admission state while a static partition keeps
+their combined origin-work allocation inside one declared budget.
+
 ## Build and start
 
 ```bash
 cargo build --locked
 docker compose -f compose.nextjs.yaml up --build -d
+```
+
+Run the replicated topology with:
+
+```bash
+docker compose -f compose.nextjs.yaml -f compose.nextjs-replicated.yaml up --build -d
 ```
 
 All origins use one image, one `deploymentId`, and one Server Action encryption
@@ -46,6 +56,22 @@ Generation writes `harmost.deployment.json` beside the configuration. Commit
 the assertion file; treat generated configuration and identity files as build
 artifacts.
 
+For several Harmost replicas, declare the group budget instead of copying a
+local ceiling to every process:
+
+```bash
+node packages/harmost-next/src/cli.js generate \
+  --dist-dir fixtures/next-storefront/.next \
+  --policy fixtures/next-storefront/harmost.next.yaml \
+  --upstream next-1:3000 --upstream next-2:3000 --upstream next-3:3000 \
+  --global-concurrency 8 --replicas 2 \
+  --out /tmp/harmost-replicated.yaml --check
+```
+
+This allocates four units to each process. Harmost rejects a configuration
+whose declared replica sum exceeds `capacity.global_max`; the orchestrator
+must keep its active replica count at or below `capacity.replicas`.
+
 ## Roll out in stages
 
 Generate each stage with `--rollout <stage>`, validate it, then reload Harmost.
@@ -57,7 +83,7 @@ Move to the next stage only when the dashboard matches the expected behavior.
 | `protect` | Fixed admission and bounded queues | In-flight work stays below the ceiling; no cache hits | Reload `observe` configuration |
 | `coalesce` | Public requests may share one in-flight render | Origin requests fall during identical bursts; cache stays empty | Reload `protect` configuration |
 | `cache` | Short caching for approved routes | Hits rise and origin work falls; invalidation remains scoped | Reload `coalesce` configuration |
-| replicate | Add Harmost replicas after Phase 6 capacity tests | Group capacity remains within its declared budget | Return ingress to one Harmost replica |
+| replicate | Add statically partitioned Harmost replicas | Group capacity remains within its declared budget | Return ingress to one Harmost replica |
 
 Every generated stage keeps the same route privacy decisions. The `observe`
 mode disables admission, cache, coalescing, and spooling in the proxy itself,
@@ -97,6 +123,19 @@ Use the recommendation as a starting point for review. Repeat the measurement
 on production hardware with representative renders and monitoring before
 raising the fixed ceiling.
 
+## Replica behavior
+
+The replicated edge hashes the URI consistently, preserving local cache and
+coalescing value without making correctness depend on affinity. Configure
+`@harmost/next` with every admin listener through `endpoints` or
+`HARMOST_PURGE_URLS`; a fan-out purge fails if any local cache cannot be
+invalidated.
+
+The reference keeps static partitioning authoritative. Capacity leases and
+adaptive limits add coordination and failure modes without evidence that the
+fixed allocation is insufficient. Distributed Harmost caching and coalescing
+remain deferred for the same reason.
+
 ## Verify
 
 The HTTP and browser suites cover public/private isolation, RSC variants,
@@ -109,7 +148,11 @@ metrics, and progressive streaming.
 ./bench/nextjs.sh
 ./bench/nextjs-browser.sh
 ./bench/nextjs-reference.sh
+./bench/nextjs-replicas.sh
 ```
+
+The replica suite checks the combined budget, URI affinity, purge fan-out,
+abrupt loss of one governor, continued service, and recovery into the pool.
 
 Production sign-off still requires an independent cache-safety review, an
 artifact/rollback exercise, staging validation, and a sustained deployment
