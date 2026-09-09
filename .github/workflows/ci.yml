@@ -34,6 +34,9 @@ jobs:
       # pingora builds its TLS bindings from source.
       - name: Install build dependencies
         run: |
+          # The hosted image adds Chrome's apt source, which these jobs do not
+          # use and which can transiently publish mismatched index metadata.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang cmake libssl-dev pkg-config
@@ -156,6 +159,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang cmake libssl-dev pkg-config
@@ -258,6 +262,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang cmake libssl-dev pkg-config

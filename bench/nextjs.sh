@@ -90,15 +90,15 @@ echo
 echo "3/11 HTML and React Server Component payloads use separate cache keys"
 RSC_PATH="/products/rsc-$RUN_ID"
 RSC_URL="$PROXY_URL$RSC_PATH"
-# This is the router tree emitted by the fixture homepage. Next canonicalizes
-# the placeholder `_rsc` value once, just as its browser client does, before it
-# returns the actual component payload.
+# This is the router tree emitted by the fixture homepage. An RSC request with
+# no `_rsc` cache-buster makes Next return the canonical URL used by its browser
+# client before it returns the actual component payload.
 RSC_TREE='%5B%22%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%2C4096%5D%7D%2Cnull%2Cnull%2C4112%5D'
 BEFORE=$(metric_sum products)
 curl -fsS -D "$RESULT_DIR/html.headers" -o "$RESULT_DIR/html.body" "$RSC_URL"
 curl -sS -D "$RESULT_DIR/rsc-redirect.headers" -o /dev/null \
   -H 'RSC: 1' -H 'Next-Url: /' -H "Next-Router-State-Tree: $RSC_TREE" \
-  "$RSC_URL?_rsc=fixture"
+  "$RSC_URL"
 RSC_LOCATION=$(sed -n 's/^location: //Ip' "$RESULT_DIR/rsc-redirect.headers" | tr -d '\r' | tail -1)
 case "$RSC_LOCATION" in
   "$RSC_PATH"'?_rsc='*) ;;
