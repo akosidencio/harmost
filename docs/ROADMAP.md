@@ -3,11 +3,6 @@
 Harmost protects expensive SSR and dynamic origin workloads. It remains a
 working prototype without sustained production validation.
 
-## 5. Complete the Next.js production reference
-
-- Validate the [production reference](./NEXTJS-PRODUCTION-REFERENCE.md) in a production-shaped staging environment.
-- Complete an independent [cache-safety review](./CACHE-KEY-REVIEW.md), published-artifact and rollback verification, and a sustained deployment report.
-
 ## 6. Validate scaling across Harmost replicas
 
 - Partition one global origin-work budget across replicas and test scaling, failures, and recovery.
