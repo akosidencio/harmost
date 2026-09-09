@@ -1,9 +1,14 @@
 # Real Next.js integration fixture: one Harmost process governing three
 # independently identifiable standalone origins.
 version: 1
+mode: protect
 
 server:
   listen: "0.0.0.0:8080"
+  trusted_proxies:
+    from: ["172.16.0.0/12"]
+    client_ip: x_forwarded
+    scheme: x_forwarded
 
 origin:
   upstreams:
@@ -33,6 +38,9 @@ cache:
   store: memory
   max_memory: 64MiB
   max_body_size: 4MiB
+  tag_header: "x-next-cache-tags"
+  purge:
+    token: "nextjs-reference-purge-token-0001"
 
 coalesce:
   enabled: true
@@ -227,5 +235,8 @@ routes:
 telemetry:
   prometheus:
     listen: "0.0.0.0:9090"
+  admin:
+    listen: "0.0.0.0:9091"
+    require_healthy_upstream: true
   logging:
     format: json

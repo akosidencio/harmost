@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 import { SUPPORTED_MANIFESTS } from './compat.js';
@@ -45,23 +46,28 @@ function missing(file, cause) {
 }
 
 /** Assemble the shape the generator consumes. */
-function assemble(buildId, routes, prerender, appPaths) {
+function assemble(buildId, routes, prerender, appPaths, pagesManifest) {
   if (!buildId) {
     throw new HarmostNextError('BUILD_ID is empty; that cannot identify a deployment');
   }
-  return {
+  const build = {
     buildId,
+    deploymentId: routes.deploymentId ?? null,
+    identity: routes.deploymentId || buildId,
     basePath: routes.basePath || '',
     staticRoutes: routes.staticRoutes ?? [],
     dynamicRoutes: routes.dynamicRoutes ?? [],
     dataRoutes: routes.dataRoutes ?? [],
     prerendered: prerender?.routes ?? {},
     appPaths: appPaths ?? {},
+    pagePaths: Object.keys(pagesManifest ?? {}).filter((name) => !name.startsWith('/_') && !['/404', '/500'].includes(name)),
     manifestVersions: {
       routes: routes.version,
       prerender: prerender?.version ?? null,
     },
   };
+  build.fingerprint = createHash('sha256').update(JSON.stringify(build)).digest('hex');
+  return build;
 }
 
 /**
@@ -85,7 +91,7 @@ export async function readBuild(distDir) {
   };
 
   const idFile = path.join(distDir, 'BUILD_ID');
-  const [buildId, routes, prerender, appPaths] = await Promise.all([
+  const [buildId, routes, prerender, appPaths, pagesManifest] = await Promise.all([
     readFile(idFile, 'utf8').then(
       (id) => id.trim(),
       (cause) => {
@@ -95,8 +101,9 @@ export async function readBuild(distDir) {
     read('routes-manifest.json'),
     read('prerender-manifest.json', true),
     read('app-path-routes-manifest.json', true),
+    read('server/pages-manifest.json', true),
   ]);
-  return assemble(buildId, routes, prerender, appPaths);
+  return assemble(buildId, routes, prerender, appPaths, pagesManifest);
 }
 
 /**
@@ -130,5 +137,6 @@ export function readBuildSync(distDir) {
     read('routes-manifest.json'),
     read('prerender-manifest.json', true),
     read('app-path-routes-manifest.json', true),
+    read('server/pages-manifest.json', true),
   );
 }

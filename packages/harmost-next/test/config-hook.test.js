@@ -38,16 +38,30 @@ async function runHook(hookOptions, { fail = false, initial } = {}) {
 }
 
 test('a production build writes the config on the way out', async () => {
-  const { out, result } = await runHook({ distDir: FIXTURE, upstreams: ['next-1:3000'] });
+  const { out, dir, result } = await runHook({
+    distDir: FIXTURE,
+    upstreams: ['next-1:3000'],
+    concurrency: 8,
+  });
   assert.equal(result.code ?? 0, 0, result.stderr);
   const yaml = await readFile(out, 'utf8');
+  const identity = JSON.parse(await readFile(path.join(dir, 'harmost.deployment.json'), 'utf8'));
   assert.match(yaml, /^version: 1$/m);
   assert.match(yaml, /^deployment:$/m);
+  assert.equal(identity.build_id, identity.next_build_id);
+  assert.match(identity.build_fingerprint, /^[a-f0-9]{64}$/);
+  assert.equal(identity.policy_fingerprint, 'none');
+  assert.equal(identity.rollout, 'cache');
   assert.match(result.stdout, /@harmost\/next: wrote/);
 });
 
 test('silent means silent', async () => {
-  const { result } = await runHook({ distDir: FIXTURE, upstreams: ['x:3000'], silent: true });
+  const { result } = await runHook({
+    distDir: FIXTURE,
+    upstreams: ['x:3000'],
+    concurrency: 8,
+    silent: true,
+  });
   assert.equal(result.code ?? 0, 0, result.stderr);
   assert.equal(result.stdout, '');
 });
@@ -56,7 +70,7 @@ test('a failed build generates nothing', async () => {
   // Generating a route policy from a half-finished build would leave a stale
   // file that looks current.
   const { out, result } = await runHook(
-    { distDir: FIXTURE, upstreams: ['next-1:3000'] },
+    { distDir: FIXTURE, upstreams: ['next-1:3000'], concurrency: 8 },
     { fail: true },
   );
   assert.equal(result.code, 7, "the build's own exit code must survive");
@@ -95,6 +109,7 @@ test('a failed check preserves the last valid config and removes its temporary f
       // platform-specific shell script.
       harmostBin: process.execPath,
       upstreams: ['127.0.0.1:3000'],
+      concurrency: 8,
     },
     { initial },
   );
@@ -113,6 +128,7 @@ test(
     const { result } = await runHook({
       distDir: FIXTURE,
       upstreams: ['127.0.0.1:3000'],
+      concurrency: 8,
       check: true,
       harmostBin: BINARY,
     });
@@ -120,3 +136,9 @@ test(
     assert.match(result.stdout, /harmost check passed/);
   },
 );
+
+test('a complete generated config requires an explicit measured ceiling', async () => {
+  const { result } = await runHook({ distDir: FIXTURE, upstreams: ['next-1:3000'] });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /explicit `concurrency`/);
+});

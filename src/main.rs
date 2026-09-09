@@ -596,6 +596,12 @@ fn check(path: &str) -> ExitCode {
                 env!("CARGO_PKG_VERSION")
             );
             println!("  {upstreams} upstream(s), {routes} route(s)");
+            match cfg.mode {
+                harmost::config::schema::Mode::Observe => println!(
+                    "  mode: observe — classification and telemetry only; admission, cache, coalescing, and spooling are disabled"
+                ),
+                harmost::config::schema::Mode::Protect => println!("  mode: protect"),
+            }
             println!(
                 "  global origin concurrency: {}",
                 cfg.origin.concurrency.max

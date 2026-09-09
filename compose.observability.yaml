@@ -58,6 +58,7 @@ services:
     volumes:
       - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./ops/prometheus/alerts.yml:/etc/prometheus/rules/harmost-alerts.yml:ro
+      - ./ops/prometheus/recording-rules.yml:/etc/prometheus/rules/harmost-recording-rules.yml:ro
     ports:
       - "127.0.0.1:19000:9090"
 

@@ -35,3 +35,4 @@ docs/*
 !docs/CONFIG-SCHEMA.md
 !docs/RELEASE-GATES.md
 !docs/ROADMAP.md
+!docs/NEXTJS-PRODUCTION-REFERENCE.md

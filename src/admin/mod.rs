@@ -219,6 +219,14 @@ impl Admin {
         // ---- configuration
         s.push_str("\"config\":{");
         field_str(&mut s, "path", &self.config_path);
+        field_str(
+            &mut s,
+            "mode",
+            match cfg.mode {
+                crate::config::schema::Mode::Observe => "observe",
+                crate::config::schema::Mode::Protect => "protect",
+            },
+        );
         let _ = write!(
             s,
             "\"schema_version\":{},\"generation\":{},\"fingerprint\":{},\"routes\":{},\"features\":[",

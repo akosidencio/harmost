@@ -57,7 +57,7 @@ pub static BYPASS_REASON: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric registration")
 });
 
-/// `decision` is one of admitted, exempt, shed_queue_full, shed_queue_timeout.
+/// `decision` is one of observe, admitted, exempt, shed_queue_full, shed_queue_timeout.
 pub static ADMISSION: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "harmost_admission_total",

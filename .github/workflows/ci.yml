@@ -34,6 +34,9 @@ jobs:
       # pingora builds its TLS bindings from source.
       - name: Install build dependencies
         run: |
+          # The hosted image adds Chrome's apt source, which these jobs do not
+          # use and which can transiently publish mismatched index metadata.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang cmake libssl-dev pkg-config
@@ -74,10 +77,12 @@ jobs:
         run: |
           python3 -c "import json; json.load(open('ops/grafana/dashboard.json'))"
           python3 -c "import yaml; yaml.safe_load(open('ops/prometheus/alerts.yml'))"
+          python3 -c "import yaml; yaml.safe_load(open('ops/prometheus/recording-rules.yml'))"
           curl -fsSL -o /tmp/prom.tar.gz \
             https://github.com/prometheus/prometheus/releases/download/v2.53.2/prometheus-2.53.2.linux-amd64.tar.gz
           tar -xzf /tmp/prom.tar.gz -C /tmp
-          /tmp/prometheus-2.53.2.linux-amd64/promtool check rules ops/prometheus/alerts.yml
+          /tmp/prometheus-2.53.2.linux-amd64/promtool check rules \
+            ops/prometheus/alerts.yml ops/prometheus/recording-rules.yml
 
   # A dependency advisory is a finding about code this binary runs at full
   # privilege, so it gates like any other. Ignores live in `.cargo/audit.toml`
@@ -154,6 +159,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang cmake libssl-dev pkg-config
@@ -228,11 +234,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the doctor validation binary
+        run: cargo build --locked
+
       - name: HTTP assertions
         run: ./bench/nextjs.sh
 
       - name: Browser-driven assertions
         run: ./bench/nextjs-browser.sh
+
+      - name: Production-reference assertions
+        run: ./bench/nextjs-reference.sh
 
   # Fuzz targets are built on every run so a target cannot rot unnoticed, and
   # run briefly. A short run is a smoke test, not a campaign: it catches a
@@ -248,6 +262,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang cmake libssl-dev pkg-config

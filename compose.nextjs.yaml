@@ -1,8 +1,12 @@
 name: harmost-nextjs-fixture
 
 x-next-origin: &next-origin
+  image: harmost-next-origin:reference
   build:
     context: ./fixtures/next-storefront
+    args:
+      HARMOST_BUILD_ID: next-fixture-v1
+      NEXT_SERVER_ACTIONS_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
   expose:
     - "3000"
   healthcheck:
@@ -11,25 +15,41 @@ x-next-origin: &next-origin
     timeout: 1s
     retries: 30
   restart: unless-stopped
+  environment: &next-environment
+    HARMOST_BUILD_ID: next-fixture-v1
+    HARMOST_DOCTOR_TOKEN: nextjs-reference-doctor-token
+    NEXT_SHARED_CACHE_DIR: /var/cache/next
+    NEXT_PRIVATE_MINIMAL_MODE: "1"
+  volumes:
+    - next-cache:/var/cache/next
 
 services:
   next-1:
     <<: *next-origin
     environment:
+      <<: *next-environment
       INSTANCE_ID: next-1
       RENDER_DELAY_MS: "350"
+    ports:
+      - "127.0.0.1:13001:3000"
 
   next-2:
     <<: *next-origin
     environment:
+      <<: *next-environment
       INSTANCE_ID: next-2
       RENDER_DELAY_MS: "350"
+    ports:
+      - "127.0.0.1:13002:3000"
 
   next-3:
     <<: *next-origin
     environment:
+      <<: *next-environment
       INSTANCE_ID: next-3
       RENDER_DELAY_MS: "350"
+    ports:
+      - "127.0.0.1:13003:3000"
 
   harmost:
     build:
@@ -42,8 +62,24 @@ services:
       next-3:
         condition: service_healthy
     volumes:
-      - ./bench/nextjs.yaml:/etc/harmost/harmost.yaml:ro
+      - ${HARMOST_CONFIG_DIR:-./bench}:/etc/harmost:ro
+    expose:
+      - "8080"
+    ports:
+      - "127.0.0.1:19090:9090"
+      - "127.0.0.1:19091:9091"
+    stop_grace_period: 25s
+    command: ["run", "--config", "/etc/harmost/nextjs.yaml"]
+
+  edge:
+    image: nginx:1.27-alpine
+    depends_on:
+      - harmost
+    volumes:
+      - ./ops/edge/nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "127.0.0.1:18080:8080"
-      - "127.0.0.1:19090:9090"
-    stop_grace_period: 10s
+    restart: unless-stopped
+
+volumes:
+  next-cache:
