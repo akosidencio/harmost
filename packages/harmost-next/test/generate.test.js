@@ -95,6 +95,13 @@ test('the build id becomes the deployment id', () => {
   assert.ok(yaml.includes(`id: "${build.buildId}"`), yaml.slice(0, 400));
 });
 
+test('a stable Next deployment id takes precedence over the data build id', () => {
+  const withDeployment = { ...build, deploymentId: 'storefront-production', identity: 'storefront-production' };
+  const output = generateConfig(withDeployment, { upstreams: ['next-1:3000'] });
+  assert.match(output, /deployment:\n  id: "storefront-production"/);
+  assert.match(output, new RegExp(`/_next/data/${build.buildId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`));
+});
+
 test('the image route carries the Accept vary that makes it cache at all', () => {
   // Without Accept in the key Harmost refuses to store the response and the
   // route gets a 0% hit rate. Generating it wrong would be worse than not

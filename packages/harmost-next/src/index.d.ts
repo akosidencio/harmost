@@ -2,13 +2,37 @@
 export interface NextBuild {
   /** The Next build id, from `.next/BUILD_ID`. Becomes `deployment.id`. */
   buildId: string;
+  deploymentId: string | null;
+  identity: string;
   basePath: string;
   staticRoutes: Array<{ page: string }>;
   dynamicRoutes: Array<{ page: string }>;
   dataRoutes: Array<{ page?: string }>;
   prerendered: Record<string, { initialRevalidateSeconds?: number | false }>;
   appPaths: Record<string, string>;
+  pagePaths: string[];
   manifestVersions: { routes: number; prerender: number | null };
+  fingerprint: string;
+}
+
+export interface RouteAssertion {
+  privacy: 'public' | 'private';
+  weight?: number;
+  priority?: 'high' | 'normal' | 'low';
+  methods?: string[];
+  coalesce?: boolean;
+  cache?: {
+    ttl?: string;
+    stale_if_error?: string;
+    query?: string[];
+    vary?: string[];
+  };
+}
+
+export interface NextPolicy {
+  version: 1;
+  routes: Record<string, RouteAssertion>;
+  fingerprint?: string | null;
 }
 
 export interface GenerateOptions {
@@ -20,10 +44,14 @@ export interface GenerateOptions {
   staleIfError?: string;
   /** Origin addresses. With at least one, a complete config is emitted. */
   upstreams?: string[];
-  /** `origin.concurrency.max`. Default 200 — set it from your own measurement. */
+  /** `origin.concurrency.max`. Required when writing a complete config. */
   concurrency?: number;
   /** `origin.priorities.low`, which reserves the rest for page renders. */
   lowPriorityPercent?: number;
+  /** Checked-in operator assertions for dynamic routes. */
+  policy?: NextPolicy | null;
+  /** Safe rollout stage. Default `cache`. */
+  rollout?: 'observe' | 'protect' | 'coalesce' | 'cache';
 }
 
 export interface PurgeResult {
@@ -61,6 +89,16 @@ export class HarmostNextError extends Error {}
 
 export function readBuild(distDir: string): Promise<NextBuild>;
 export function generateConfig(build: NextBuild, options?: GenerateOptions): string;
+export function inspectRoutes(build: NextBuild, policy?: NextPolicy | null): Array<Record<string, unknown>>;
+export const POLICY_VERSION: 1;
+export function parsePolicy(raw: string, file?: string): NextPolicy;
+export function readPolicy(file: string, build?: NextBuild): Promise<NextPolicy>;
+export function readPolicySync(file: string, build?: NextBuild): NextPolicy;
+export function validatePolicy(policy: NextPolicy, build?: NextBuild, file?: string): NextPolicy;
+export function formatInspection(build: NextBuild, policy?: NextPolicy | null, options?: { json?: boolean }): string;
+export function explainRequest(build: NextBuild, policy: NextPolicy | null, options: { url?: string; path?: string; method?: string; headers?: string[] }): Record<string, unknown>;
+export function doctor(build: NextBuild, options?: Record<string, unknown>): Promise<Record<string, unknown>>;
+export function calibrate(options?: Record<string, unknown>): Promise<Record<string, unknown>>;
 export function toGlob(page: string): string;
 export function routeId(page: string, taken: Set<string>): string;
 export function createPurger(options?: PurgerOptions): Purger;

@@ -1,4 +1,5 @@
 import { HARMOST_SCHEMA_VERSION } from './compat.js';
+import { normalizeRouteName, policyFingerprint, validatePolicy } from './policy.js';
 import { Lines, inlineList, quote } from './yaml.js';
 
 /**
@@ -59,12 +60,21 @@ function isRouteHandler(appPaths, page) {
 export function generateConfig(build, options = {}) {
   const {
     includeDeployment = true,
-    defaultTtl = '1s',
     staleIfError = '1m',
     upstreams = [],
     concurrency = 200,
     lowPriorityPercent = 30,
+    policy: policyInput = null,
+    rollout = 'cache',
   } = options;
+  if (!['observe', 'protect', 'coalesce', 'cache'].includes(rollout)) {
+    throw new TypeError(`rollout must be observe, protect, coalesce, or cache; got ${rollout}`);
+  }
+  const policy = policyInput ? validatePolicy(policyInput, build) : { version: 1, routes: {} };
+  const imageWeight = upstreams.length > 0 ? Math.min(4, concurrency) : 4;
+  const effectiveLowPriorityPercent = upstreams.length > 0
+    ? Math.max(lowPriorityPercent, Math.ceil((imageWeight * 100) / concurrency))
+    : lowPriorityPercent;
   const base = build.basePath || '';
   const p = (suffix) => `${base}${suffix}`;
   const taken = new Set();
@@ -76,16 +86,29 @@ export function generateConfig(build, options = {}) {
       'step with what is actually deployed.\n' +
       '\n' +
       `Next build id:      ${build.buildId}\n` +
+      `Deployment identity: ${build.identity ?? build.buildId}\n` +
+      `Build fingerprint:  ${build.fingerprint ?? 'unavailable'}\n` +
+      `Policy fingerprint: ${policyFingerprint(policyInput)}\n` +
       `routes-manifest:    v${build.manifestVersions.routes}\n` +
       `prerender-manifest: ${build.manifestVersions.prerender === null ? 'absent' : 'v' + build.manifestVersions.prerender}\n` +
       '\n' +
       'Every route the build does not PROVE is shareable is generated as\n' +
       '`private_dynamic`. Prerendered routes are proof — Next produced one\n' +
       'response for everybody. Dynamically rendered routes are not, because they\n' +
-      'may read cookies or headers, so opting one into `public_ssr` is a decision\n' +
-      'only you can make.',
+      'may read cookies or headers. Public dynamic routes require an explicit\n' +
+      'operator assertion in `harmost.next.yaml`.',
   );
   out.raw(`version: ${HARMOST_SCHEMA_VERSION}`);
+  out.raw(`mode: ${rollout === 'observe' ? 'observe' : 'protect'}`);
+
+  if (rollout === 'protect' || rollout === 'coalesce') {
+    out.raw();
+    out.comment(`Rollout stage: ${rollout}. Response caching remains globally disabled.`);
+    out.raw('cache:');
+    out.raw('  enabled: false');
+    out.raw('coalesce:');
+    out.raw(`  enabled: ${rollout === 'coalesce'}`);
+  }
 
   if (includeDeployment) {
     out.raw();
@@ -95,7 +118,7 @@ export function generateConfig(build, options = {}) {
         'purges them.',
     );
     out.raw('deployment:');
-    out.raw(`  id: ${quote(build.buildId)}`);
+    out.raw(`  id: ${quote(build.identity ?? build.buildId)}`);
   }
 
   if (upstreams.length > 0) {
@@ -114,7 +137,7 @@ export function generateConfig(build, options = {}) {
     out.raw('  concurrency:');
     out.raw(`    max: ${concurrency}`);
     out.raw('  priorities:');
-    out.raw(`    low: ${lowPriorityPercent}`);
+    out.raw(`    low: ${effectiveLowPriorityPercent}`);
   }
 
   out.raw();
@@ -139,7 +162,7 @@ export function generateConfig(build, options = {}) {
   out.raw(`    match: ${quote(p('/_next/image'))}`);
   out.raw('    class: public_dynamic');
   out.raw('    priority: low');
-  out.raw('    weight: 4');
+  out.raw(`    weight: ${imageWeight}`);
   out.raw('    cache:');
   out.raw('      ttl:');
   out.raw('        max: 1h');
@@ -148,6 +171,22 @@ export function generateConfig(build, options = {}) {
   out.raw(`        keys: ${inlineList(['url', 'w', 'q'])}`);
   out.raw('      vary:');
   out.raw(`        headers: ${inlineList(['Accept'])}`);
+
+  if ((build.pagePaths ?? []).length > 0) {
+    out.raw();
+    out.comment(
+      'Pages Router data payloads. They use a different URL from the document\n' +
+        'and inherit the document route\'s explicit privacy decision.',
+      2,
+    );
+    for (const page of [...build.pagePaths].sort(compareRouteSpecificity)) {
+      const assertion = policy.routes[normalizeRouteName(page)];
+      const dataPath = p(`/_next/data/${build.buildId}${toGlob(page === '/' ? '/index' : page)}.json`);
+      out.raw(`  - id: ${quote(routeId(`data${page}`, taken))}`);
+      emitMatch(out, dataPath, assertion?.methods);
+      emitAssertion(out, assertion, rollout);
+    }
+  }
 
   const prerendered = Object.entries(build.prerendered)
     .filter(([route]) => !route.startsWith('/_'))
@@ -172,13 +211,13 @@ export function generateConfig(build, options = {}) {
       out.raw(`        max: ${ttl}`);
       out.raw(`      stale_if_error: ${staleIfError}`);
       out.raw('    coalesce:');
-      out.raw('      enabled: true');
+      out.raw(`      enabled: ${rollout === 'coalesce' || rollout === 'cache'}`);
     }
   }
 
   const handlers = [...new Set(Object.values(build.appPaths))]
     .filter((route) => isRouteHandler(build.appPaths, route))
-    .sort();
+    .sort(compareRouteSpecificity);
   if (handlers.length > 0) {
     out.raw();
     out.comment(
@@ -187,8 +226,11 @@ export function generateConfig(build, options = {}) {
       2,
     );
     for (const route of handlers) {
+      const assertion = policy.routes[normalizeRouteName(route)];
       out.raw(`  - id: ${quote(routeId(`api${route}`, taken))}`);
-      out.raw(`    match: ${quote(p(toGlob(route)))}`);
+      emitMatch(out, p(toGlob(route)), assertion?.methods);
+      if (assertion?.weight !== undefined) out.raw(`    weight: ${assertion.weight}`);
+      if (assertion?.priority !== undefined) out.raw(`    priority: ${assertion.priority}`);
       out.raw('    class: private_dynamic');
       out.raw('    cache:');
       out.raw('      enabled: false');
@@ -197,34 +239,37 @@ export function generateConfig(build, options = {}) {
 
   const prerenderedSet = new Set(prerendered.map(([route]) => route));
   const handlerSet = new Set(handlers);
-  const pages = [...new Set([...build.staticRoutes, ...build.dynamicRoutes].map((r) => r.page))]
+  const pages = [...new Set([
+    ...[...build.staticRoutes, ...build.dynamicRoutes].map((r) => r.page),
+    ...(build.pagePaths ?? []),
+  ])]
     .filter(
       (page) => page && !page.startsWith('/_') && !prerenderedSet.has(page) && !handlerSet.has(page),
     )
-    .sort();
+    .sort(compareRouteSpecificity);
   if (pages.length > 0) {
     out.raw();
     out.comment(
       'Dynamically rendered pages. Private by default — the build does not say\n' +
-        'whether these read cookies or headers. If one is genuinely the same for\n' +
-        'every visitor, change it to:\n' +
+        'whether these read cookies or headers. Approve public routes by their\n' +
+        'Next.js names in a checked-in `harmost.next.yaml`, then regenerate:\n' +
         '\n' +
-        '    class: public_ssr\n' +
-        '    cache:\n' +
-        '      override_origin: true\n' +
-        `      ttl: { max: ${defaultTtl} }\n` +
-        '    coalesce: { enabled: true }\n' +
+        '    routes:\n' +
+        '      /products/[slug]:\n' +
+        '        privacy: public\n' +
+        '        cache:\n' +
+        '          ttl: 2s\n' +
         '\n' +
         'A dynamically rendered Next route answers `no-store`, so the override is\n' +
-        'required or nothing here is ever cached or collapsed.',
+        'required or nothing here is ever cached or collapsed. Do not edit this\n' +
+        'generated file directly.',
       2,
     );
     for (const page of pages) {
+      const assertion = policy.routes[normalizeRouteName(page)];
       out.raw(`  - id: ${quote(routeId(`page${page}`, taken))}`);
-      out.raw(`    match: ${quote(p(toGlob(page)))}`);
-      out.raw('    class: private_dynamic');
-      out.raw('    cache:');
-      out.raw('      enabled: false');
+      emitMatch(out, p(toGlob(page)), assertion?.methods);
+      emitAssertion(out, assertion, rollout);
     }
   }
 
@@ -241,4 +286,89 @@ export function generateConfig(build, options = {}) {
   out.raw('      enabled: false');
 
   return out.toString();
+}
+
+function emitMatch(out, path, methods) {
+  if (!methods) {
+    out.raw(`    match: ${quote(path)}`);
+    return;
+  }
+  out.raw('    match:');
+  out.raw(`      path: ${quote(path)}`);
+  out.raw(`      methods: ${inlineList(methods)}`);
+}
+
+function emitAssertion(out, assertion, rollout) {
+  if (assertion?.weight !== undefined) out.raw(`    weight: ${assertion.weight}`);
+  if (assertion?.priority !== undefined) out.raw(`    priority: ${assertion.priority}`);
+  if (assertion?.privacy === 'public') {
+    out.raw('    class: public_ssr');
+    out.raw('    cache:');
+    out.raw('      override_origin: true');
+    out.raw('      ttl:');
+    out.raw(`        max: ${assertion.cache.ttl}`);
+    if (assertion.cache.stale_if_error) out.raw(`      stale_if_error: ${assertion.cache.stale_if_error}`);
+    if (assertion.cache.query) {
+      out.raw('      query:');
+      out.raw('        mode: include');
+      out.raw(`        keys: ${inlineList(assertion.cache.query)}`);
+    }
+    if (assertion.cache.vary) {
+      out.raw('      vary:');
+      out.raw(`        headers: ${inlineList(assertion.cache.vary)}`);
+    }
+    out.raw('    coalesce:');
+    const coalesceEnabled = rollout === 'protect' ? false : assertion.coalesce ?? true;
+    out.raw(`      enabled: ${coalesceEnabled}`);
+    if (rollout === 'coalesce' && coalesceEnabled) out.raw('      override_origin: true');
+  } else {
+    out.raw('    class: private_dynamic');
+    out.raw('    cache:');
+    out.raw('      enabled: false');
+  }
+}
+
+function compareRouteSpecificity(left, right) {
+  const dynamic = (value) => (value.match(/\[/g) ?? []).length;
+  return dynamic(left) - dynamic(right) || right.length - left.length || left.localeCompare(right);
+}
+
+/** Describe the decisions used by generate without emitting YAML. */
+export function inspectRoutes(build, policyInput = null) {
+  const policy = policyInput ? validatePolicy(policyInput, build) : { version: 1, routes: {} };
+  const handlers = new Set(
+    Object.entries(build.appPaths)
+      .filter(([file]) => file.endsWith('/route'))
+      .map(([, route]) => route),
+  );
+  const prerendered = new Set(Object.keys(build.prerendered).filter((route) => !route.startsWith('/_')));
+  const pages = new Set(
+    [...build.staticRoutes, ...build.dynamicRoutes, ...(build.pagePaths ?? []).map((page) => ({ page }))]
+      .map((route) => route.page)
+      .filter((route) => route && !route.startsWith('/_')),
+  );
+  const rows = [];
+  for (const route of [...new Set([...pages, ...handlers, ...prerendered])].sort()) {
+    const assertion = policy.routes[normalizeRouteName(route)];
+    const handler = handlers.has(route);
+    const staticPage = prerendered.has(route);
+    const isPublic = staticPage || assertion?.privacy === 'public';
+    rows.push({
+      route,
+      match: toGlob(route),
+      render: handler ? 'handler' : staticPage ? 'prerendered' : 'dynamic',
+      privacy: isPublic ? 'public' : 'private',
+      reuse: staticPage
+        ? `cache ${typeof build.prerendered[route]?.initialRevalidateSeconds === 'number' ? `${build.prerendered[route].initialRevalidateSeconds}s` : '1h'}`
+        : assertion?.privacy === 'public'
+          ? `cache ${assertion.cache.ttl}`
+          : 'bypass',
+      weight: assertion?.weight ?? 1,
+      priority: assertion?.priority ?? 'normal',
+      evidence: staticPage ? 'Next prerender manifest' : assertion ? 'operator assertion' : 'conservative default',
+      publicOverride: !staticPage && assertion?.privacy === 'public',
+      assertion: assertion ?? null,
+    });
+  }
+  return rows;
 }

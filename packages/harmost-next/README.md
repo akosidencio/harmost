@@ -33,8 +33,32 @@ npm install --save-dev @harmost/next   # or: bun add -d @harmost/next
 
 ```bash
 next build
-npx harmost-next generate --upstream next-1:3000 --out harmost.yaml --check
+npx harmost-next generate --upstream next-1:3000 --concurrency 40 \
+  --out harmost.yaml --check
 ```
+
+Approve public dynamic routes in a checked-in policy:
+
+```yaml
+version: 1
+routes:
+  /products/[slug]:
+    privacy: public
+    weight: 3
+    cache:
+      ttl: 2s
+      stale_if_error: 1m
+```
+
+```bash
+npx harmost-next generate --policy harmost.next.yaml \
+  --upstream next-1:3000 --concurrency 40 --out harmost.yaml --check
+```
+
+Unknown fields, unmatched routes, unsafe methods, credential variants, and
+cache settings on private routes are rejected. Routes without an assertion
+remain private. Generation also writes `harmost.deployment.json` beside the
+configuration for origin identity checks.
 
 `--check` runs `harmost check` on a temporary sibling file and **fails if it is
 rejected**. The previous config is replaced atomically only after validation,
@@ -81,7 +105,7 @@ appears in the log as its own step:
 {
   "scripts": {
     "build": "next build",
-    "postbuild": "harmost-next generate --upstream next-1:3000 --out harmost.yaml --check"
+    "postbuild": "harmost-next generate --upstream next-1:3000 --concurrency 40 --out harmost.yaml --check"
   }
 }
 ```
@@ -124,10 +148,13 @@ nothing but Node.
 
 ```
 --dist-dir <DIR>     Next build output. Default: .next
+--policy <FILE>      Checked-in dynamic-route assertions.
 --upstream <ADDR>    Repeatable. With at least one, the output is a complete
                      config; with none, it is routes only.
---concurrency <N>    origin.concurrency.max. Default: 200
+--concurrency <N>    Required with --upstream. Measure this origin ceiling.
+--rollout <STAGE>    observe, protect, coalesce, or cache.
 --out <FILE>         Write here instead of stdout.
+--identity-out <FILE> Deployment identity artifact path.
 --routes-only        Omit deployment.id as well as the origin block.
 --check              Run `harmost check` on the result and fail if it is
                      rejected. Needs --out and at least one --upstream.
@@ -137,6 +164,28 @@ nothing but Node.
 `concurrency` is the one number that has to come from your own measurement: it
 is the ceiling on how much work the origin does at once, and the right value is
 a property of your renders and your hardware, not of your framework.
+
+### Inspect, explain, doctor, and calibrate
+
+```bash
+harmost-next inspect --policy harmost.next.yaml
+harmost-next explain --policy harmost.next.yaml \
+  --url 'https://shop.example/products/one' --header 'Cookie: session=secret'
+harmost-next doctor --config harmost.yaml --origin http://next-1:3000 \
+  --traffic http://harmost:8080 --metrics http://harmost:9090
+harmost-next calibrate --target http://127.0.0.1:8080 \
+  --route /products/calibration --steps 1,2,4,8 --allow-load
+```
+
+`inspect` highlights every public override and its evidence. `explain` is
+local and redacts credential values. `doctor` performs bounded deployment
+checks. `calibrate` refuses non-local targets unless `--allow-production` is
+also present, never changes configuration, and prints the load shape before
+starting.
+
+Use `--rollout observe`, then `protect`, `coalesce`, and `cache` in order.
+Observe mode records policy decisions but disables protection and reuse in the
+proxy. See the [production reference](../../docs/NEXTJS-PRODUCTION-REFERENCE.md).
 
 ---
 
@@ -233,5 +282,5 @@ runs natively.
 - **No fan-out.** Harmost's cache is per process, so a purge reaches one
   instance. Call every replica, or accept that invalidation is eventually
   consistent within one TTL.
-- **No route cost hints.** `weight` is generated for the image route only.
-  Nothing in a Next build says what a page costs to render.
+- **No inferred route cost.** Nothing in a Next build says what a page costs
+  to render. Set `weight` explicitly in the assertion file.

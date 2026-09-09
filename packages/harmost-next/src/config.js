@@ -30,7 +30,7 @@ const GUARD = '__HARMOST_NEXT_HOOK__';
  *
  * export default withHarmost(
  *   { output: 'standalone' },
- *   { out: 'harmost.yaml', upstreams: ['next-1:3000'], check: true },
+ *   { out: 'harmost.yaml', upstreams: ['next-1:3000'], concurrency: 40, check: true },
  * );
  * ```
  *

@@ -9,6 +9,10 @@ export interface WithHarmostOptions extends GenerateOptions {
   check?: boolean;
   /** Path to the harmost binary. Default `$HARMOST_BIN`, else `harmost` on PATH. */
   harmostBin?: string;
+  /** Assertion file read after the build. */
+  policyFile?: string;
+  /** Deployment identity artifact path, or false to omit it. */
+  identityOut?: string | false;
   /** Suppress the success line. Failures are always reported. */
   silent?: boolean;
 }

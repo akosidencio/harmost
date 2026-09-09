@@ -25,6 +25,7 @@ export const SUPPORTED_MANIFESTS = Object.freeze({
   'routes-manifest.json': Object.freeze([3]),
   'prerender-manifest.json': Object.freeze([4]),
   'app-path-routes-manifest.json': null,
+  'server/pages-manifest.json': null,
 });
 
 /**

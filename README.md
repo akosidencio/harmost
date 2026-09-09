@@ -679,7 +679,10 @@ services:
 
 with `upstreams: ["web:3000"]`.
 
-The complete local example is [`compose.nextjs.yaml`](./compose.nextjs.yaml).
+The complete local example is [`compose.nextjs.yaml`](./compose.nextjs.yaml),
+with a public edge boundary in front of Harmost and private Next.js origins.
+The [production reference guide](./docs/NEXTJS-PRODUCTION-REFERENCE.md) covers
+route approval, staged rollout, deployment checks, and calibration.
 
 #### DigitalOcean App Platform
 
@@ -1030,20 +1033,26 @@ Harmost cannot work out by watching traffic:
 
 ```bash
 next build
-npx harmost-next generate --upstream next-1:3000 --out harmost.yaml
-harmost check --config harmost.yaml
+npx harmost-next generate \
+  --policy harmost.next.yaml \
+  --upstream next-1:3000 \
+  --concurrency 40 \
+  --out harmost.yaml \
+  --check
 ```
 
-The build id becomes `deployment.id`; prerendered routes become `public_ssr`
+The build or Next.js deployment identity becomes `deployment.id`; prerendered routes become `public_ssr`
 with a TTL from their `initialRevalidateSeconds`; Route Handlers and
 dynamically rendered pages become `private_dynamic`; `/_next/image` is
 generated with the `vary: [Accept]` it needs to cache at all.
 
 **Anything the build does not prove is shareable is generated private.** A
 prerendered route is proof — Next produced one response for everybody. A
-dynamic one is not, so opting it into `public_ssr` stays a decision a person
-makes. The same package routes `revalidateTag()` and `revalidatePath()` to the
-purge API below.
+dynamic one is not, so it needs an exact, checked-in approval in
+`harmost.next.yaml`. The same policy drives `generate`, `inspect`, and the local
+`explain` command. `doctor` checks a deployed reference, and `calibrate`
+requires an explicit load flag and route allowlist. The package also routes
+`revalidateTag()` and `revalidatePath()` to the purge API below.
 
 This is the difference between Harmost inferring route policy from headers and
 being *told* it by the build — the gap that made hand-written route config

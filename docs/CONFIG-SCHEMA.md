@@ -80,6 +80,7 @@ needs to change:
 
 | Key | Added with | Default |
 |---|---|---|
+| `mode` | staged Next.js rollout | `protect` |
 | `server.h2c` | protocol coverage | `false` |
 | `server.tls` | TLS termination | absent |
 | `server.trusted_proxies` | forwarded-header trust | trusts nobody |
@@ -99,6 +100,10 @@ needs to change:
 | `cache.purge.token` | the purge API | absent — **endpoint disabled** |
 
 Two of those are worth acting on rather than merely noting:
+
+- **`mode: observe` does not protect the origin.** It records classification
+  and telemetry while bypassing admission, caching, coalescing, and spooling.
+  Use it only as the first rollout stage.
 
 - **`server.graceful.pid_file` and `upgrade_socket` default to `/tmp`.** Two
   Harmost processes on one host with the defaults will hand each other their
