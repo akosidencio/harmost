@@ -90,23 +90,31 @@ echo
 echo "3/11 HTML and React Server Component payloads use separate cache keys"
 RSC_PATH="/products/rsc-$RUN_ID"
 RSC_URL="$PROXY_URL$RSC_PATH"
-# This is the router tree emitted by the fixture homepage. An RSC request with
-# no `_rsc` cache-buster makes Next return the canonical URL used by its browser
-# client before it returns the actual component payload.
+# This is the router tree emitted by the fixture homepage. Depending on the
+# request host, Next either serves this RSC request directly or redirects it to
+# the canonical `_rsc` URL used by its browser client.
 RSC_TREE='%5B%22%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%2C4096%5D%7D%2Cnull%2Cnull%2C4112%5D'
 BEFORE=$(metric_sum products)
 curl -fsS -D "$RESULT_DIR/html.headers" -o "$RESULT_DIR/html.body" "$RSC_URL"
-curl -sS -D "$RESULT_DIR/rsc-redirect.headers" -o /dev/null \
+curl -fsS -D "$RESULT_DIR/rsc-initial.headers" -o "$RESULT_DIR/rsc-initial.body" \
   -H 'RSC: 1' -H 'Next-Url: /' -H "Next-Router-State-Tree: $RSC_TREE" \
   "$RSC_URL"
-RSC_LOCATION=$(sed -n 's/^location: //Ip' "$RESULT_DIR/rsc-redirect.headers" | tr -d '\r' | tail -1)
-case "$RSC_LOCATION" in
-  "$RSC_PATH"'?_rsc='*) ;;
-  *) fail "Next.js did not return a canonical RSC location: ${RSC_LOCATION:-missing}" ;;
-esac
-curl -fsS -D "$RESULT_DIR/rsc.headers" -o "$RESULT_DIR/rsc.body" \
-  -H 'RSC: 1' -H 'Next-Url: /' -H "Next-Router-State-Tree: $RSC_TREE" \
-  "$PROXY_URL$RSC_LOCATION"
+RSC_LOCATION=$(sed -n 's/^location: //Ip' "$RESULT_DIR/rsc-initial.headers" | tr -d '\r' | tail -1)
+if [ -n "$RSC_LOCATION" ]; then
+  case "$RSC_LOCATION" in
+    "$RSC_PATH"'?_rsc='*) ;;
+    *) fail "Next.js returned an unexpected RSC location: $RSC_LOCATION" ;;
+  esac
+  curl -fsS -D "$RESULT_DIR/rsc.headers" -o "$RESULT_DIR/rsc.body" \
+    -H 'RSC: 1' -H 'Next-Url: /' -H "Next-Router-State-Tree: $RSC_TREE" \
+    "$PROXY_URL$RSC_LOCATION"
+  EXPECTED_RSC_ORIGIN_REQUESTS=3
+else
+  RSC_LOCATION="$RSC_PATH"
+  cp "$RESULT_DIR/rsc-initial.headers" "$RESULT_DIR/rsc.headers"
+  cp "$RESULT_DIR/rsc-initial.body" "$RESULT_DIR/rsc.body"
+  EXPECTED_RSC_ORIGIN_REQUESTS=2
+fi
 # Both variants should now be cache hits and must remain different types.
 curl -fsS -o "$RESULT_DIR/rsc-again.body" \
   -H 'RSC: 1' -H 'Next-Url: /' -H "Next-Router-State-Tree: $RSC_TREE" \
@@ -114,7 +122,8 @@ curl -fsS -o "$RESULT_DIR/rsc-again.body" \
 curl -fsS -o "$RESULT_DIR/html-again.body" "$RSC_URL"
 AFTER=$(metric_sum products)
 ORIGIN_REQUESTS=$((AFTER - BEFORE))
-[ "$ORIGIN_REQUESTS" -eq 3 ] || fail "HTML plus canonicalized RSC sequence used $ORIGIN_REQUESTS origin requests instead of 3"
+[ "$ORIGIN_REQUESTS" -eq "$EXPECTED_RSC_ORIGIN_REQUESTS" ] \
+  || fail "HTML plus RSC sequence used $ORIGIN_REQUESTS origin requests instead of $EXPECTED_RSC_ORIGIN_REQUESTS"
 grep -qi '^content-type: text/html' "$RESULT_DIR/html.headers" || fail "document request was not HTML"
 grep -qi '^content-type: text/x-component' "$RESULT_DIR/rsc.headers" || fail "RSC request was not a component payload"
 cmp -s "$RESULT_DIR/html.body" "$RESULT_DIR/html-again.body" || fail "cached HTML response changed after an RSC request"
