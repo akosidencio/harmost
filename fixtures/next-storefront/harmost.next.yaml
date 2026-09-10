@@ -1,0 +1,31 @@
+version: 1
+
+routes:
+  /products/[slug]:
+    privacy: public
+    weight: 3
+    cache:
+      ttl: 2s
+
+  /search:
+    privacy: public
+    weight: 2
+    cache:
+      ttl: 1s
+      query: [q, page]
+
+  /flash-sale:
+    privacy: public
+    cache:
+      ttl: 1s
+      query: [run]
+
+  /preview:
+    privacy: public
+    cache:
+      ttl: 2s
+
+  /legacy/[slug]:
+    privacy: public
+    cache:
+      ttl: 2s

@@ -4,6 +4,7 @@ global:
 
 rule_files:
   - /etc/prometheus/rules/harmost-alerts.yml
+  - /etc/prometheus/rules/harmost-recording-rules.yml
 
 scrape_configs:
   - job_name: harmost

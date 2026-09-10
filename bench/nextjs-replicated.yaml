@@ -1,0 +1,246 @@
+# Replicated Next.js reference: two Harmost processes share one declared
+# origin-work budget while keeping cache and admission state local.
+version: 1
+mode: protect
+
+server:
+  listen: "0.0.0.0:8080"
+  trusted_proxies:
+    from: ["172.16.0.0/12"]
+    client_ip: x_forwarded
+    scheme: x_forwarded
+
+origin:
+  upstreams:
+    - "next-1:3000"
+    - "next-2:3000"
+    - "next-3:3000"
+  load_balancing: hash_by_path
+  concurrency:
+    max: 4
+    queue:
+      max: 100
+      timeout: 5s
+  # So `priority: low` on the image route means something. Step 11 asserts that
+  # a tier ceiling is actually enforced.
+  priorities:
+    low: 50
+
+capacity:
+  global_max: 8
+  replicas: 2
+
+health:
+  path: "/healthz"
+  interval: 2s
+  timeout: 1s
+  healthy_after: 1
+  unhealthy_after: 1
+
+cache:
+  enabled: true
+  store: memory
+  max_memory: 64MiB
+  max_body_size: 4MiB
+  tag_header: "x-harmost-cache-tags"
+  purge:
+    token: "nextjs-reference-purge-token-0001"
+
+coalesce:
+  enabled: true
+  on_timeout: stale_or_shed
+
+timeouts:
+  connect: 1s
+  first_byte: 5s
+  idle: 30s
+  origin: 15s
+  downstream_write: 15s
+
+deployment:
+  id: "next-fixture-v1"
+
+debug_headers: true
+
+routes:
+  - id: next-static
+    match: "/_next/static/**"
+    class: static
+
+  # The image optimiser. `vary: [Accept]` is load-bearing: Next negotiates the
+  # output format on `Accept` and answers `Vary: Accept`, so without it in the
+  # key Harmost refuses to store anything and the route gets a 0% hit rate.
+  # Step 11 asserts the hit, the format separation, and the tier ceiling.
+  - id: next-image
+    match: "/_next/image"
+    class: public_dynamic
+    priority: low
+    weight: 2
+    cache:
+      ttl:
+        max: 1h
+      query:
+        mode: include
+        keys: ["url", "w", "q"]
+      vary:
+        headers: ["Accept"]
+    concurrency:
+      max: 2
+      queue:
+        max: 30
+        timeout: 5s
+
+  - id: health
+    match: "/healthz"
+    class: private_dynamic
+    cache:
+      enabled: false
+
+  - id: products
+    match: "/products/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 10s
+    coalesce:
+      enabled: true
+    concurrency:
+      max: 4
+      queue:
+        max: 50
+        timeout: 5s
+
+  - id: search
+    match: "/search"
+    class: public_dynamic
+    cache:
+      override_origin: true
+      ttl:
+        max: 1s
+      query:
+        mode: include
+        keys: ["q", "page"]
+    coalesce:
+      enabled: true
+    concurrency:
+      max: 3
+      queue:
+        max: 30
+        timeout: 5s
+
+  - id: flash-sale
+    match: "/flash-sale"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 1s
+      query:
+        mode: include
+        keys: ["run"]
+    coalesce:
+      enabled: true
+    concurrency:
+      max: 2
+      queue:
+        max: 30
+        timeout: 5s
+
+  # Deliberately permissive: Next.js Draft Mode cookies must still force a
+  # bypass before this route policy can share unpublished content.
+  - id: preview
+    match: "/preview"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 2s
+    coalesce:
+      enabled: true
+
+  # Pages Router. `/legacy/session` sets a cookie from `getServerSideProps`
+  # under exactly this permissive policy: the Set-Cookie barrier has to hold on
+  # the legacy code path too, not only on Route Handlers.
+  - id: legacy-pages
+    match: "/legacy/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 2s
+    coalesce:
+      enabled: true
+    concurrency:
+      max: 4
+      queue:
+        max: 50
+        timeout: 5s
+
+  # The Pages Router's JSON props payload for a client-side navigation. It is a
+  # separate URL from the document — unlike the App Router's RSC variant, which
+  # shares one — so the hazard is not key collision but classification: without
+  # a route of its own it falls to `private-default` and is never reused, which
+  # is safe but silently gives up the protection.
+  - id: legacy-data
+    match: "/_next/data/**"
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 2s
+    coalesce:
+      enabled: true
+
+  - id: private-session
+    match: "/api/private-session"
+    class: private_dynamic
+    cache:
+      enabled: false
+    coalesce:
+      enabled: false
+
+  # Deliberately permissive: a Next-Action header must force a mutation bypass
+  # before this policy can cache or collapse the response.
+  - id: action-probe
+    match:
+      path: "/api/action-probe"
+      methods: ["POST"]
+    class: public_ssr
+    cache:
+      override_origin: true
+      ttl:
+        max: 2s
+    coalesce:
+      enabled: true
+
+  - id: private-routes
+    match:
+      path: "/{account,cart,api/**}"
+    class: private_dynamic
+    cache:
+      enabled: false
+    coalesce:
+      enabled: false
+    concurrency:
+      max: 4
+      queue:
+        max: 30
+        timeout: 5s
+
+  - id: private-default
+    match: "/**"
+    class: private_dynamic
+    cache:
+      enabled: false
+    coalesce:
+      enabled: false
+
+telemetry:
+  prometheus:
+    listen: "0.0.0.0:9090"
+  admin:
+    listen: "0.0.0.0:9091"
+    require_healthy_upstream: true
+  logging:
+    format: json

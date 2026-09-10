@@ -22,6 +22,9 @@ fixtures/next-storefront/.next/
 fixtures/next-storefront/node_modules/
 fixtures/next-storefront/*.tsbuildinfo
 
+# JavaScript package dependencies
+node_modules/
+
 # docs/ holds the author's own study and prep material, which is not part of the
 # repository. Published documents linked by the README or release workflows
 # are the exception: documentation that is not in the tree cannot support an
@@ -35,3 +38,5 @@ docs/*
 !docs/CONFIG-SCHEMA.md
 !docs/RELEASE-GATES.md
 !docs/ROADMAP.md
+!docs/NEXTJS-PRODUCTION-REFERENCE.md
+!docs/STANDALONE.md

@@ -150,7 +150,7 @@ exclusions reads as more coverage than it has.
   nothing is built or tested anywhere else. Harmost still *compiles* on macOS
   and is usable for local development, but that is unverified by CI and no
   artifact is published for it.
-- **Multi-replica behaviour.** Cache, coalescing and admission state are
-  process-local. Nothing here tests what several replicas do together, and the
-  README says so under its limitations rather than a benchmark implying
-  otherwise.
+- **Dynamic replica coordination.** The replicated reference tests a fixed
+  partition, URI affinity, failure, recovery, and purge fan-out. It does not
+  discover excess replicas or lease capacity dynamically; the orchestrator
+  must honor the declared replica count.

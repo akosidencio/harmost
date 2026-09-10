@@ -5,7 +5,11 @@ dynamic origin workloads. They do not treat cache-hit rate or lower latency as
 the product goal; the primary signals are bounded origin work, queueing,
 shedding, origin health and recovery.
 
-Two files, both meant to be copied into your own monitoring stack rather than
+Prometheus loads alert rules and compact recording rules for local and replica
+group saturation, shedding, origin latency, avoided origin work, and
+cache/spool occupancy.
+
+Three files, all meant to be copied into your own monitoring stack rather than
 imported and forgotten.
 
 ## Local end-to-end demo
@@ -73,7 +77,7 @@ your deployment. They are written as obvious knobs for that reason.
 Check them before shipping:
 
 ```bash
-promtool check rules ops/prometheus/alerts.yml
+promtool check rules ops/prometheus/alerts.yml ops/prometheus/recording-rules.yml
 ```
 
 ## `grafana/dashboard.json`

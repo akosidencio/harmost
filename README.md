@@ -67,6 +67,7 @@ Reference documentation:
 | | |
 |---|---|
 | [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | Running it: readiness, drain, restart, systemd, Kubernetes, what to alert on |
+| [`docs/STANDALONE.md`](./docs/STANDALONE.md) | Installing one binary on a server and connecting a domain |
 | [`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md) | Schema versioning, what may change without a bump, migration notes |
 | [`docs/RELEASE-GATES.md`](./docs/RELEASE-GATES.md) | What has to pass before a tag, and what is deliberately not gated |
 | [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) | What is protected, from whom, and what is not defended |
@@ -538,17 +539,21 @@ Harmost is not on crates.io. It targets Linux: the published image is
 `linux/amd64` and the release binary is `x86_64-unknown-linux-gnu`. There are
 no macOS or Windows artifacts.
 
+Choose either supported deployment form:
+
+- **One Linux server:** install the release binary, generate one
+  `/etc/harmost/harmost.yaml`, and run it under systemd. Follow the
+  [standalone server guide](./docs/STANDALONE.md).
+- **Containers:** use the published image with Docker, a managed container
+  platform, or Kubernetes.
+
 Tagged releases publish a `linux/amd64` container image to GitHub Packages at
 `ghcr.io/akosidencio/harmost`, built from the repository
 [`Dockerfile`](./Dockerfile). The same Dockerfile builds a local image for
-testing and as a base for deployment work. The image is the recommended way to
-run Harmost, and the one every topology below assumes unless it says otherwise.
+testing and as a base for deployment work.
 
-A release also attaches a single `x86_64-unknown-linux-gnu` binary, with a
-checksum for both the archive and the binary inside it. That exists for the one
-topology a container does not serve — the systemd unit in
-[`docs/OPERATIONS.md`](./docs/OPERATIONS.md), which runs
-`/usr/local/bin/harmost` directly.
+A release also attaches a `x86_64-unknown-linux-gnu` binary, checksums, and a
+ready-to-install systemd unit. Docker is not required.
 
 ```bash
 docker pull ghcr.io/akosidencio/harmost:<version>
@@ -580,9 +585,13 @@ The binary lands at `target/release/harmost`.
 
 ```bash
 ./target/release/harmost version
-./target/release/harmost check --config harmost.yaml   # validate, don't start
-./target/release/harmost run   --config harmost.yaml   # start the proxy
+./target/release/harmost init                           # create harmost.yaml
+./target/release/harmost check                          # validate, don't start
+./target/release/harmost run                            # start the proxy
 ```
+
+Without `--config`, Harmost checks `HARMOST_CONFIG`, the current directory,
+then `/etc/harmost/harmost.yaml`. Both `.yaml` and `.yml` are accepted.
 
 `harmost check` exits non-zero on an invalid or unsafe configuration, so it
 works as a CI gate on a config change.
@@ -664,6 +673,39 @@ Next.js stops being publicly reachable and listens only for Harmost. Whatever
 used to point at Next — your load balancer, your CDN origin, your DNS record —
 now points at Harmost instead.
 
+#### Choosing the replica count
+
+Harmost's cache, request coalescing and admission limits are local to each
+process. Choose the smallest fixed replica count that meets your availability
+needs:
+
+| Replicas | Recommended use | Trade-off |
+| --- | --- | --- |
+| **1** | Simple, internal or cost-sensitive deployments | Best cache reuse and simplest operation, with a brief interruption and a cold cache after a restart |
+| **2** | Production deployments that must remain available during a pod failure or rollout | Two independent caches and a temporary rise in origin traffic during failover |
+| **3+** | Only when measured availability or throughput requires it | More duplicated cache entries, cold starts and capacity coordination |
+
+Use two replicas as active peers behind an ingress or load balancer, not as a
+primary and passive backup. Consistently hash the request URI so the same path
+normally reaches the same warm cache. If a replica fails, traffic moves to the
+survivor while the replacement starts with an empty cache.
+
+Pingora handles connections, draining and planned graceful upgrades; it does
+not restart a failed process or pod. Kubernetes, Docker, systemd or another
+supervisor must provide restart and health-check policy.
+
+For every multi-replica deployment:
+
+- Divide the safe origin concurrency across replicas. A global limit of `80`
+  with two replicas means a local limit of `40` each.
+- Send every purge to every replica's admin endpoint. The local caches are not
+  synchronized.
+- Expect simultaneous misses on different replicas to render separately;
+  coalescing only combines requests handled by the same process.
+- Keep the deployed replica count at or below the count used to generate the
+  capacity configuration. Avoid automatic scale-out until the global budget
+  is coordinated externally.
+
 #### One server
 
 Both processes on the same box. Harmost takes the public port, Next binds to
@@ -708,7 +750,10 @@ services:
 
 with `upstreams: ["web:3000"]`.
 
-The complete local example is [`compose.nextjs.yaml`](./compose.nextjs.yaml).
+The complete local example is [`compose.nextjs.yaml`](./compose.nextjs.yaml),
+with a public edge boundary in front of Harmost and private Next.js origins.
+The [production reference guide](./docs/NEXTJS-PRODUCTION-REFERENCE.md) covers
+route approval, staged rollout, deployment checks, and calibration.
 
 #### DigitalOcean App Platform
 
@@ -747,13 +792,13 @@ Ingress ──▶ Service/harmost ──▶ Deployment/harmost (2 replicas)
 
 with `upstreams: ["web.default.svc.cluster.local:3000"]`.
 
-Keep the Harmost replica count low. Coalescing only collapses requests that
-reach the *same* instance, so replicas divide the benefit — and an autoscaler
-that adds replicas during a spike reduces collapsing exactly when it is most
-wanted. Concurrency limits are also per process: two replicas configured with a
-ceiling of 100 can admit up to 200 origin requests between them. Size the
-per-process limit accordingly. If you need more than a few replicas, have the
-Ingress consistent-hash on path so one key lands on one instance.
+Follow the [replica-count guidance](#choosing-the-replica-count): declare one
+group budget when generating configuration and consistently hash the URI at
+the Ingress. Cache affinity improves reuse, but correctness and privacy do not
+depend on it. For two replicas, use `maxUnavailable: 0`, a PodDisruptionBudget
+with `minAvailable: 1`, and topology spread or anti-affinity so one node failure
+does not remove both replicas. See the [operations guide](./docs/OPERATIONS.md#kubernetes)
+for probes, draining and resource limits.
 
 #### Where this does not work
 
@@ -1059,20 +1104,30 @@ Harmost cannot work out by watching traffic:
 
 ```bash
 next build
-npx harmost-next generate --upstream next-1:3000 --out harmost.yaml
-harmost check --config harmost.yaml
+npx harmost-next generate \
+  --policy harmost.next.yaml \
+  --upstream next-1:3000 \
+  --concurrency 40 \
+  --out harmost.yaml \
+  --check
 ```
 
-The build id becomes `deployment.id`; prerendered routes become `public_ssr`
+For a replica group, replace `--concurrency 40` with
+`--global-concurrency 80 --replicas 2`. Division rounds down, so the generated
+sum never exceeds the declared origin-work budget.
+
+The build or Next.js deployment identity becomes `deployment.id`; prerendered routes become `public_ssr`
 with a TTL from their `initialRevalidateSeconds`; Route Handlers and
 dynamically rendered pages become `private_dynamic`; `/_next/image` is
 generated with the `vary: [Accept]` it needs to cache at all.
 
 **Anything the build does not prove is shareable is generated private.** A
 prerendered route is proof — Next produced one response for everybody. A
-dynamic one is not, so opting it into `public_ssr` stays a decision a person
-makes. The same package routes `revalidateTag()` and `revalidatePath()` to the
-purge API below.
+dynamic one is not, so it needs an exact, checked-in approval in
+`harmost.next.yaml`. The same policy drives `generate`, `inspect`, and the local
+`explain` command. `doctor` checks a deployed reference, and `calibrate`
+requires an explicit load flag and route allowlist. The package also routes
+`revalidateTag()` and `revalidatePath()` to the purge API below.
 
 This is the difference between Harmost inferring route policy from headers and
 being *told* it by the build — the gap that made hand-written route config
@@ -1137,6 +1192,10 @@ that invalidates a cache gets fetched by crawlers and link prefetchers; an open
 purge endpoint is a stampede trigger anybody can pull. A misspelled parameter
 is a `400` rather than a quiet success, for the same reason unknown config keys
 are refused.
+
+**Replicated purges must reach every process.** `@harmost/next` accepts all
+admin listeners through `endpoints` or `HARMOST_PURGE_URLS` and fails if any
+local cache cannot be invalidated.
 
 **Deployment rollovers need no call at all.** The cache key already carries
 `deployment.id`, so a build's entries become unreachable the moment it changes

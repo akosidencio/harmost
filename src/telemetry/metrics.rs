@@ -57,7 +57,7 @@ pub static BYPASS_REASON: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric registration")
 });
 
-/// `decision` is one of admitted, exempt, shed_queue_full, shed_queue_timeout.
+/// `decision` is one of observe, admitted, exempt, shed_queue_full, shed_queue_timeout.
 pub static ADMISSION: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "harmost_admission_total",
@@ -406,6 +406,12 @@ pub fn preregister() {
     LazyLock::force(&REQUESTS);
     LazyLock::force(&CACHE);
     LazyLock::force(&BYPASS_REASON);
+    // A registered CounterVec with no label values is omitted from Prometheus
+    // output. Seed one bounded zero-value series so a fresh deployment still
+    // exposes the metric contract before its first cache bypass.
+    BYPASS_REASON
+        .with_label_values(&["-", "route_disabled"])
+        .inc_by(0);
     LazyLock::force(&ADMISSION);
     LazyLock::force(&ORIGIN_REQUESTS);
     LazyLock::force(&ORIGIN_LATENCY);
@@ -447,6 +453,16 @@ mod tests {
         // Duplicate registration panics at runtime; catch it here instead.
         preregister();
         preregister();
+    }
+
+    #[test]
+    fn a_fresh_scrape_includes_the_cache_bypass_metric() {
+        preregister();
+        assert!(
+            prometheus::gather()
+                .iter()
+                .any(|family| family.get_name() == "harmost_cache_bypass_reason_total")
+        );
     }
 
     #[test]

@@ -11,9 +11,17 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
+    /// Rollout behavior. `observe` classifies and proxies without protecting
+    /// or reusing responses; `protect` enables the configured controls.
+    #[serde(default)]
+    pub mode: Mode,
     #[serde(default)]
     pub server: Server,
     pub origin: Origin,
+    /// Optional static partition of one origin-work budget across a bounded
+    /// Harmost replica group.
+    #[serde(default)]
+    pub capacity: Option<CapacityGroup>,
     #[serde(default)]
     pub health: Option<Health>,
     #[serde(default)]
@@ -39,6 +47,23 @@ pub struct Config {
     /// cache poisoning.
     #[serde(default)]
     pub debug_headers: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    Observe,
+    #[default]
+    Protect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityGroup {
+    /// Maximum combined origin work across the declared replica group.
+    pub global_max: usize,
+    /// Maximum number of simultaneously active Harmost replicas.
+    pub replicas: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

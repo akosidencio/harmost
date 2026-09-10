@@ -41,7 +41,7 @@ use crate::admission::{Admission, AdmissionController};
 use crate::cache::policy::{Disposition, Shareability, evaluate_request, evaluate_response};
 use crate::cache::{BoundedStore, KeyBuilder};
 use crate::classifier::{FrameworkAdapter, RequestClass, RequestMetadata, nextjs::NextJs};
-use crate::config::schema::{LogFormat, OriginHttpVersion, Priority, RouteCache, Timeouts};
+use crate::config::schema::{LogFormat, Mode, OriginHttpVersion, Priority, RouteCache, Timeouts};
 use crate::net::forwarded::{ClientFacts, ListenerScheme, TrustPolicy};
 use crate::policy::PolicySnapshot;
 use crate::proxy::spool::{Spool, SpoolBudget, SpoolOutcome};
@@ -617,16 +617,19 @@ impl ProxyHttp for Harmost {
             .and_then(|r| r.config.coalesce.as_ref())
             .is_some_and(|c| c.override_origin);
         ctx.coalesce_override = coalesce_override;
-        let route_cache_enabled = ctx.policy.config.cache.enabled
+        let protecting = ctx.policy.config.mode == Mode::Protect;
+        let route_cache_enabled = protecting
+            && ctx.policy.config.cache.enabled
             && ctx
                 .route_cache
                 .as_ref()
                 .and_then(|cache| cache.enabled)
                 .unwrap_or(true);
-        let route_coalesce_enabled = route
-            .and_then(|r| r.config.coalesce.as_ref())
-            .and_then(|coalesce| coalesce.enabled)
-            .unwrap_or(ctx.policy.config.coalesce.enabled);
+        let route_coalesce_enabled = protecting
+            && route
+                .and_then(|r| r.config.coalesce.as_ref())
+                .and_then(|coalesce| coalesce.enabled)
+                .unwrap_or(ctx.policy.config.coalesce.enabled);
 
         let route_label = ctx.route_id.as_deref().unwrap_or("-");
         metrics::REQUESTS
@@ -640,6 +643,9 @@ impl ProxyHttp for Harmost {
             .and_then(|r| r.config.spool.as_ref())
             .and_then(|spool| spool.enabled)
             .unwrap_or(ctx.policy.config.spool.enabled);
+        if !protecting {
+            ctx.spool_enabled = false;
+        }
 
         // An upgrade leaves HTTP behind, so every filter after this one stops
         // applying. Refuse it here, before the cache is consulted and before
@@ -799,6 +805,13 @@ impl ProxyHttp for Harmost {
                     return Ok(false);
                 }
             }
+        }
+
+        if ctx.policy.config.mode == Mode::Observe {
+            metrics::ADMISSION
+                .with_label_values(&[&route_label, "observe"])
+                .inc();
+            return Ok(true);
         }
 
         let route_limiter = ctx

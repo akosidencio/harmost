@@ -1,0 +1,61 @@
+# Layer over compose.nextjs.yaml to replace the single governor with two
+# statically partitioned Harmost replicas behind URI-stable ingress.
+services:
+  harmost:
+    profiles: [single]
+
+  edge:
+    profiles: [single]
+
+  harmost-1:
+    build:
+      context: .
+    depends_on:
+      next-1:
+        condition: service_healthy
+      next-2:
+        condition: service_healthy
+      next-3:
+        condition: service_healthy
+    volumes:
+      - ${HARMOST_REPLICATED_CONFIG_DIR:-./bench}:/etc/harmost:ro
+    expose:
+      - "8080"
+    ports:
+      - "127.0.0.1:18181:8080"
+      - "127.0.0.1:19190:9090"
+      - "127.0.0.1:19191:9091"
+    stop_grace_period: 25s
+    command: ["run", "--config", "/etc/harmost/nextjs-replicated.yaml"]
+
+  harmost-2:
+    build:
+      context: .
+    depends_on:
+      next-1:
+        condition: service_healthy
+      next-2:
+        condition: service_healthy
+      next-3:
+        condition: service_healthy
+    volumes:
+      - ${HARMOST_REPLICATED_CONFIG_DIR:-./bench}:/etc/harmost:ro
+    expose:
+      - "8080"
+    ports:
+      - "127.0.0.1:18282:8080"
+      - "127.0.0.1:19290:9090"
+      - "127.0.0.1:19291:9091"
+    stop_grace_period: 25s
+    command: ["run", "--config", "/etc/harmost/nextjs-replicated.yaml"]
+
+  replica-edge:
+    image: nginx:1.27-alpine
+    depends_on:
+      - harmost-1
+      - harmost-2
+    volumes:
+      - ./ops/edge/nginx-replicated.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:18080:8080"
+    restart: unless-stopped

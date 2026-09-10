@@ -3,7 +3,9 @@ import { renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
+import { resolveCapacity } from './capacity.js';
 import { HarmostNextError, readBuildSync } from './manifests.js';
+import { policyFingerprint, readPolicySync, validatePolicy } from './policy.js';
 import { generateConfig } from './routes.js';
 
 /**
@@ -33,17 +35,70 @@ export function generateToFile(options = {}) {
     distDir = '.next',
     out,
     upstreams = [],
-    concurrency = 200,
+    concurrency = null,
+    globalConcurrency = null,
+    replicas = null,
     includeDeployment = true,
     check = false,
     harmostBin: bin,
+    policy: policyInput = null,
+    policyFile = null,
+    identityOut: identityOption,
+    rollout = 'cache',
   } = options;
 
   if (!out) throw new HarmostNextError('generateToFile needs an `out` path');
+  const capacity = resolveCapacity(
+    { concurrency, globalConcurrency, replicas },
+    { requireExplicit: upstreams.length > 0 },
+  );
 
   const build = readBuildSync(distDir);
-  const yaml = generateConfig(build, { upstreams, concurrency, includeDeployment });
-  const result = { buildId: build.buildId, out, routes: countRoutes(yaml), checked: false };
+  if (policyInput && policyFile) {
+    throw new HarmostNextError('pass either `policy` or `policyFile`, not both');
+  }
+  const policy = policyFile
+    ? readPolicySync(policyFile, build)
+    : policyInput
+      ? validatePolicy(policyInput, build)
+      : null;
+  const yaml = generateConfig(build, {
+    upstreams,
+    concurrency: capacity.group ? null : capacity.concurrency,
+    globalConcurrency,
+    replicas,
+    includeDeployment,
+    policy,
+    rollout,
+  });
+  const identityOut = identityOption === false
+    ? null
+    : identityOption || path.join(path.dirname(out), 'harmost.deployment.json');
+  const identity = `${JSON.stringify({
+    version: 1,
+    build_id: build.identity ?? build.buildId,
+    next_build_id: build.buildId,
+    next_deployment_id: build.deploymentId,
+    build_fingerprint: build.fingerprint,
+    policy_fingerprint: policyFingerprint(policy),
+    concurrency: upstreams.length > 0 ? capacity.concurrency : null,
+    capacity: capacity.group
+      ? {
+          global_max: capacity.group.globalMax,
+          replicas: capacity.group.replicas,
+          allocated: capacity.group.allocated,
+          unallocated: capacity.group.unallocated,
+        }
+      : null,
+    rollout,
+  }, null, 2)}\n`;
+  const result = {
+    buildId: build.identity ?? build.buildId,
+    out,
+    identityOut,
+    routes: countRoutes(yaml),
+    checked: false,
+  };
 
   if (check && upstreams.length === 0) {
     throw new HarmostNextError(
@@ -56,11 +111,18 @@ export function generateToFile(options = {}) {
     path.dirname(out),
     `.${path.basename(out)}.${process.pid}.${randomUUID()}.tmp`,
   );
+  const identityTemporary = identityOut
+    ? path.join(
+        path.dirname(identityOut),
+        `.${path.basename(identityOut)}.${process.pid}.${randomUUID()}.tmp`,
+      )
+    : null;
   let committed = false;
   try {
     // A sibling temporary file keeps validation from destroying the last
     // known-good config and makes the final replacement atomic.
     writeFileSync(temporary, yaml, { flag: 'wx' });
+    if (identityTemporary) writeFileSync(identityTemporary, identity, { flag: 'wx' });
 
     if (check) {
       const binary = harmostBin(bin);
@@ -87,6 +149,7 @@ export function generateToFile(options = {}) {
       result.checked = true;
     }
 
+    if (identityTemporary && identityOut) renameSync(identityTemporary, identityOut);
     renameSync(temporary, out);
     committed = true;
     return result;
@@ -99,6 +162,13 @@ export function generateToFile(options = {}) {
         // a cleanup failure must not replace its actionable diagnostics. The
         // uniquely named file cannot be mistaken for the committed config and
         // a later run will never reuse it.
+      }
+      if (identityTemporary) {
+        try {
+          unlinkSync(identityTemporary);
+        } catch {
+          // Same as the config temporary file: keep the original error.
+        }
       }
     }
   }

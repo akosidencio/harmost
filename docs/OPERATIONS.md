@@ -164,6 +164,10 @@ second full drain.
 
 ## systemd
 
+Release archives include the ready-to-install unit from
+[`packaging/systemd/harmost.service`](../packaging/systemd/harmost.service).
+The expanded example below documents each operational setting.
+
 ```ini
 [Unit]
 Description=Harmost origin workload governor
@@ -380,10 +384,9 @@ Four things worth knowing before you rely on it:
   refused rather than treated as "purge nothing", on the same reasoning as
   unknown keys in the config file: an invalidation that quietly does nothing
   looks like a working one until somebody checks.
-- **Purge is per process.** Every replica has its own cache and its own
-  endpoint, so a purge has to reach all of them. Fan out from your deploy
-  pipeline, or accept that invalidation is eventually consistent within one
-  TTL.
+- **Purge is per process.** Every replica has its own cache and endpoint. Fan
+  out from the deploy pipeline; `@harmost/next` accepts all admin listeners
+  through `endpoints` or `HARMOST_PURGE_URLS` and fails on partial delivery.
 - **In-flight renders keep streaming, but are not admitted afterward.** A
   matching render already streaming to a client is allowed to finish, while
   its temporary fill is marked invalid so it cannot repopulate the cache after
