@@ -635,6 +635,39 @@ Next.js stops being publicly reachable and listens only for Harmost. Whatever
 used to point at Next — your load balancer, your CDN origin, your DNS record —
 now points at Harmost instead.
 
+#### Choosing the replica count
+
+Harmost's cache, request coalescing and admission limits are local to each
+process. Choose the smallest fixed replica count that meets your availability
+needs:
+
+| Replicas | Recommended use | Trade-off |
+| --- | --- | --- |
+| **1** | Simple, internal or cost-sensitive deployments | Best cache reuse and simplest operation, with a brief interruption and a cold cache after a restart |
+| **2** | Production deployments that must remain available during a pod failure or rollout | Two independent caches and a temporary rise in origin traffic during failover |
+| **3+** | Only when measured availability or throughput requires it | More duplicated cache entries, cold starts and capacity coordination |
+
+Use two replicas as active peers behind an ingress or load balancer, not as a
+primary and passive backup. Consistently hash the request URI so the same path
+normally reaches the same warm cache. If a replica fails, traffic moves to the
+survivor while the replacement starts with an empty cache.
+
+Pingora handles connections, draining and planned graceful upgrades; it does
+not restart a failed process or pod. Kubernetes, Docker, systemd or another
+supervisor must provide restart and health-check policy.
+
+For every multi-replica deployment:
+
+- Divide the safe origin concurrency across replicas. A global limit of `80`
+  with two replicas means a local limit of `40` each.
+- Send every purge to every replica's admin endpoint. The local caches are not
+  synchronized.
+- Expect simultaneous misses on different replicas to render separately;
+  coalescing only combines requests handled by the same process.
+- Keep the deployed replica count at or below the count used to generate the
+  capacity configuration. Avoid automatic scale-out until the global budget
+  is coordinated externally.
+
 #### One server
 
 Both processes on the same box. Harmost takes the public port, Next binds to
@@ -721,12 +754,13 @@ Ingress ──▶ Service/harmost ──▶ Deployment/harmost (2 replicas)
 
 with `upstreams: ["web.default.svc.cluster.local:3000"]`.
 
-Keep the Harmost replica count low and declare one group budget when generating
-configuration. For example, `--global-concurrency 80 --replicas 2` emits a
-local ceiling of 40 and a `capacity` contract that Harmost validates. Keep the
-Deployment at or below that replica count. Have the Ingress consistently hash
-the URI so one key normally lands on one local cache; correctness and privacy
-do not depend on that affinity.
+Follow the [replica-count guidance](#choosing-the-replica-count): declare one
+group budget when generating configuration and consistently hash the URI at
+the Ingress. Cache affinity improves reuse, but correctness and privacy do not
+depend on it. For two replicas, use `maxUnavailable: 0`, a PodDisruptionBudget
+with `minAvailable: 1`, and topology spread or anti-affinity so one node failure
+does not remove both replicas. See the [operations guide](./docs/OPERATIONS.md#kubernetes)
+for probes, draining and resource limits.
 
 #### Where this does not work
 
