@@ -59,6 +59,7 @@ Reference documentation:
 | | |
 |---|---|
 | [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | Running it: readiness, drain, restart, systemd, Kubernetes, what to alert on |
+| [`docs/STANDALONE.md`](./docs/STANDALONE.md) | Installing one binary on a server and connecting a domain |
 | [`docs/CONFIG-SCHEMA.md`](./docs/CONFIG-SCHEMA.md) | Schema versioning, what may change without a bump, migration notes |
 | [`docs/RELEASE-GATES.md`](./docs/RELEASE-GATES.md) | What has to pass before a tag, and what is deliberately not gated |
 | [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) | What is protected, from whom, and what is not defended |
@@ -509,17 +510,21 @@ Harmost is not on crates.io. It targets Linux: the published image is
 `linux/amd64` and the release binary is `x86_64-unknown-linux-gnu`. There are
 no macOS or Windows artifacts.
 
+Choose either supported deployment form:
+
+- **One Linux server:** install the release binary, generate one
+  `/etc/harmost/harmost.yaml`, and run it under systemd. Follow the
+  [standalone server guide](./docs/STANDALONE.md).
+- **Containers:** use the published image with Docker, a managed container
+  platform, or Kubernetes.
+
 Tagged releases publish a `linux/amd64` container image to GitHub Packages at
 `ghcr.io/akosidencio/harmost`, built from the repository
 [`Dockerfile`](./Dockerfile). The same Dockerfile builds a local image for
-testing and as a base for deployment work. The image is the recommended way to
-run Harmost, and the one every topology below assumes unless it says otherwise.
+testing and as a base for deployment work.
 
-A release also attaches a single `x86_64-unknown-linux-gnu` binary, with a
-checksum for both the archive and the binary inside it. That exists for the one
-topology a container does not serve — the systemd unit in
-[`docs/OPERATIONS.md`](./docs/OPERATIONS.md), which runs
-`/usr/local/bin/harmost` directly.
+A release also attaches a `x86_64-unknown-linux-gnu` binary, checksums, and a
+ready-to-install systemd unit. Docker is not required.
 
 ```bash
 docker pull ghcr.io/akosidencio/harmost:<version>
@@ -551,9 +556,13 @@ The binary lands at `target/release/harmost`.
 
 ```bash
 ./target/release/harmost version
-./target/release/harmost check --config harmost.yaml   # validate, don't start
-./target/release/harmost run   --config harmost.yaml   # start the proxy
+./target/release/harmost init                           # create harmost.yaml
+./target/release/harmost check                          # validate, don't start
+./target/release/harmost run                            # start the proxy
 ```
+
+Without `--config`, Harmost checks `HARMOST_CONFIG`, the current directory,
+then `/etc/harmost/harmost.yaml`. Both `.yaml` and `.yml` are accepted.
 
 `harmost check` exits non-zero on an invalid or unsafe configuration, so it
 works as a CI gate on a config change.

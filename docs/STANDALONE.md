@@ -1,0 +1,118 @@
+# Standalone server
+
+Harmost can run as one Linux binary under systemd. Docker and Kubernetes are
+optional. For one application on one server, use this network path:
+
+```text
+DNS -> Caddy :443 -> Harmost 127.0.0.1:8080 -> application 127.0.0.1:3000
+```
+
+Caddy owns the public domain and renews its TLS certificate. Harmost stays on
+loopback and governs origin work. The application also stays on loopback, so
+traffic cannot bypass Harmost.
+
+## 1. Install the release binary
+
+Download the archive and checksum from the GitHub release. Replace the version
+with the release you want to install.
+
+```bash
+VERSION=0.1.3
+TARGET=x86_64-unknown-linux-gnu
+BASE="https://github.com/akosidencio/harmost/releases/download/v${VERSION}"
+
+curl -fsSLO "${BASE}/harmost-${VERSION}-${TARGET}.tar.gz"
+curl -fsSLO "${BASE}/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+tar xzf "harmost-${VERSION}-${TARGET}.tar.gz"
+cd "harmost-${VERSION}-${TARGET}"
+
+sudo ./install.sh
+```
+
+The installer adds the binary, a restricted service account, the systemd unit,
+and `/etc/harmost/harmost.yaml`. It preserves that config when upgrading and
+does not start Harmost before you review it.
+
+## 2. Create `harmost.yaml`
+
+The generated defaults fit a single server with a local application on port
+3000. The catch-all treats every response as private, so the first deployment
+bounds origin work without sharing user data.
+
+```bash
+sudo -u harmost harmost check
+```
+
+Use flags when the local ports or initial origin ceiling differ:
+
+```bash
+sudo harmost init \
+  --config /etc/harmost/harmost.yaml \
+  --upstream 127.0.0.1:4000 \
+  --listen 127.0.0.1:8080 \
+  --concurrency 24 \
+  --force
+sudo chown root:harmost /etc/harmost/harmost.yaml
+sudo chmod 0640 /etc/harmost/harmost.yaml
+```
+
+The initial concurrency value is a starting point. Measure the application and
+tune it before relying on the limit in production. Add reviewed public routes
+above `default-private` when caching or request coalescing is safe for them.
+
+`harmost run` and `harmost check` find `/etc/harmost/harmost.yaml`
+automatically. An explicit `--config` flag or `HARMOST_CONFIG` overrides the
+default search.
+
+## 3. Run the application and Harmost
+
+Run the application with its own supervisor and bind it to loopback:
+
+```bash
+next start -H 127.0.0.1 -p 3000
+```
+
+Then enable Harmost:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now harmost
+sudo systemctl status harmost
+curl http://127.0.0.1:9091/health/live
+```
+
+## 4. Point a domain at the server
+
+Create DNS `A` and, when available, `AAAA` records for the domain pointing to
+the server. Install Caddy, then add this site block to its Caddyfile:
+
+```caddyfile
+app.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Reload Caddy after replacing `app.example.com`. Caddy accepts public traffic on
+ports 80 and 443, obtains the certificate, and forwards the original host,
+client address, and scheme to Harmost. The generated config trusts those
+forwarded values only from loopback.
+
+Keep ports 8080, 3000, and the admin port 9091 closed to the public network.
+Only ports 80 and 443 need to be reachable. If a cloud load balancer or another
+edge proxy replaces Caddy, update `server.trusted_proxies.from` to that proxy's
+private address range.
+
+Harmost can terminate TLS itself when built with the `tls` feature, but it does
+not obtain or renew certificates. A small edge proxy is the simpler public
+server setup and provides a quick path around Harmost during an incident.
+
+## Everyday commands
+
+```bash
+harmost check                              # validate the discovered config
+sudo systemctl reload harmost              # apply reloadable policy changes
+sudo systemctl restart harmost             # restart after listener changes
+journalctl -u harmost -f                    # follow logs
+curl http://127.0.0.1:9091/status           # inspect current state
+```

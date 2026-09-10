@@ -8,7 +8,12 @@ working prototype without sustained production validation.
 - Validate the static partition and path-stable reference in production-shaped staging.
 - Revisit capacity leases, adaptive limits, and distributed reuse only if fixed partitions prove insufficient.
 
-## 7. Expand framework support
+## 7. Complete standalone distribution
+
+- Validate the binary, generated config, systemd unit, and domain guide on a clean server.
+- Add Linux ARM64 and package-manager installation when demand justifies them.
+
+## 8. Expand framework support
 
 - After phases 5–6, extract a versioned adapter contract and shared conformance tests.
 - Choose the next framework based on demonstrated self-hosting demand.
