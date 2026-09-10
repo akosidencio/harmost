@@ -31,6 +31,10 @@ emits JSON `render_start` and `render_end` records carrying an instance id and a
 unique render id. Harmost's Prometheus origin counter is the machine-readable
 witness used by `bench/nextjs.sh` across all three origins.
 
+Product responses also emit the public `X-Harmost-Cache-Tags` contract. The
+fixture therefore exercises tag invalidation without Next.js private minimal
+mode, which disables the image optimiser covered by the same scenario.
+
 Run the complete scenario from the repository root:
 
 ```bash

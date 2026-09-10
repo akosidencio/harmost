@@ -42,7 +42,7 @@ cache:
   store: memory
   max_memory: 64MiB
   max_body_size: 4MiB
-  tag_header: "x-next-cache-tags"
+  tag_header: "x-harmost-cache-tags"
   purge:
     token: "nextjs-reference-purge-token-0001"
 

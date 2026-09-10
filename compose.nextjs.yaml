@@ -19,7 +19,6 @@ x-next-origin: &next-origin
     HARMOST_BUILD_ID: next-fixture-v1
     HARMOST_DOCTOR_TOKEN: nextjs-reference-doctor-token
     NEXT_SHARED_CACHE_DIR: /var/cache/next
-    NEXT_PRIVATE_MINIMAL_MODE: "1"
   volumes:
     - next-cache:/var/cache/next
 
