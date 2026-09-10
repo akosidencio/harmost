@@ -184,11 +184,18 @@ export async function doctor(build, options = {}) {
       const initial = await Promise.all(origins.map(readProbe));
       const invalidate = await boundedFetch(new URL('/.well-known/harmost/cache', origins[0]), { method: 'POST', headers }, options.timeoutMs);
       if (!invalidate.ok) throw new Error(`cache invalidation probe answered ${invalidate.status}`);
-      const afterFirst = await readProbe(origins[0]);
-      const after = await Promise.all(origins.map(readProbe));
       const initialConverged = initial.every((value) => value.generation === before.generation);
-      const invalidated = afterFirst.generation !== before.generation;
-      const finalConverged = after.every((value) => value.generation === afterFirst.generation);
+      const deadline = performance.now() + (options.timeoutMs ?? 2000);
+      let invalidated = false;
+      let finalConverged = false;
+      do {
+        const afterFirst = await readProbe(origins[0]);
+        const after = await Promise.all(origins.map(readProbe));
+        invalidated = afterFirst.generation !== before.generation;
+        finalConverged = after.every((value) => value.generation === afterFirst.generation);
+        if (invalidated && finalConverged) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      } while (performance.now() < deadline);
       checks.push(checkResult(
         'Next.js cache coordination',
         initialConverged && invalidated && finalConverged ? 'pass' : 'fail',
