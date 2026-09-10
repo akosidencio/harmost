@@ -179,27 +179,31 @@ export async function doctor(build, options = {}) {
       if (!response.ok) throw new Error(`${new URL(origin).origin} cache probe answered ${response.status}`);
       return response.json();
     };
-    try {
-      const before = await readProbe(origins[0]);
-      const initial = await Promise.all(origins.map(readProbe));
-      const invalidate = await boundedFetch(new URL('/.well-known/harmost/cache', origins[0]), { method: 'POST', headers }, options.timeoutMs);
-      if (!invalidate.ok) throw new Error(`cache invalidation probe answered ${invalidate.status}`);
-      const initialConverged = initial.every((value) => value.generation === before.generation);
+    const waitForConvergence = async (previousGeneration) => {
       const deadline = performance.now() + (options.timeoutMs ?? 2000);
-      let invalidated = false;
-      let finalConverged = false;
+      let generation;
+      let converged = false;
+      let changed = previousGeneration === undefined;
       do {
-        const afterFirst = await readProbe(origins[0]);
-        const after = await Promise.all(origins.map(readProbe));
-        invalidated = afterFirst.generation !== before.generation;
-        finalConverged = after.every((value) => value.generation === afterFirst.generation);
-        if (invalidated && finalConverged) break;
+        const first = await readProbe(origins[0]);
+        const values = await Promise.all(origins.map(readProbe));
+        generation = first.generation;
+        converged = values.every((value) => value.generation === generation);
+        changed = previousGeneration === undefined || generation !== previousGeneration;
+        if (changed && converged) break;
         await new Promise((resolve) => setTimeout(resolve, 25));
       } while (performance.now() < deadline);
+      return { generation, converged, changed };
+    };
+    try {
+      const initial = await waitForConvergence();
+      const invalidate = await boundedFetch(new URL('/.well-known/harmost/cache', origins[0]), { method: 'POST', headers }, options.timeoutMs);
+      if (!invalidate.ok) throw new Error(`cache invalidation probe answered ${invalidate.status}`);
+      const final = await waitForConvergence(initial.generation);
       checks.push(checkResult(
         'Next.js cache coordination',
-        initialConverged && invalidated && finalConverged ? 'pass' : 'fail',
-        `initial=${initialConverged}, invalidated=${invalidated}, converged=${finalConverged}`,
+        initial.converged && final.changed && final.converged ? 'pass' : 'fail',
+        `initial=${initial.converged}, invalidated=${final.changed}, converged=${final.converged}`,
       ));
     } catch (cause) {
       checks.push(checkResult('Next.js cache coordination', 'fail', cause.message));
