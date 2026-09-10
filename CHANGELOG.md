@@ -11,6 +11,7 @@ work and [operations guide](./docs/OPERATIONS.md) for deployment details.
 - Added a production-shaped Next.js reference with shared cache state, stable identity, an edge boundary, and expanded CI checks.
 - Added Prometheus recording rules and deployment identity artifacts.
 - Added conservative replica-group capacity partitioning, URI-stable ingress, and purge fan-out.
+- Added standalone setup with generated configuration, automatic config discovery, and a packaged systemd service.
 
 ## 0.1.2 — 2026-09-02
 

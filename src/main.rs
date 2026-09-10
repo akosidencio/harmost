@@ -1,15 +1,28 @@
 //! `harmost` — origin workload governor.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
 harmost — origin workload governor for server-rendered applications
 
 USAGE:
-    harmost check --config <FILE>   Validate a config file and exit
+    harmost init [OPTIONS]          Create a safe single-server config
+    harmost check [--config <FILE>] Validate a config file and exit
     harmost version                 Print the version and build features
 
-    harmost run --config <FILE> [OPTIONS]
+    harmost run [--config <FILE>] [OPTIONS]
+
+CONFIG:
+    --config, -c <FILE>  Use this file. Otherwise Harmost checks
+                         $HARMOST_CONFIG, ./harmost.yaml, ./harmost.yml,
+                         /etc/harmost/harmost.yaml, then /etc/harmost/harmost.yml.
+
+INIT OPTIONS:
+    --upstream <ADDR>       Origin address (default: 127.0.0.1:3000)
+    --listen <ADDR>         Harmost address (default: 127.0.0.1:8080)
+    --concurrency <NUMBER>  Origin work ceiling (default: 16)
+    --force                 Replace an existing config file
 
 RUN OPTIONS:
     --upgrade    Take the listening sockets over from a running Harmost.
@@ -47,15 +60,20 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Some("check") => match config_path(&args) {
-            Some(path) => check(&path),
-            None => {
-                eprintln!("harmost check: --config <FILE> is required");
+        Some("init") if has_flag(&args, "--help") || has_flag(&args, "-h") => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("init") => init(&args),
+        Some("check") => match resolve_config_path(&args) {
+            Ok(path) => check(path.to_string_lossy().as_ref()),
+            Err(error) => {
+                eprintln!("harmost check: {error}");
                 ExitCode::from(2)
             }
         },
-        Some("run") => match config_path(&args) {
-            Some(path) => {
+        Some("run") => match resolve_config_path(&args) {
+            Ok(path) => {
                 let flags = RunFlags {
                     upgrade: has_flag(&args, "--upgrade"),
                     daemon: has_flag(&args, "--daemon"),
@@ -65,10 +83,10 @@ fn main() -> ExitCode {
                     eprintln!("harmost run: unknown option `{unknown}`\n\n{USAGE}");
                     return ExitCode::from(2);
                 }
-                run(&path, flags)
+                run(path.to_string_lossy().as_ref(), flags)
             }
-            None => {
-                eprintln!("harmost run: --config <FILE> is required");
+            Err(error) => {
+                eprintln!("harmost run: {error}");
                 ExitCode::from(2)
             }
         },
@@ -83,9 +101,220 @@ fn main() -> ExitCode {
     }
 }
 
-fn config_path(args: &[String]) -> Option<String> {
-    let i = args.iter().position(|a| a == "--config" || a == "-c")?;
-    args.get(i + 1).cloned()
+fn resolve_config_path(args: &[String]) -> Result<PathBuf, String> {
+    if let Some(i) = args.iter().position(|a| a == "--config" || a == "-c") {
+        return args
+            .get(i + 1)
+            .filter(|value| !value.starts_with('-'))
+            .map(PathBuf::from)
+            .ok_or_else(|| "--config requires a file path".to_string());
+    }
+
+    if let Some(path) = std::env::var_os("HARMOST_CONFIG").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+
+    const DEFAULTS: [&str; 4] = [
+        "harmost.yaml",
+        "harmost.yml",
+        "/etc/harmost/harmost.yaml",
+        "/etc/harmost/harmost.yml",
+    ];
+    DEFAULTS
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "no config found; run `harmost init`, set HARMOST_CONFIG, or pass --config <FILE>"
+                .to_string()
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitOptions {
+    config: PathBuf,
+    upstream: String,
+    listen: String,
+    concurrency: usize,
+    force: bool,
+}
+
+impl Default for InitOptions {
+    fn default() -> Self {
+        Self {
+            config: PathBuf::from("harmost.yaml"),
+            upstream: "127.0.0.1:3000".to_string(),
+            listen: "127.0.0.1:8080".to_string(),
+            concurrency: 16,
+            force: false,
+        }
+    }
+}
+
+fn init(args: &[String]) -> ExitCode {
+    let options = match parse_init_options(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("harmost init: {error}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let contents = render_initial_config(&options);
+
+    // Parse and validate the generated text before touching the destination.
+    // This also validates user-provided listener and upstream addresses.
+    let config: harmost::config::schema::Config = match serde_saphyr::from_str(&contents) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("harmost init: generated an invalid config: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = harmost::config::validation::validate(&config) {
+        eprintln!("harmost init: {error}");
+        return ExitCode::from(2);
+    }
+    if let Err(error) = harmost::policy::PolicySnapshot::build(config, 1) {
+        eprintln!("harmost init: {error}");
+        return ExitCode::from(2);
+    }
+
+    if options.config.exists() && !options.force {
+        eprintln!(
+            "harmost init: {} already exists; pass --force to replace it",
+            options.config.display()
+        );
+        return ExitCode::from(2);
+    }
+    if let Some(parent) = options
+        .config
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "harmost init: could not create {}: {error}",
+            parent.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = std::fs::write(&options.config, contents) {
+        eprintln!(
+            "harmost init: could not write {}: {error}",
+            options.config.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    println!("created {}", options.config.display());
+    println!("  listen: {}", options.listen);
+    println!("  upstream: {}", options.upstream);
+    println!("  origin concurrency ceiling: {}", options.concurrency);
+    println!("next: harmost check --config {}", options.config.display());
+    ExitCode::SUCCESS
+}
+
+fn parse_init_options(args: &[String]) -> Result<InitOptions, String> {
+    let mut options = InitOptions::default();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" | "-c" => {
+                options.config = PathBuf::from(option_value(args, &mut i, "--config")?);
+            }
+            "--upstream" => {
+                options.upstream = option_value(args, &mut i, "--upstream")?.to_string();
+            }
+            "--listen" => {
+                options.listen = option_value(args, &mut i, "--listen")?.to_string();
+            }
+            "--concurrency" => {
+                let value = option_value(args, &mut i, "--concurrency")?;
+                options.concurrency = value
+                    .parse()
+                    .map_err(|_| "--concurrency must be a positive integer".to_string())?;
+                if options.concurrency == 0 {
+                    return Err("--concurrency must be greater than zero".to_string());
+                }
+            }
+            "--force" => options.force = true,
+            unknown => return Err(format!("unknown option `{unknown}`")),
+        }
+        i += 1;
+    }
+    Ok(options)
+}
+
+fn option_value<'a>(
+    args: &'a [String],
+    index: &mut usize,
+    option: &str,
+) -> Result<&'a str, String> {
+    *index += 1;
+    args.get(*index)
+        .filter(|value| !value.starts_with('-'))
+        .map(String::as_str)
+        .ok_or_else(|| format!("{option} requires a value"))
+}
+
+fn yaml_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn render_initial_config(options: &InitOptions) -> String {
+    let queue = options.concurrency.saturating_mul(2);
+    format!(
+        r#"# Generated by `harmost init`. Add reviewed public routes above the private catch-all.
+version: 1
+
+server:
+  listen: {}
+  # The generated setup expects a local TLS edge such as Caddy.
+  trusted_proxies:
+    from: ["127.0.0.1/32", "::1/128"]
+    client_ip: x_forwarded
+    scheme: x_forwarded
+
+origin:
+  upstreams: [{}]
+  concurrency:
+    # Safe capacity depends on the application. Start here, measure, then tune.
+    max: {}
+    queue:
+      max: {}
+      timeout: 2s
+
+telemetry:
+  admin:
+    listen: "127.0.0.1:9091"
+
+routes:
+  - id: default-private
+    match: "/**"
+    class: private_dynamic
+    cache:
+      enabled: false
+    coalesce:
+      enabled: false
+"#,
+        yaml_quote(&options.listen),
+        yaml_quote(&options.upstream),
+        options.concurrency,
+        queue,
+    )
 }
 
 /// What `run` was asked to do beyond starting.
@@ -814,6 +1043,60 @@ fn check(path: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_defaults_make_a_safe_valid_config() {
+        let options = InitOptions::default();
+        let text = render_initial_config(&options);
+        let config: harmost::config::schema::Config = serde_saphyr::from_str(&text).unwrap();
+
+        harmost::config::validation::validate(&config).unwrap();
+        harmost::policy::PolicySnapshot::build(config, 1).unwrap();
+        assert!(text.contains("class: private_dynamic"));
+        assert!(text.contains("enabled: false"));
+    }
+
+    #[test]
+    fn init_options_override_the_single_server_defaults() {
+        let args = vec![
+            "init".to_string(),
+            "--config".to_string(),
+            "/tmp/custom.yml".to_string(),
+            "--upstream".to_string(),
+            "app.internal:4000".to_string(),
+            "--listen".to_string(),
+            "0.0.0.0:8088".to_string(),
+            "--concurrency".to_string(),
+            "24".to_string(),
+            "--force".to_string(),
+        ];
+
+        let options = parse_init_options(&args).unwrap();
+        assert_eq!(options.config, PathBuf::from("/tmp/custom.yml"));
+        assert_eq!(options.upstream, "app.internal:4000");
+        assert_eq!(options.listen, "0.0.0.0:8088");
+        assert_eq!(options.concurrency, 24);
+        assert!(options.force);
+    }
+
+    #[test]
+    fn init_rejects_zero_concurrency_and_missing_values() {
+        let zero = vec![
+            "init".to_string(),
+            "--concurrency".to_string(),
+            "0".to_string(),
+        ];
+        assert_eq!(
+            parse_init_options(&zero).unwrap_err(),
+            "--concurrency must be greater than zero"
+        );
+
+        let missing = vec!["init".to_string(), "--upstream".to_string()];
+        assert_eq!(
+            parse_init_options(&missing).unwrap_err(),
+            "--upstream requires a value"
+        );
+    }
 
     #[test]
     fn pingora_timeouts_round_fractional_seconds_up() {

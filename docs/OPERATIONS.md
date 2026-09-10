@@ -164,6 +164,10 @@ second full drain.
 
 ## systemd
 
+Release archives include the ready-to-install unit from
+[`packaging/systemd/harmost.service`](../packaging/systemd/harmost.service).
+The expanded example below documents each operational setting.
+
 ```ini
 [Unit]
 Description=Harmost origin workload governor

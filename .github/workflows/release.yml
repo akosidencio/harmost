@@ -86,8 +86,12 @@ jobs:
         run: |
           version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           name="harmost-${version}-${{ env.TARGET }}"
-          mkdir -p "dist/$name"
+          mkdir -p "dist/$name/docs"
           cp "target/${{ env.TARGET }}/release/harmost" "dist/$name/"
+          cp packaging/systemd/harmost.service "dist/$name/"
+          cp packaging/install.sh "dist/$name/"
+          chmod 0755 "dist/$name/install.sh"
+          cp docs/STANDALONE.md "dist/$name/docs/"
           cp LICENSE README.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           # The checksum of the *binary* as well as of the archive: gzip records
