@@ -15,6 +15,9 @@ x-next-origin: &next-origin
     timeout: 1s
     retries: 30
   restart: unless-stopped
+  depends_on:
+    next-cache-init:
+      condition: service_completed_successfully
   environment: &next-environment
     HARMOST_BUILD_ID: next-fixture-v1
     HARMOST_DOCTOR_TOKEN: nextjs-reference-doctor-token
@@ -23,6 +26,22 @@ x-next-origin: &next-origin
     - next-cache:/var/cache/next
 
 services:
+  # Named volumes start as root-owned. Prepare the shared cache before the
+  # non-root Next.js origins try to create entries and invalidation state.
+  next-cache-init:
+    image: harmost-next-origin:reference
+    build:
+      context: ./fixtures/next-storefront
+      args:
+        HARMOST_BUILD_ID: next-fixture-v1
+        NEXT_SERVER_ACTIONS_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+    user: root
+    entrypoint: ["sh", "-c"]
+    command: ["chown -R nextjs:nodejs /var/cache/next"]
+    volumes:
+      - next-cache:/var/cache/next
+    restart: "no"
+
   next-1:
     <<: *next-origin
     environment:
