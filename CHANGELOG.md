@@ -3,7 +3,7 @@
 Notable changes by version. See the [roadmap](./docs/ROADMAP.md) for remaining
 work and [operations guide](./docs/OPERATIONS.md) for deployment details.
 
-## 0.1.3 Unreleased
+## 0.1.3 — 2026-09-12
 
 - Added checked-in Next.js route approvals with strict fail-closed validation.
 - Added `inspect`, `doctor`, `explain`, and guarded capacity calibration workflows.
