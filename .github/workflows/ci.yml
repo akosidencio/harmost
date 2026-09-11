@@ -7,6 +7,17 @@ on:
     branches: [main, dev, 'feat/**']
   # Reused as the release gate so a tag cannot publish untested code.
   workflow_call:
+    inputs:
+      ref:
+        # Without this every job below checks out `github.ref`, which is the
+        # *caller's* ref. On a tag push that is the tag, so the gate is honest.
+        # On a `workflow_dispatch` re-cut it is the branch the run was started
+        # from — so the QA suite would pass on `main` while the binary, SBOM
+        # and image were built from the tag. Release passes the tag explicitly.
+        description: "Ref to check out. Defaults to the caller's ref."
+        type: string
+        required: false
+        default: ""
 
 # A new push to a branch cancels the run still going for the old head.
 concurrency:
@@ -30,6 +41,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       # pingora builds its TLS bindings from source.
       - name: Install build dependencies
@@ -93,6 +106,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
@@ -115,6 +130,8 @@ jobs:
         working-directory: packages/harmost-next
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build harmost, so the generated config can be checked for real
@@ -156,6 +173,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install build dependencies
         run: |
@@ -177,7 +196,7 @@ jobs:
             echo "memory: $(free -h | awk '/^Mem:/ {print $2}')"
             echo "kernel: $(uname -r)"
             echo "rustc: $(rustc --version)"
-            echo "commit: ${{ github.sha }}"
+            echo "commit: $(git rev-parse HEAD)"
           } | tee benchmark-environment.txt
 
       # A GitHub runner has two cores, so the concurrency is kept low enough
@@ -233,6 +252,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -262,6 +283,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install build dependencies
         run: |

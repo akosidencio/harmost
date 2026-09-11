@@ -19,10 +19,59 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # A tag is cut by hand, and the two mistakes a human makes cutting one both
+  # fail late and expensively. The v0.1.3 release is the worked example: the
+  # bump commit edited `version` in Cargo.toml and never regenerated
+  # Cargo.lock, so every `--locked` cargo call in the suite below died with
+  # "cannot update the lock file" — 30 seconds into a job, 12 minutes into a
+  # release, and with an error message that says nothing about the version
+  # bump that caused it.
+  #
+  # Both checks are cheap and neither needs the project to compile, so they run
+  # ahead of everything and gate it. A mis-cut tag now costs seconds.
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A tag that disagrees with Cargo.toml ships a mislabelled release.
+      - name: Verify the tag matches Cargo.toml
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          crate="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "tag=$tag crate=$crate"
+          if [ "$tag" != "v$crate" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      # `cargo metadata` resolves the full graph against the lockfile, so
+      # --locked fails here for exactly the reasons it fails in a build: a
+      # version bump, an added dependency, or an edited constraint that never
+      # made it into Cargo.lock.
+      - name: Verify Cargo.lock is in sync with Cargo.toml
+        run: |
+          if ! cargo metadata --locked --format-version 1 > /dev/null; then
+            echo "::error::Cargo.lock is stale — run 'cargo check' and commit the regenerated Cargo.lock"
+            exit 1
+          fi
+
   # A tag can point at any commit, and CI only runs on branches — so re-run the
-  # full QA suite against the tagged tree before anything is published.
+  # full QA suite against the tagged tree before anything is published. The ref
+  # is passed explicitly: a `workflow_dispatch` re-cut would otherwise test the
+  # branch it was started from while the artifacts below are built from the tag.
   test:
+    needs: preflight
     uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ inputs.tag || github.ref }}
 
   # The versioned release binary — Linux only, deliberately.
   #
@@ -159,17 +208,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
-
-      # A tag that disagrees with Cargo.toml ships a mislabelled image.
-      - name: Verify tag matches Cargo.toml version
-        run: |
-          tag="${{ inputs.tag || github.ref_name }}"
-          crate="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          echo "tag=$tag crate=$crate"
-          if [ "$tag" != "v$crate" ]; then
-            echo "::error::tag $tag does not match Cargo.toml version $crate"
-            exit 1
-          fi
 
       - uses: docker/setup-buildx-action@v3
 
