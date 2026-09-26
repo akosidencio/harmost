@@ -626,6 +626,20 @@ fn run(path: &str, flags: RunFlags) -> ExitCode {
         None => None,
     };
 
+    let resolve_interval = policy.load().config.origin.resolve_interval.as_duration();
+    for backend in upstreams.backends() {
+        harmost::telemetry::metrics::UPSTREAM_ADDRESSES
+            .with_label_values(&[&backend.address])
+            .set(i64::try_from(backend.sockets().len()).unwrap_or(i64::MAX));
+    }
+    if !resolve_interval.is_zero() {
+        eprintln!("  upstream re-resolution: every {resolve_interval:?}");
+        server.add_service(pingora_core::services::background::background_service(
+            "resolver",
+            harmost::upstream::resolver::Resolver::new(upstreams.clone(), resolve_interval),
+        ));
+    }
+
     if let Some(health) = health_cfg {
         eprintln!(
             "  health checks: {} every {:?}",

@@ -41,7 +41,9 @@ use crate::admission::{Admission, AdmissionController};
 use crate::cache::policy::{Disposition, Shareability, evaluate_request, evaluate_response};
 use crate::cache::{BoundedStore, KeyBuilder};
 use crate::classifier::{FrameworkAdapter, RequestClass, RequestMetadata, nextjs::NextJs};
-use crate::config::schema::{LogFormat, Mode, OriginHttpVersion, Priority, RouteCache, Timeouts};
+use crate::config::schema::{
+    LoadBalancing, LogFormat, Mode, OriginHttpVersion, Priority, RouteCache, Timeouts,
+};
 use crate::net::forwarded::{ClientFacts, ListenerScheme, TrustPolicy};
 use crate::policy::PolicySnapshot;
 use crate::proxy::spool::{Spool, SpoolBudget, SpoolOutcome};
@@ -995,6 +997,11 @@ impl ProxyHttp for Harmost {
             .upstreams
             .select(path)
             .ok_or_else(|| Error::explain(ErrorType::InternalError, "no upstream configured"))?;
+        // Which of the instances behind this upstream's name. Under
+        // `hash_by_path` a path keeps reaching the same instance, whose own
+        // render cache then stays warm; otherwise instances take turns.
+        let socket = backend
+            .socket_for((self.upstreams.strategy() == LoadBalancing::HashByPath).then_some(path));
         // Called again for every retry, which is the point: a retried request
         // goes back through selection and so lands wherever the breakers and
         // the load signal now say it should, rather than back on the backend
@@ -1022,12 +1029,12 @@ impl ProxyHttp for Harmost {
         let origin = &ctx.policy.config.origin;
         let mut peer = match &origin.tls {
             Some(tls) => {
-                let mut peer = HttpPeer::new(backend.socket, true, tls.sni.clone());
+                let mut peer = HttpPeer::new(socket, true, tls.sni.clone());
                 peer.options.verify_cert = tls.verify_cert;
                 peer.options.verify_hostname = tls.verify_hostname;
                 peer
             }
-            None => HttpPeer::new(backend.socket, false, String::new()),
+            None => HttpPeer::new(socket, false, String::new()),
         };
         peer.options.alpn = match origin.http_version {
             OriginHttpVersion::Http1 => pingora_core::protocols::ALPN::H1,
