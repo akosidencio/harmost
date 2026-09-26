@@ -266,6 +266,18 @@ pub static UPSTREAM_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric registration")
 });
 
+/// How many addresses each upstream's name currently resolves to — the number
+/// of origin instances Harmost is spreading work across. A drop to 1 when the
+/// platform runs several instances means the others are not being used.
+pub static UPSTREAM_ADDRESSES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "harmost_upstream_addresses",
+        "Addresses an upstream name currently resolves to",
+        &["upstream"]
+    )
+    .expect("metric registration")
+});
+
 /// 1 while a backend's circuit breaker is open, 0 while it is closed.
 ///
 /// The companion to `harmost_upstream_healthy`, and the one that moves when an
@@ -432,6 +444,7 @@ pub fn preregister() {
     LazyLock::force(&CONFIG_GENERATION);
     LazyLock::force(&CONFIG_FINGERPRINT);
     LazyLock::force(&UPSTREAM_HEALTHY);
+    LazyLock::force(&UPSTREAM_ADDRESSES);
     LazyLock::force(&UPSTREAM_EJECTED);
     LazyLock::force(&UPSTREAM_TRIPS);
     LazyLock::force(&UPSTREAM_FAILURES);

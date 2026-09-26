@@ -17,7 +17,7 @@ Download the archive and checksum from the GitHub release. Replace the version
 with the release you want to install.
 
 ```bash
-VERSION=0.1.3
+VERSION=0.1.4
 TARGET=x86_64-unknown-linux-gnu
 BASE="https://github.com/akosidencio/harmost/releases/download/v${VERSION}"
 

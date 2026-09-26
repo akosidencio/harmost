@@ -246,6 +246,11 @@ pub enum ForwardedSource {
 #[serde(deny_unknown_fields)]
 pub struct Origin {
     pub upstreams: Vec<String>,
+    /// How often each upstream name is looked up again, so instances the
+    /// platform adds or replaces start (and stop) receiving traffic without a
+    /// restart. `0` resolves once at startup, the old behaviour.
+    #[serde(default = "d_10s")]
+    pub resolve_interval: Dur,
     #[serde(default)]
     pub load_balancing: LoadBalancing,
     #[serde(default)]

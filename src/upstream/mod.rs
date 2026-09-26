@@ -16,6 +16,7 @@
 
 pub mod breaker;
 pub mod health;
+pub mod resolver;
 pub mod retry;
 pub mod window;
 
@@ -25,14 +26,91 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
+
 use crate::config::schema::{Breaker as BreakerConfig, LoadBalancing};
 use breaker::{Breaker, BreakerAllowance, BreakerState, ProbeToken};
 
+/// One configured upstream: the name from `origin.upstreams` and every
+/// address it currently resolves to.
+///
+/// A name, not an address, because the platforms Harmost runs on hand out one
+/// DNS name for a set of instances — App Platform's internal service name,
+/// a Kubernetes headless Service — and grow, shrink and replace that set
+/// without telling anyone. Resolving once and keeping the first address, as
+/// Harmost used to, pinned every origin connection to one instance: on the
+/// staging storefront one instance ran at 100% CPU while its twin idled, and a
+/// replaced instance would have been unreachable until Harmost restarted.
+/// [`resolver`] re-resolves every `origin.resolve_interval`.
 #[derive(Debug, Clone)]
 pub struct Backend {
     pub id: usize,
     pub address: String,
-    pub socket: SocketAddr,
+    sockets: Arc<ArcSwap<Vec<SocketAddr>>>,
+    rotation: Arc<AtomicUsize>,
+}
+
+impl Backend {
+    fn new(id: usize, address: &str) -> Result<Self, String> {
+        let sockets = resolve(address)?;
+        Ok(Backend {
+            id,
+            address: address.to_string(),
+            sockets: Arc::new(ArcSwap::from_pointee(sockets)),
+            rotation: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Every address this upstream currently resolves to, in a stable order.
+    pub fn sockets(&self) -> Arc<Vec<SocketAddr>> {
+        self.sockets.load_full()
+    }
+
+    /// The address one origin connection should use.
+    ///
+    /// With a `key` — the path, under `hash_by_path` — the same path keeps
+    /// reaching the same instance, which is the point of that strategy: the
+    /// instance's own render cache stays warm. Without one, instances take
+    /// turns. The set never goes empty: [`Backend::refresh`] keeps the last
+    /// good answer rather than store none.
+    pub fn socket_for(&self, key: Option<&str>) -> SocketAddr {
+        let sockets = self.sockets.load();
+        let len = sockets.len().max(1);
+        let index = match key {
+            Some(key) => usize::try_from(fnv1a(key.as_bytes()) % len as u64).unwrap_or(0),
+            None => self.rotation.fetch_add(1, Ordering::Relaxed) % len,
+        };
+        sockets[index.min(sockets.len() - 1)]
+    }
+
+    /// Resolves the name again. Returns whether the set of addresses changed.
+    ///
+    /// A failed or empty lookup keeps the previous addresses: a DNS blip must
+    /// not take a working origin out of rotation, and the health checker and
+    /// breakers already handle instances that really are gone.
+    pub fn refresh(&self) -> Result<bool, String> {
+        let fresh = resolve(&self.address)?;
+        if **self.sockets.load() == fresh {
+            return Ok(false);
+        }
+        self.sockets.store(Arc::new(fresh));
+        Ok(true)
+    }
+}
+
+/// Every address `address` resolves to, sorted and without duplicates so that
+/// hashing a path onto them is stable between refreshes.
+fn resolve(address: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut sockets: Vec<SocketAddr> = address
+        .to_socket_addrs()
+        .map_err(|error| format!("could not resolve upstream `{address}`: {error}"))?
+        .collect();
+    sockets.sort();
+    sockets.dedup();
+    if sockets.is_empty() {
+        return Err(format!("upstream `{address}` resolved to no addresses"));
+    }
+    Ok(sockets)
 }
 
 /// A routing decision and, when applicable, the recovery-probe identity that
@@ -91,18 +169,7 @@ impl UpstreamPool {
         let backends = addresses
             .iter()
             .enumerate()
-            .map(|(id, address)| {
-                let socket = address
-                    .to_socket_addrs()
-                    .map_err(|error| format!("could not resolve upstream `{address}`: {error}"))?
-                    .next()
-                    .ok_or_else(|| format!("upstream `{address}` resolved to no addresses"))?;
-                Ok(Backend {
-                    id,
-                    address: address.clone(),
-                    socket,
-                })
-            })
+            .map(|(id, address)| Backend::new(id, address))
             .collect::<Result<Vec<_>, String>>()?;
         let state = backends
             .iter()
@@ -140,6 +207,10 @@ impl UpstreamPool {
 
     pub fn backends(&self) -> &[Backend] {
         &self.backends
+    }
+
+    pub fn strategy(&self) -> LoadBalancing {
+        self.strategy
     }
 
     pub fn is_empty(&self) -> bool {
@@ -786,5 +857,59 @@ mod tests {
                 "one healthy backend with a closed breaker is the only choice"
             );
         }
+    }
+
+    /// A backend whose name stands for several instances, as App Platform's
+    /// internal service name does when a component runs more than one.
+    fn multi_instance(addresses: &[&str]) -> Backend {
+        let sockets: Vec<SocketAddr> = addresses.iter().map(|a| a.parse().unwrap()).collect();
+        Backend {
+            id: 0,
+            address: "origin:3000".to_string(),
+            sockets: Arc::new(ArcSwap::from_pointee(sockets)),
+            rotation: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[test]
+    fn instances_behind_one_name_all_receive_connections() {
+        // Regression: the first resolved address was kept and every other
+        // instance idled — the staging storefront ran one instance at 100% CPU
+        // while its twin sat at 0%.
+        let backend = multi_instance(&["10.0.0.1:3000", "10.0.0.2:3000", "10.0.0.3:3000"]);
+        let used: std::collections::HashSet<SocketAddr> =
+            (0..9).map(|_| backend.socket_for(None)).collect();
+
+        assert_eq!(used.len(), 3);
+    }
+
+    #[test]
+    fn hash_by_path_keeps_a_path_on_one_instance() {
+        let backend = multi_instance(&["10.0.0.1:3000", "10.0.0.2:3000"]);
+        let first = backend.socket_for(Some("/books/noli-me-tangere"));
+
+        for _ in 0..5 {
+            assert_eq!(backend.socket_for(Some("/books/noli-me-tangere")), first);
+        }
+    }
+
+    #[test]
+    fn a_failed_lookup_keeps_the_previous_addresses() {
+        let backend = multi_instance(&["10.0.0.1:3000", "10.0.0.2:3000"]);
+        let unresolvable = Backend {
+            address: "harmost-test.invalid:3000".to_string(),
+            ..backend.clone()
+        };
+
+        assert!(unresolvable.refresh().is_err());
+        assert_eq!(backend.sockets().len(), 2, "a DNS blip must not empty the pool");
+    }
+
+    #[test]
+    fn a_lookup_returning_the_same_addresses_reports_no_change() {
+        let backend = Backend::new(0, "127.0.0.1:3000").unwrap();
+
+        assert_eq!(backend.refresh(), Ok(false));
+        assert_eq!(*backend.sockets(), vec!["127.0.0.1:3000".parse::<SocketAddr>().unwrap()]);
     }
 }

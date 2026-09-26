@@ -3,6 +3,10 @@
 Notable changes by version. See the [roadmap](./docs/ROADMAP.md) for remaining
 work and [operations guide](./docs/OPERATIONS.md) for deployment details.
 
+## 0.1.4 — 2026-09-26
+
+- Fixed: an upstream name that resolves to several instances now spreads origin connections across all of them. Harmost kept only the first address it resolved at startup, so one instance served everything while the rest idled, and a replaced instance stayed unreachable until restart. Names are re-resolved every `origin.resolve_interval` (default `10s`), a failed lookup keeps the previous addresses, `hash_by_path` keeps a path on one instance, and `harmost_upstream_addresses` reports how many each name has.
+
 ## 0.1.3 — 2026-09-12
 
 - Added checked-in Next.js route approvals with strict fail-closed validation.
