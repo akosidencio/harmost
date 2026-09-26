@@ -1000,9 +1000,8 @@ impl ProxyHttp for Harmost {
         // Which of the instances behind this upstream's name. Under
         // `hash_by_path` a path keeps reaching the same instance, whose own
         // render cache then stays warm; otherwise instances take turns.
-        let socket = backend.socket_for(
-            (self.upstreams.strategy() == LoadBalancing::HashByPath).then_some(path),
-        );
+        let socket = backend
+            .socket_for((self.upstreams.strategy() == LoadBalancing::HashByPath).then_some(path));
         // Called again for every retry, which is the point: a retried request
         // goes back through selection and so lands wherever the breakers and
         // the load signal now say it should, rather than back on the backend

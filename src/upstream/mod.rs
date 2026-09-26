@@ -902,7 +902,11 @@ mod tests {
         };
 
         assert!(unresolvable.refresh().is_err());
-        assert_eq!(backend.sockets().len(), 2, "a DNS blip must not empty the pool");
+        assert_eq!(
+            backend.sockets().len(),
+            2,
+            "a DNS blip must not empty the pool"
+        );
     }
 
     #[test]
@@ -910,6 +914,9 @@ mod tests {
         let backend = Backend::new(0, "127.0.0.1:3000").unwrap();
 
         assert_eq!(backend.refresh(), Ok(false));
-        assert_eq!(*backend.sockets(), vec!["127.0.0.1:3000".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(
+            *backend.sockets(),
+            vec!["127.0.0.1:3000".parse::<SocketAddr>().unwrap()]
+        );
     }
 }

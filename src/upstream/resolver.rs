@@ -46,7 +46,10 @@ impl Resolver {
                 Ok(Ok(false)) => {}
                 // Kept serving on the previous addresses; see Backend::refresh.
                 Ok(Err(error)) => log::warn!("{error}; keeping the previous addresses"),
-                Err(error) => log::warn!("upstream {} lookup did not finish: {error}", backend.address),
+                Err(error) => log::warn!(
+                    "upstream {} lookup did not finish: {error}",
+                    backend.address
+                ),
             }
             crate::telemetry::metrics::UPSTREAM_ADDRESSES
                 .with_label_values(&[&backend.address])
